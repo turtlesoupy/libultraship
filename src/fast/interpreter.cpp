@@ -29,6 +29,8 @@
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
+extern "C" int port_get_display_submit_count(void);
+
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/Utils.h"
@@ -119,6 +121,20 @@ Interpreter::~Interpreter() {
 }
 
 static std::weak_ptr<Interpreter> mInstance;
+
+static int sCrashProbeLogCount = 0;
+
+static bool gfxCrashProbeShouldLog() {
+    if (port_get_display_submit_count() < 55) {
+        return false;
+    }
+    if (sCrashProbeLogCount >= 256) {
+        return false;
+    }
+    sCrashProbeLogCount++;
+    return true;
+}
+
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
@@ -3430,6 +3446,12 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+
+    if (gfxCrashProbeShouldLog()) {
+        SPDLOG_INFO("SSB64 CrashProbe: G_DL cmd={} target={} push={} w0=0x{:08X} w1=0x{:016X}",
+                    static_cast<const void*>(cmd), static_cast<const void*>(subGFX), C0(16, 1) == 0,
+                    cmd->words.w0, (uint64_t)cmd->words.w1);
+    }
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
@@ -3524,6 +3546,11 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mMarkerOn = false;
+
+    if (gfxCrashProbeShouldLog()) {
+        SPDLOG_INFO("SSB64 CrashProbe: G_ENDDL cmd={} stack_depth={}", static_cast<const void*>(*cmd0),
+                    g_exec_stack.cmd_stack.size());
+    }
     g_exec_stack.ret();
     return true;
 }
@@ -4471,6 +4498,11 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
+
+    if (gfxCrashProbeShouldLog()) {
+        SPDLOG_INFO("SSB64 CrashProbe: step cmd={} stack_depth={} path_depth={}", static_cast<const void*>(cmd),
+                    g_exec_stack.cmd_stack.size(), g_exec_stack.gfx_path.size());
+    }
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
 #ifdef USE_GBI_TRACE

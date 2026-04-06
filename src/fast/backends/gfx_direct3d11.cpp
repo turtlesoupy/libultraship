@@ -394,11 +394,22 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
+    auto logCompileFailure = [&](const char* stage) {
+        const char* err = (error_blob != nullptr) ? (const char*)error_blob->GetBufferPointer() : "No D3D compiler error blob";
+
+        SPDLOG_ERROR(
+            "DX11 shader compile failed at stage {} shader_id0=0x{:016X} shader_id1=0x{:016X}: {}",
+            stage, shader_id0, shader_id1, err
+        );
+        SPDLOG_ERROR("DX11 shader source for failed compile:\n{}", shader);
+    };
+
     HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
         char* err = (char*)error_blob->GetBufferPointer();
+        logCompileFailure("VS");
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
@@ -408,6 +419,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
 
     if (FAILED(hr)) {
         char* err = (char*)error_blob->GetBufferPointer();
+        logCompileFailure("PS");
         MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
         throw hr;
     }
