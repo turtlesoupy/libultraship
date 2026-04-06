@@ -58,7 +58,7 @@ target_link_libraries(libultraship
     PUBLIC ImGui
 )
 
-target_link_libraries(libultraship PRIVATE stb)
+target_link_libraries(libultraship PUBLIC stb)
 
 if (GFX_DEBUG_DISASSEMBLER)
     target_link_libraries(libultraship PRIVATE libgfxd)
