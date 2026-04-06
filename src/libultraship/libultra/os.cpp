@@ -36,7 +36,7 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
 
 int32_t osContStartReadData(OSMesgQueue* mesg) {
     if (mesg != nullptr) {
-        osSendMesg(mesg, nullptr, OS_MESG_NOBLOCK);
+        osSendMesg(mesg, OSMesg{}, OS_MESG_NOBLOCK);
     }
     return 0;
 }
