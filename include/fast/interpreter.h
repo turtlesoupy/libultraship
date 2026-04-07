@@ -538,3 +538,9 @@ const char* GfxGetOpcodeName(int8_t opcode);
 extern "C" void gfx_texture_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize);
+
+/* GBI trace callback — called for every command during interpreter execution.
+ * Parameters: w0, w1 (raw command words), dl_depth (call stack depth).
+ * Set to NULL to disable. */
+typedef void (*GbiTraceCallbackFn)(uintptr_t w0, uintptr_t w1, int dl_depth);
+extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback);

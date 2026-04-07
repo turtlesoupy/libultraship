@@ -148,13 +148,19 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
         // Rewrite segment E (intra-file) references to absolute file addresses.
         // Resource DLs use 0x0E + offset for textures, vertices, and sub-DLs
-        // within the same reloc file blob.  Without rewriting, these resolve
-        // through the segment table against the graphics heap (wrong base).
+        // within the same reloc file blob.
+        //
+        // EXCEPTION: G_DL commands with segment 0x0E and offset 0 must NOT be
+        // resolved here.  These call into the runtime graphics heap (set via
+        // gSPSegment in gcDrawMObjForDObj) and need SegAddr() to resolve them
+        // at runtime using the current segment table.  The reloc chain walk
+        // preserves these as 0x0E000000 instead of tokenizing them.
         uint32_t w1_raw = rawWords[1];
         uint8_t seg = (w1_raw >> 24) & 0xFF;
         uint32_t offset = w1_raw & 0x00FFFFFF;
 
-        if (seg == 0x0E && offset < fileSize) {
+        bool isRuntimeSegRef = (opcode == Fast::F3DEX2_G_DL) && (seg == 0x0E);
+        if (seg == 0x0E && offset < fileSize && !isRuntimeSegRef) {
             hostCmd.words.w1 = fileBase + offset;
         } else {
             hostCmd.words.w1 = w1_raw;
@@ -259,6 +265,9 @@ extern "C" void portResetPackedDisplayListCache(void) {
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
+
+/* GBI trace callback — forward declaration (defined near g_exec_stack below) */
+static GbiTraceCallbackFn sGbiTraceCallback = nullptr;
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -4687,6 +4696,11 @@ static void gfx_step() {
     auto cmd0 = cmd;
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
+    if (sGbiTraceCallback) {
+        sGbiTraceCallback((uintptr_t)cmd->words.w0, (uintptr_t)cmd->words.w1,
+                          (int)g_exec_stack.cmd_stack.size() - 1);
+    }
+
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
         Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnableGFXTrace", 0)) {
@@ -4919,6 +4933,10 @@ void Interpreter::StartFrame() {
 }
 
 GfxExecStack g_exec_stack = {};
+
+extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback) {
+    sGbiTraceCallback = callback;
+}
 
 void Interpreter::RunGuiOnly() {
     SpReset();
