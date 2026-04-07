@@ -1,5 +1,9 @@
 #define NOMINMAX
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,6 +14,7 @@
 
 #include <any>
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -29,7 +34,10 @@
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
-extern "C" int port_get_display_submit_count(void);
+extern "C" void* portRelocTryResolvePointer(uint32_t token);
+extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
+extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
+                                         uint32_t* out_file_id, const char** out_path);
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -65,6 +73,154 @@ std::stack<std::string> currentDir;
     ((mFbActive ? activeFb->second.applied_height : dims.height) / (2.0f * HALF_SCREEN_HEIGHT(activeFb)))
 
 #define TEXTURE_CACHE_MAX_SIZE 1024
+
+namespace {
+
+constexpr size_t PORT_PACKED_GFX_SIZE = sizeof(uint32_t) * 2;
+
+struct PortPackedDisplayListInfo {
+    const void* source;
+    uintptr_t fileBase;
+    size_t fileSize;
+    std::shared_ptr<std::vector<Fast::F3DGfx>> commands;
+};
+
+std::unordered_map<const void*, PortPackedDisplayListInfo> sPortPackedDisplayListCache;
+
+bool portFindNormalizedDisplayListCommand(const Fast::F3DGfx* cmd, const PortPackedDisplayListInfo** outInfo,
+                                          size_t* outIndex) {
+    for (const auto& [source, info] : sPortPackedDisplayListCache) {
+        const Fast::F3DGfx* begin = info.commands->data();
+        const Fast::F3DGfx* end = begin + info.commands->size();
+
+        if ((cmd >= begin) && (cmd < end)) {
+            if (outInfo != nullptr) {
+                *outInfo = &info;
+            }
+            if (outIndex != nullptr) {
+                *outIndex = static_cast<size_t>(cmd - begin);
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+
+    if (dlist == nullptr || !portRelocFindContainingFile(dlist, &fileBase, &fileSize)) {
+        return dlist;
+    }
+
+    auto cached = sPortPackedDisplayListCache.find(dlist);
+
+    if (cached != sPortPackedDisplayListCache.end()) {
+        return cached->second.commands->data();
+    }
+
+    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(dlist);
+    uintptr_t fileEnd = fileBase + fileSize;
+
+    if ((rawAddr < fileBase) || ((fileEnd - rawAddr) < PORT_PACKED_GFX_SIZE)) {
+        return dlist;
+    }
+
+    auto translated = std::make_shared<std::vector<Fast::F3DGfx>>();
+    translated->reserve((fileEnd - rawAddr) / PORT_PACKED_GFX_SIZE);
+
+    while ((rawAddr + PORT_PACKED_GFX_SIZE) <= fileEnd) {
+        const uint32_t* rawWords = reinterpret_cast<const uint32_t*>(rawAddr);
+        Fast::F3DGfx hostCmd = {};
+
+        hostCmd.words.w0 = rawWords[0];
+        hostCmd.words.w1 = rawWords[1];
+        translated->push_back(hostCmd);
+
+        rawAddr += PORT_PACKED_GFX_SIZE;
+
+        if ((uint8_t)(rawWords[0] >> 24) == Fast::F3DEX2_G_ENDDL) {
+            break;
+        }
+    }
+
+    if (translated->empty()) {
+        return dlist;
+    }
+
+    Fast::F3DGfx* translatedPtr = translated->data();
+    sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
+
+    return translatedPtr;
+}
+
+size_t portGetDisplayListStride(uintptr_t segmentBase) {
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+
+    if ((segmentBase != 0) && portRelocFindContainingFile(reinterpret_cast<const void*>(segmentBase), &fileBase, &fileSize)) {
+        return PORT_PACKED_GFX_SIZE;
+    }
+
+    return sizeof(Fast::F3DGfx);
+}
+
+bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return false;
+    }
+
+#ifdef _WIN32
+    const uint8_t* cursor = reinterpret_cast<const uint8_t*>(ptr);
+    size_t remaining = size;
+
+    while (remaining != 0) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+
+        if (VirtualQuery(cursor, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+
+        DWORD protect = mbi.Protect & 0xFF;
+
+        switch (protect) {
+            case PAGE_READONLY:
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                break;
+
+            default:
+                return false;
+        }
+
+        uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        size_t available = regionEnd - reinterpret_cast<uintptr_t>(cursor);
+
+        if (available >= remaining) {
+            return true;
+        }
+
+        remaining -= available;
+        cursor += available;
+    }
+#endif
+
+    return true;
+}
+
+} // namespace
+
+extern "C" void portResetPackedDisplayListCache(void) {
+    sPortPackedDisplayListCache.clear();
+}
 
 namespace Fast {
 
@@ -121,19 +277,6 @@ Interpreter::~Interpreter() {
 }
 
 static std::weak_ptr<Interpreter> mInstance;
-
-static int sCrashProbeLogCount = 0;
-
-static bool gfxCrashProbeShouldLog() {
-    if (port_get_display_submit_count() < 55) {
-        return false;
-    }
-    if (sCrashProbeLogCount >= 256) {
-        return false;
-    }
-    sCrashProbeLogCount++;
-    return true;
-}
 
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
@@ -2970,20 +3113,28 @@ void Interpreter::Gfxs2dexRecyCopy(F3DuObjSprite* spr) {
 }
 
 void* Interpreter::SegAddr(uintptr_t w1) {
-    // Segmented?
-    if (w1 & 1) {
-        uint32_t segNum = (uint32_t)(w1 >> 24);
+    if (w1 <= UINT32_MAX) {
+        void* relocPtr = portRelocTryResolvePointer((uint32_t)w1);
 
-        uint32_t offset = w1 & 0x00FFFFFE;
-
-        if (mSegmentPointers[segNum] != 0) {
-            return (void*)(mSegmentPointers[segNum] + offset);
-        } else {
-            return (void*)w1;
+        if (relocPtr != nullptr) {
+            return relocPtr;
         }
-    } else {
-        return (void*)w1;
     }
+
+    // Raw reloc-file display lists still use classic N64 segmented addresses,
+    // while some libultraship-generated commands tag the low bit. Support both.
+    uint32_t segNum = (uint32_t)(w1 >> 24);
+
+    if ((segNum < MAX_SEGMENT_POINTERS) && (mSegmentPointers[segNum] != 0)) {
+        uint32_t offset = (uint32_t)(w1 & 0x00FFFFFF);
+
+        if ((w1 & 1) != 0) {
+            offset &= ~1u;
+        }
+        return (void*)(mSegmentPointers[segNum] + offset);
+    }
+
+    return (void*)w1;
 }
 
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
@@ -2993,7 +3144,7 @@ void GfxExecStack::start(F3DGfx* dlist) {
     while (!cmd_stack.empty())
         cmd_stack.pop();
     gfx_path.clear();
-    cmd_stack.push(dlist);
+    cmd_stack.push(portNormalizeDisplayListPointer(dlist));
     disp_stack.clear();
 }
 
@@ -3021,13 +3172,13 @@ void GfxExecStack::branch(F3DGfx* caller) {
     F3DGfx* old = cmd_stack.top();
     cmd_stack.pop();
     cmd_stack.push(nullptr);
-    cmd_stack.push(old);
+    cmd_stack.push(portNormalizeDisplayListPointer(old));
 
     gfx_path.push_back(caller);
 }
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
-    cmd_stack.push(callee);
+    cmd_stack.push(portNormalizeDisplayListPointer(callee));
     gfx_path.push_back(caller);
 }
 
@@ -3127,7 +3278,7 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (const char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
     const int32_t* mtx = (const int32_t*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(
         (const char*)fileName);
 
@@ -3141,7 +3292,7 @@ bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
 bool gfx_mtx_otr_filepath_handler_custom_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (const char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
     const int32_t* mtx = (const int32_t*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(
         (const char*)fileName);
 
@@ -3264,7 +3415,7 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
 bool gfx_push_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* shader = (char*)cmd->words.w1;
+    const char* shader = (const char*)gfx->SegAddr(cmd->words.w1);
 
     gfx->mShaders[gfx->mShadersIndex] = shader;
     gfx->mShaderStack.push(gfx->mShadersIndex);
@@ -3396,7 +3547,7 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
 bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    char* fileName = (char*)cmd->words.w1;
+    char* fileName = (char*)gfx->SegAddr(cmd->words.w1);
     (*cmd0)++;
     cmd = *cmd0;
     size_t vtxCnt = cmd->words.w0;
@@ -3411,8 +3562,9 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    char* fileName = (char*)cmd->words.w1;
+    char* fileName = (char*)gfx->SegAddr(cmd->words.w1);
     F3DGfx* nDL =
         (F3DGfx*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
 
@@ -3447,11 +3599,6 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
 
-    if (gfxCrashProbeShouldLog()) {
-        SPDLOG_INFO("SSB64 CrashProbe: G_DL cmd={} target={} push={} w0=0x{:08X} w1=0x{:016X}",
-                    static_cast<const void*>(cmd), static_cast<const void*>(subGFX), C0(16, 1) == 0,
-                    cmd->words.w0, (uint64_t)cmd->words.w1);
-    }
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
@@ -3494,7 +3641,8 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
     F3DGfx* cmd = (*cmd0);
     uint8_t segNum = (uint8_t)(cmd->words.w1 >> 24);
     uint32_t index = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
-    uintptr_t segAddr = (segNum << 24) | (index * sizeof(F3DGfx)) + 1;
+    uintptr_t segmentBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
+    uintptr_t segAddr = (segNum << 24) | (index * portGetDisplayListStride(segmentBase)) + 1;
 
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(segAddr);
     if (C0(16, 1) == 0) {
@@ -3512,7 +3660,8 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
 
 // TODO handle special OTR opcodes later...
 bool gfx_pushcd_handler_custom(F3DGfx** cmd0) {
-    gfx_push_current_dir((char*)(*cmd0)->words.w1);
+    Interpreter* gfx = mInstance.lock().get();
+    gfx_push_current_dir((char*)gfx->SegAddr((*cmd0)->words.w1));
     return false;
 }
 
@@ -3547,10 +3696,6 @@ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mMarkerOn = false;
 
-    if (gfxCrashProbeShouldLog()) {
-        SPDLOG_INFO("SSB64 CrashProbe: G_ENDDL cmd={} stack_depth={}", static_cast<const void*>(*cmd0),
-                    g_exec_stack.cmd_stack.size());
-    }
     g_exec_stack.ret();
     return true;
 }
@@ -3712,7 +3857,6 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     uintptr_t i = (uintptr_t)gfx->SegAddr(cmd->words.w1);
-
     char* imgData = (char*)i;
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetdata = {};
@@ -3814,8 +3958,9 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
 
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
@@ -3823,7 +3968,6 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
         Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(fileName));
     if (texture != nullptr) {
-        Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
         rawTexMetadata.height = texture->Height;
@@ -3879,7 +4023,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
 bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    bool* hasCopiedPtr = (bool*)cmd->words.w1;
+    bool* hasCopiedPtr = (bool*)gfx->SegAddr(cmd->words.w1);
 
     gfx->Flush();
     gfx->CopyFrameBuffer(C0(11, 11), C0(0, 11), (bool)C0(22, 1), hasCopiedPtr);
@@ -3892,7 +4036,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
 
     int32_t width, height;
     [[maybe_unused]] int32_t ulx, uly;
-    uint16_t* rgba16Buffer = (uint16_t*)cmd->words.w1;
+    uint16_t* rgba16Buffer = (uint16_t*)gfx->SegAddr(cmd->words.w1);
     int fbId = C0(0, 8);
     bool bswap = C0(8, 1);
     ++(*cmd0);
@@ -3925,17 +4069,17 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
     gfx->Flush();
 
-    char* timg = (char*)cmd->words.w1;
+    char* timg = (char*)gfx->SegAddr(cmd->words.w1);
 
     ++(*cmd0);
     cmd = *cmd0;
 
-    uint8_t* mask = (uint8_t*)cmd->words.w0;
-    uint8_t* replacementTex = (uint8_t*)cmd->words.w1;
+    uint8_t* mask = (uint8_t*)gfx->SegAddr(cmd->words.w0);
+    uint8_t* replacementTex = (uint8_t*)gfx->SegAddr(cmd->words.w1);
 
     if (!gfx_check_image_signature(timg)) {
-        SPDLOG_ERROR(
-            "OTR_G_REGBLENDEDTEX: Texture is not a valid OTR resource name, unable to register blended texture");
+        SPDLOG_ERROR("OTR_G_REGBLENDEDTEX: invalid texture resource pointer cmd={} timg={} mask={} replacement={}",
+                     fmt::ptr(cmd), fmt::ptr(timg), fmt::ptr(mask), fmt::ptr(replacementTex));
         return false;
     }
 
@@ -4381,6 +4525,10 @@ static constexpr UcodeHandler f3dex2Handlers = {
     { F3DEX2_G_QUAD, { "G_QUAD", gfx_quad_handler_f3dex2 } },
     { F3DEX2_G_SETOTHERMODE_L, { "G_SETOTHERMODE_L", gfx_othermode_l_handler_f3dex2 } },
     { F3DEX2_G_SETOTHERMODE_H, { "G_SETOTHERMODE_H", gfx_othermode_h_handler_f3dex2 } },
+    // SSB64 mixes S2DEX BG commands into F3DEX2 display lists without a G_LOAD_UCODE switch.
+    // The RSP was already running the right ucode from task setup; on PC we handle them here.
+    { F3DEX2_G_BG_1CYC, { "G_BG_1CYC", gfx_bg_1cyc_handler_s2dex } },
+    { F3DEX2_G_BG_COPY, { "G_BG_COPY", gfx_bg_copy_handler_s2dex } },
 };
 
 static constexpr UcodeHandler f3dexHandlers = {
@@ -4498,11 +4646,6 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
-
-    if (gfxCrashProbeShouldLog()) {
-        SPDLOG_INFO("SSB64 CrashProbe: step cmd={} stack_depth={} path_depth={}", static_cast<const void*>(cmd),
-                    g_exec_stack.cmd_stack.size(), g_exec_stack.gfx_path.size());
-    }
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
 #ifdef USE_GBI_TRACE
@@ -4531,13 +4674,15 @@ static void gfx_step() {
         // Guard against null or N64-segment addresses that would crash in strlen/strncmp.
         if (opcode == OTR_G_VTX_OTR_FILEPATH || opcode == OTR_G_SETTIMG_OTR_FILEPATH ||
             opcode == OTR_G_DL_OTR_FILEPATH || opcode == OTR_G_PUSHCD || opcode == OTR_G_MTX_OTR_FILEPATH ||
-            opcode == OTR_G_PUSH_SHADER) {
-            uintptr_t w1 = (uintptr_t)cmd->words.w1;
-            if (w1 < 0x10000
+            opcode == OTR_G_PUSH_SHADER || opcode == OTR_G_REGBLENDEDTEX) {
+            Interpreter* gfx = mInstance.lock().get();
+            uintptr_t resolvedW1 = (uintptr_t)gfx->SegAddr((uintptr_t)cmd->words.w1);
+            if (resolvedW1 < 0x10000
 #if UINTPTR_MAX > 0xFFFFFFFFu
                 // On 64-bit: filter kernel/sentinel addresses.
-                || w1 > 0x0000FFFFFFFFFFFFull
+                || resolvedW1 > 0x0000FFFFFFFFFFFFull
 #endif
+                || !gfxPointerHasReadableBytes(reinterpret_cast<const void*>(resolvedW1), 8)
             ) {
                 ++g_exec_stack.currCmd();
                 return;
@@ -4556,11 +4701,34 @@ static void gfx_step() {
                 return;
             }
         } else {
-            SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {}", (uint8_t)opcode,
-                            (uint32_t)ucode_handler_index);
+            const PortPackedDisplayListInfo* packedInfo = nullptr;
+            size_t packedIndex = 0;
+
+            if (portFindNormalizedDisplayListCommand(cmd, &packedInfo, &packedIndex)) {
+                const uintptr_t rawCmd = reinterpret_cast<uintptr_t>(packedInfo->source) + (packedIndex * PORT_PACKED_GFX_SIZE);
+                const uintptr_t fileOffset = rawCmd - packedInfo->fileBase;
+                uintptr_t describedBase = 0;
+                size_t describedSize = 0;
+                uint32_t fileId = UINT32_MAX;
+                const char* filePath = nullptr;
+
+                portRelocDescribePointer(packedInfo->source, &describedBase, &describedSize, &fileId, &filePath);
+
+                SPDLOG_CRITICAL(
+                    "Unhandled OP code: 0x{:X}, for loaded ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X} raw_source={} raw_cmd=0x{:X} file_offset=0x{:X} cmd_index={} file_id={} file_path={} file_base=0x{:X} file_size=0x{:X}",
+                    (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd), (uint32_t)cmd->words.w0,
+                    (uint64_t)cmd->words.w1, fmt::ptr(packedInfo->source), rawCmd, fileOffset, packedIndex, fileId,
+                    (filePath != nullptr) ? filePath : "(unknown)", describedBase, describedSize);
+            } else {
+                SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X}",
+                                (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd),
+                                (uint32_t)cmd->words.w0, (uint64_t)cmd->words.w1);
+            }
         }
     } else {
-        SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {}", (uint8_t)opcode, (uint32_t)ucode_handler_index);
+        SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X}",
+                        (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd), (uint32_t)cmd->words.w0,
+                        (uint64_t)cmd->words.w1);
     }
 
     ++cmd;
@@ -4967,6 +5135,9 @@ int32_t gfx_check_image_signature(const char* imgData) {
         return 0;
     }
 #endif
+    if (!gfxPointerHasReadableBytes(imgData, 8)) {
+        return 0;
+    }
 
     return Ship::Context::GetInstance()->GetResourceManager()->OtrSignatureCheck(imgData);
 }
