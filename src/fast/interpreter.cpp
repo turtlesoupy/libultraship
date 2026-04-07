@@ -133,22 +133,56 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
     while ((rawAddr + PORT_PACKED_GFX_SIZE) <= fileEnd) {
         const uint32_t* rawWords = reinterpret_cast<const uint32_t*>(rawAddr);
+        uint8_t opcode = (uint8_t)(rawWords[0] >> 24);
+
+        // Valid F3DEX2 opcodes: 0x00-0x0F (SP geometry) and 0xD7-0xFF (SP/RDP).
+        // Anything in 0x10-0xD6 is not a real GBI command — we've entered
+        // non-DL data (textures, vertices, structs) adjacent in the blob.
+        if (opcode > 0x0F && opcode < 0xD7) {
+            break;
+        }
+
         Fast::F3DGfx hostCmd = {};
 
         hostCmd.words.w0 = rawWords[0];
-        hostCmd.words.w1 = rawWords[1];
+
+        // Rewrite segment E (intra-file) references to absolute file addresses.
+        // Resource DLs use 0x0E + offset for textures, vertices, and sub-DLs
+        // within the same reloc file blob.  Without rewriting, these resolve
+        // through the segment table against the graphics heap (wrong base).
+        uint32_t w1_raw = rawWords[1];
+        uint8_t seg = (w1_raw >> 24) & 0xFF;
+        uint32_t offset = w1_raw & 0x00FFFFFF;
+
+        if (seg == 0x0E && offset < fileSize) {
+            hostCmd.words.w1 = fileBase + offset;
+        } else {
+            hostCmd.words.w1 = w1_raw;
+        }
+
         translated->push_back(hostCmd);
 
         rawAddr += PORT_PACKED_GFX_SIZE;
 
-        if ((uint8_t)(rawWords[0] >> 24) == Fast::F3DEX2_G_ENDDL) {
+        if (opcode == Fast::F3DEX2_G_ENDDL) {
             break;
         }
     }
 
-    if (translated->empty()) {
-        return dlist;
+    // Ensure the widened DL always ends with G_ENDDL.  The opcode validation
+    // can terminate the loop early, and some source DLs use gSPBranchList
+    // (never returns) instead of gSPEndDisplayList.  Without a terminator
+    // the interpreter reads past the vector into uninitialized heap.
+    {
+        bool hasEndDL = !translated->empty() &&
+            ((uint8_t)(translated->back().words.w0 >> 24) == Fast::F3DEX2_G_ENDDL);
+        if (!hasEndDL) {
+            Fast::F3DGfx endCmd = {};
+            endCmd.words.w0 = ((uintptr_t)Fast::F3DEX2_G_ENDDL) << 24;
+            translated->push_back(endCmd);
+        }
     }
+
 
     Fast::F3DGfx* translatedPtr = translated->data();
     sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
@@ -4450,6 +4484,7 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },          // mRdpFULLSYNC (-23)
     { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },            // G_SETSCISSOR (-19)
     { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },    // G_SETPRIMDEPTH (-18)
+    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_stubbed_command_handler } },            // G_SETCONVERT (-20)
     { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },   // mRdpSETOTHERMODE (-17)
     { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                 // G_LOADTLUT (-16)
     { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },       // G_SETTILESIZE (-14)

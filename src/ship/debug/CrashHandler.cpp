@@ -69,6 +69,9 @@ void CrashHandler::PrintCommon() {
         mCallback(mOutBuffer, &mOutBuffersize);
     }
 
+    // Null-terminate to prevent logging uninitialized buffer bytes
+    mOutBuffer[mOutBuffersize] = '\0';
+
     SPDLOG_CRITICAL(mOutBuffer);
 }
 
