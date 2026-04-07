@@ -301,6 +301,10 @@ constexpr size_t MAX_TRI_BUFFER = 256;
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
+    // Point palette pointers at staging buffers so CI8 rendering always has
+    // valid pointers even when only one palette half has been loaded via TLUT.
+    mRdp->palettes[0] = mRdp->palette_staging[0];
+    mRdp->palettes[1] = mRdp->palette_staging[1];
     mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 }
 
