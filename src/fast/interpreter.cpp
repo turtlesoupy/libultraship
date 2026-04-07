@@ -150,16 +150,16 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         // Resource DLs use 0x0E + offset for textures, vertices, and sub-DLs
         // within the same reloc file blob.
         //
-        // EXCEPTION: G_DL commands with segment 0x0E and offset 0 must NOT be
-        // resolved here.  These call into the runtime graphics heap (set via
-        // gSPSegment in gcDrawMObjForDObj) and need SegAddr() to resolve them
-        // at runtime using the current segment table.  The reloc chain walk
-        // preserves these as 0x0E000000 instead of tokenizing them.
+        // EXCEPTION: G_DL commands with segment 0x0E must NOT be resolved here.
+        // These call into the runtime graphics heap (set via gSPSegment in
+        // gcDrawMObjForDObj) and need SegAddr() to resolve them at runtime
+        // using the current segment table.  The reloc chain walk preserves
+        // these as 0x0Exxxxxx instead of tokenizing them.
         uint32_t w1_raw = rawWords[1];
         uint8_t seg = (w1_raw >> 24) & 0xFF;
         uint32_t offset = w1_raw & 0x00FFFFFF;
 
-        bool isRuntimeSegRef = (opcode == Fast::F3DEX2_G_DL) && (seg == 0x0E);
+        bool isRuntimeSegRef = (opcode == (uint8_t)Fast::F3DEX2_G_DL) && (seg == 0x0E);
         if (seg == 0x0E && offset < fileSize && !isRuntimeSegRef) {
             hostCmd.words.w1 = fileBase + offset;
         } else {
@@ -170,7 +170,7 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
         rawAddr += PORT_PACKED_GFX_SIZE;
 
-        if (opcode == Fast::F3DEX2_G_ENDDL) {
+        if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL) {
             break;
         }
     }
@@ -181,10 +181,10 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
     // the interpreter reads past the vector into uninitialized heap.
     {
         bool hasEndDL = !translated->empty() &&
-            ((uint8_t)(translated->back().words.w0 >> 24) == Fast::F3DEX2_G_ENDDL);
+            ((uint8_t)(translated->back().words.w0 >> 24) == (uint8_t)Fast::F3DEX2_G_ENDDL);
         if (!hasEndDL) {
             Fast::F3DGfx endCmd = {};
-            endCmd.words.w0 = ((uintptr_t)Fast::F3DEX2_G_ENDDL) << 24;
+            endCmd.words.w0 = ((uintptr_t)(uint8_t)Fast::F3DEX2_G_ENDDL) << 24;
             translated->push_back(endCmd);
         }
     }
