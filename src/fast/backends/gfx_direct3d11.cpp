@@ -408,20 +408,16 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
                              vs.GetAddressOf(), error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
         logCompileFailure("VS");
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw hr;
+        return nullptr;
     }
 
     hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
                      error_blob.GetAddressOf());
 
     if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
         logCompileFailure("PS");
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw hr;
+        return nullptr;
     }
 
     struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];

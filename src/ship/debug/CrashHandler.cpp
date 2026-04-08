@@ -406,11 +406,8 @@ extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
 
     WRITE_VAR_LINE(crashHandler, "Exception: ", exceptionString);
     crashHandler->PrintStack(ex->ContextRecord);
-    MessageBoxA(
-        nullptr,
-        (Context::GetInstance()->GetName() + " has crashed. Please upload the logs to the support channel in discord.")
-            .c_str(),
-        "Crash", MB_OK | MB_ICONERROR);
+    // Skip MessageBox in dev builds to avoid blocking the process
+    Context::GetInstance()->GetLogger()->flush();
 
     return EXCEPTION_EXECUTE_HANDLER;
 }

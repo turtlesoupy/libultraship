@@ -117,22 +117,32 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
     // Guard: runtime display lists (built on the graphics heap with native 16-byte
     // Gfx structs) can fall within a reloc file's address range because both share
-    // the same game heap.  Detect this by checking the upper 32 bits of the first
-    // uintptr_t at the address: for packed 8-byte GBI data, bytes 4-7 are a
-    // separate u32 w1 (typically non-zero: segment address, pointer, parameter).
-    // For native 16-byte Gfx, bytes 4-7 are the upper half of uintptr_t w0, which
-    // is ALWAYS zero (GBI opcodes fit in 32 bits).
+    // the same game heap.  Detect native format by checking the upper 32 bits of
+    // uintptr_t w0 fields at THREE command positions.
+    //
+    // Layout comparison (as uint32_t[]):
+    //   Native 16-byte:  [w0_lo] [w0_hi=0] [w1_lo] [w1_hi] [w0_lo] [w0_hi=0] ...
+    //   Packed  8-byte:  [w0]    [w1]      [w0]    [w1]    [w0]    [w1]      ...
+    //
+    // For native format, probe[1], probe[5], and probe[9] are upper halves of
+    // uintptr_t w0 fields — always zero because GBI opcodes fit in 32 bits.
+    // For packed format, these are w1 of packed commands 0, 2, and 4.  Having
+    // ALL THREE be zero requires 5+ commands where every other one has w1=0
+    // (e.g. alternating syncs), which is virtually impossible in real DLs.
     {
         uintptr_t rawAddr_chk = reinterpret_cast<uintptr_t>(dlist);
         uintptr_t fileEnd_chk = fileBase + fileSize;
-        if ((fileEnd_chk - rawAddr_chk) >= 2 * sizeof(uint32_t)) {
-            const uint32_t* probe = reinterpret_cast<const uint32_t*>(dlist);
-            if (probe[1] == 0) {
-                // Upper 32 bits of first word are zero — likely native 16-byte format.
-                // Packed DLs almost never have w1=0 as their first command's second word.
-                return dlist;
-            }
-        }
+        const uint32_t* probe = reinterpret_cast<const uint32_t*>(dlist);
+
+        // DISABLED: All data-inspection heuristics have false positives.
+        // Packed DLs often start with commands that have w1=0 (sync, fog, geometry
+        // mode).  Instead of guessing, we ALWAYS normalize data found in a reloc
+        // file range.  If a native runtime DL somehow lands in a reloc range, the
+        // normalization loop's opcode validator will bail out early and produce a
+        // harmless truncated DL with G_ENDDL.
+        (void)probe;
+        (void)rawAddr_chk;
+        (void)fileEnd_chk;
     }
 
     auto cached = sPortPackedDisplayListCache.find(dlist);
@@ -358,12 +368,21 @@ void Interpreter::Flush() {
     }
 }
 
+static std::set<std::pair<uint64_t,uint64_t>> sFailedShaderIds;
+
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
+    auto key = std::make_pair(id0, id1);
+    if (sFailedShaderIds.count(key)) {
+        return nullptr; // Previously failed — don't retry
+    }
     ShaderProgram* prg = mRapi->LookupShader(id0, id1);
     if (prg == nullptr) {
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         prg = mRapi->CreateAndLoadNewShader(id0, id1);
         mRenderingState.mShaderProgram = prg;
+        if (prg == nullptr) {
+            sFailedShaderIds.insert(key);
+        }
     }
     return prg;
 }
@@ -1983,6 +2002,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     ColorCombinerKey key;
     key.combine_mode = mRdp->combine_mode;
     key.options = cc_options;
+    key.shader_id = 0;
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
@@ -2102,6 +2122,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (prg == NULL) {
         comb->prg[tm] = prg =
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
+    }
+    if (prg == NULL) {
+        return; // Shader compile failed — skip this draw call
     }
     if (prg != mRenderingState.mShaderProgram) {
         Flush();
@@ -5023,8 +5046,6 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         if (dbg->IsDebugging()) {
             g_exec_stack.gfx_path.push_back(cmd);
             if (dbg->HasBreakPoint(g_exec_stack.gfx_path)) {
-                // On a breakpoint with the active framebuffer still set, we need to reset back to prevent
-                // soft locking the renderer
                 if (mFbActive) {
                     mFbActive = 0;
                     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
