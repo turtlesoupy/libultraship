@@ -178,19 +178,14 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
         // Rewrite segment E (intra-file) references to absolute file addresses.
         // Resource DLs use 0x0E + offset for textures, vertices, and sub-DLs
-        // within the same reloc file blob.
-        //
-        // EXCEPTION: G_DL commands with segment 0x0E must NOT be resolved here.
-        // These call into the runtime graphics heap (set via gSPSegment in
-        // gcDrawMObjForDObj) and need SegAddr() to resolve them at runtime
-        // using the current segment table.  The reloc chain walk preserves
-        // these as 0x0Exxxxxx instead of tokenizing them.
+        // within the same reloc file blob.  This includes G_DL commands that
+        // branch to sub-display-lists within the same file — these are
+        // intra-file references, not runtime graphics heap references.
         uint32_t w1_raw = rawWords[1];
         uint8_t seg = (w1_raw >> 24) & 0xFF;
         uint32_t offset = w1_raw & 0x00FFFFFF;
 
-        bool isRuntimeSegRef = (opcode == (uint8_t)Fast::F3DEX2_G_DL) && (seg == 0x0E);
-        if (seg == 0x0E && offset < fileSize && !isRuntimeSegRef) {
+        if (seg == 0x0E && offset < fileSize) {
             hostCmd.words.w1 = fileBase + offset;
         } else {
             hostCmd.words.w1 = w1_raw;
