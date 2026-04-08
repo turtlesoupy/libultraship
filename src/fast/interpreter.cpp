@@ -115,6 +115,26 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         return dlist;
     }
 
+    // Guard: runtime display lists (built on the graphics heap with native 16-byte
+    // Gfx structs) can fall within a reloc file's address range because both share
+    // the same game heap.  Detect this by checking the upper 32 bits of the first
+    // uintptr_t at the address: for packed 8-byte GBI data, bytes 4-7 are a
+    // separate u32 w1 (typically non-zero: segment address, pointer, parameter).
+    // For native 16-byte Gfx, bytes 4-7 are the upper half of uintptr_t w0, which
+    // is ALWAYS zero (GBI opcodes fit in 32 bits).
+    {
+        uintptr_t rawAddr_chk = reinterpret_cast<uintptr_t>(dlist);
+        uintptr_t fileEnd_chk = fileBase + fileSize;
+        if ((fileEnd_chk - rawAddr_chk) >= 2 * sizeof(uint32_t)) {
+            const uint32_t* probe = reinterpret_cast<const uint32_t*>(dlist);
+            if (probe[1] == 0) {
+                // Upper 32 bits of first word are zero — likely native 16-byte format.
+                // Packed DLs almost never have w1=0 as their first command's second word.
+                return dlist;
+            }
+        }
+    }
+
     auto cached = sPortPackedDisplayListCache.find(dlist);
 
     if (cached != sPortPackedDisplayListCache.end()) {
