@@ -38,6 +38,7 @@ extern "C" void* portRelocTryResolvePointer(uint32_t token);
 extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
                                          uint32_t* out_file_id, const char** out_path);
+extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -3579,7 +3580,15 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    uint32_t n_vertices = C0(12, 8);
+    uint32_t v_dest_end = C0(1, 7);
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+
+    // Lazy vertex byte-order fixup (port-side, Option A).
+    // Per-vertex idempotency handles overlapping sub-region reloads.
+    portRelocFixupVertexAtRuntime((const void*)vertices, n_vertices);
+
+    gfx->GfxSpVertex(n_vertices, v_dest_end - n_vertices, vertices);
 
     return false;
 }
