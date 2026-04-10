@@ -165,7 +165,15 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     int32_t mRenderTargetHeight;
     int mCurrentFramebuffer;
-    FilteringMode mCurrentFilterMode = FILTER_NONE;
+    // Default to FILTER_LINEAR so the SetSamplerParameters check
+    //   `linear_filter && mCurrentFilterMode == FILTER_LINEAR`
+    // succeeds when the game requests bilinear via gDPSetTextureFilter,
+    // producing standard 4-tap bilinear filtering on the GPU.
+    // The original FILTER_NONE default forced every sampler to point/nearest
+    // filtering regardless of the game's request. FILTER_THREE_POINT enables
+    // a shader-based N64-accurate 3-tap filter, but standard bilinear matches
+    // the look of glide64mk2/mupen better and is what most ports expect.
+    FilteringMode mCurrentFilterMode = FILTER_LINEAR;
 
     // Previous states (to prevent setting states needlessly)
 
