@@ -3700,6 +3700,47 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
 
+    // PORT FIX: stride correction for runtime segment 0x0E DLs.
+    //
+    // SSB64 builds per-MObj material setup sub-DLs in the graphics heap and
+    // points segment 0x0E at them via gsSPSegment(0xE, runtime_buf).  The
+    // stored model DL then calls into them with `gsSPDisplayList(0x0E000000 + N)`
+    // where N is the BYTE offset within the runtime buffer.
+    //
+    // On N64, each Gfx is 8 bytes, so N=8 means "second cmd".  On the port,
+    // game-built runtime DLs use the libultraship native 16-byte Gfx layout
+    // (uintptr_t w0; uintptr_t w1;), so "second cmd" is at byte offset 16.
+    //
+    // SegAddr returns mSegmentPointers[0x0E] + N (raw byte offset).  When the
+    // segment base is heap-allocated (game-built widened DL), we need to
+    // convert: cmd_index = N / 8; widened_offset = cmd_index * sizeof(F3DGfx).
+    //
+    // Without this, the interpreter lands halfway through a 16-byte widened
+    // cmd and reads w1-of-cmdN, w0-of-cmdN+1 as if they were one cmd —
+    // producing a pointer-shaped "opcode" and a cmd-word-shaped "pointer",
+    // which then dispatches as garbage G_VTX with bogus vertex addresses.
+    {
+        uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
+        if (segByte == 0x0E) {
+            uint32_t segNum = 0x0E;
+            uintptr_t segBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
+            if (segBase != 0) {
+                uintptr_t segFileBase = 0;
+                size_t segFileSize = 0;
+                bool baseInFile = portRelocFindContainingFile(reinterpret_cast<const void*>(segBase),
+                                                              &segFileBase, &segFileSize);
+                if (!baseInFile) {
+                    /* Heap-built widened DL: convert N64 byte offset → widened. */
+                    uint32_t n64_offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
+                    if ((n64_offset & 7u) == 0u) {
+                        uint32_t cmd_index = n64_offset / PORT_PACKED_GFX_SIZE;
+                        subGFX = (F3DGfx*)(segBase + cmd_index * sizeof(F3DGfx));
+                    }
+                }
+            }
+        }
+    }
+
     // Fallback for packed seg=0x0E G_DL commands left unresolved by
     // portNormalizeDisplayListPointer.  SegAddr returns the runtime segment
     // 0x0E base + offset when the game has set it via gsSPSegment(0xE, ...).
