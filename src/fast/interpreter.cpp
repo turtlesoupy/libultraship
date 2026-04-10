@@ -177,15 +177,23 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
         hostCmd.words.w0 = rawWords[0];
 
         // Rewrite segment E (intra-file) references to absolute file addresses.
-        // Resource DLs use 0x0E + offset for textures, vertices, and sub-DLs
-        // within the same reloc file blob.  This includes G_DL commands that
-        // branch to sub-display-lists within the same file — these are
-        // intra-file references, not runtime graphics heap references.
+        // Resource DLs use 0x0E + offset for textures, vertices, matrices, and
+        // sub-display-lists within the same reloc file blob.
+        //
+        // EXCEPTION: G_DL.  Some scenes (e.g. mvOpeningRoom) build per-MObj
+        // material setup sub-DLs in the graphics heap at runtime and patch
+        // segment 0x0E to point at that heap via gsSPSegment(0xE, ...).  Stored
+        // model DLs then call into them with `gsSPDisplayList(0x0E000000+X)`.
+        // For these, we MUST defer resolution to interpreter execution time so
+        // the runtime segment table is consulted.  Other scenes (e.g. the N64
+        // logo) use seg=0x0E G_DL as intra-file branches; gfx_dl_handler_common
+        // falls back to fileBase + offset when the runtime segment is unset.
         uint32_t w1_raw = rawWords[1];
         uint8_t seg = (w1_raw >> 24) & 0xFF;
         uint32_t offset = w1_raw & 0x00FFFFFF;
 
-        if (seg == 0x0E && offset < fileSize) {
+        if (seg == 0x0E && offset < fileSize &&
+            opcode != (uint8_t)Fast::F3DEX2_G_DL) {
             hostCmd.words.w1 = fileBase + offset;
         } else {
             hostCmd.words.w1 = w1_raw;
@@ -213,7 +221,6 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
             translated->push_back(endCmd);
         }
     }
-
 
     Fast::F3DGfx* translatedPtr = translated->data();
     sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
@@ -3683,6 +3690,26 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+
+    // Fallback for packed seg=0x0E G_DL commands left unresolved by
+    // portNormalizeDisplayListPointer.  SegAddr returns the runtime segment
+    // 0x0E base + offset when the game has set it via gsSPSegment(0xE, ...).
+    // If no runtime segment is set, SegAddr returns the raw w1 (a garbage
+    // pointer like 0x0E000000+offset); in that case fall back to the calling
+    // DL's containing reloc file (intra-file sub-DL branch).
+    {
+        uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
+        if (segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
+            uintptr_t fileBase = 0;
+            size_t fileSize = 0;
+            if (portRelocFindContainingFile(cmd, &fileBase, &fileSize)) {
+                uint32_t offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
+                if (offset < fileSize) {
+                    subGFX = (F3DGfx*)(fileBase + offset);
+                }
+            }
+        }
+    }
 
     if (C0(16, 1) == 0) {
         // Push return address
