@@ -43,6 +43,12 @@
 
 #define DEBUG_D3D 0
 
+// stb_image_write for backbuffer screenshot capture (portFastCaptureBackbufferPNG).
+// Define implementation here so the TU owns the single instantiation.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 using namespace Microsoft::WRL; // For ComPtr
 
 namespace Fast {
@@ -50,8 +56,15 @@ namespace Fast {
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
 }
 
+// Static pointer to the most recently constructed DX11 API instance.
+// Used by portFastCaptureBackbufferPNG so the port can capture the back buffer
+// without needing a handle to the renderer. libultraship instantiates exactly
+// one GfxRenderingAPIDX11 for the lifetime of the process.
+static GfxRenderingAPIDX11* sDX11InstanceForCapture = nullptr;
+
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
     mWindowBackend = backend;
+    sDX11InstanceForCapture = this;
 }
 
 void GfxRenderingAPIDX11::CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count,
@@ -1430,5 +1443,157 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
     // SPDLOG_INFO("====================================");
     return result;
 }
+
+// --------------------------------------------------------------------------
+// Backbuffer screenshot capture (called via portFastCaptureBackbufferPNG).
+//
+// Reads the current swap chain back buffer into a CPU-readable staging
+// texture, converts to RGBA8, and writes a PNG to the given path.
+//
+// Returns true on success, false on failure. Never throws — errors are
+// logged via SPDLOG_WARN and the function silently fails.
+// --------------------------------------------------------------------------
+static bool CaptureBackbufferToPNG_DX11(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    GfxRenderingAPIDX11* self = sDX11InstanceForCapture;
+    if (self == nullptr) {
+        return false;
+    }
+    if (!self->mDevice || !self->mContext || self->mWindowBackend == nullptr) {
+        return false;
+    }
+
+    IDXGISwapChain1* swap_chain = self->mWindowBackend->GetSwapChain();
+    if (swap_chain == nullptr) {
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 desc = {};
+    if (FAILED(swap_chain->GetDesc1(&desc))) {
+        return false;
+    }
+
+    ComPtr<ID3D11Texture2D> back_buffer;
+    if (FAILED(swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                                     reinterpret_cast<void**>(back_buffer.GetAddressOf())))) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC bb_desc = {};
+    back_buffer->GetDesc(&bb_desc);
+
+    // Create a CPU-readable staging texture matching the back buffer.
+    D3D11_TEXTURE2D_DESC staging_desc = bb_desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    staging_desc.MiscFlags = 0;
+    staging_desc.SampleDesc.Count = 1;
+    staging_desc.SampleDesc.Quality = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(self->mDevice->CreateTexture2D(&staging_desc, nullptr, staging.GetAddressOf()))) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG: CreateTexture2D(staging) failed");
+        return false;
+    }
+
+    // If the back buffer is multisampled, we'd need to resolve first. The port
+    // uses no MSAA on the swap chain (BufferCount=3, SampleDesc.Count=1), so
+    // CopyResource is fine. If we ever enable MSAA, add ResolveSubresource.
+    if (bb_desc.SampleDesc.Count > 1) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG: MSAA back buffer not supported");
+        return false;
+    }
+
+    self->mContext->CopyResource(staging.Get(), back_buffer.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(self->mContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG: Map(staging) failed");
+        return false;
+    }
+
+    const uint32_t w = bb_desc.Width;
+    const uint32_t h = bb_desc.Height;
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+
+    const uint8_t* src_base = reinterpret_cast<const uint8_t*>(mapped.pData);
+    bool supported = true;
+
+    // Handle common swap chain formats. Swap chain is created as
+    // DXGI_FORMAT_R8G8B8A8_UNORM (see gfx_dxgi.cpp CreateSwapChain), so the
+    // RGBA branch is the hot path. BGRA8 is kept as a fallback for safety.
+    switch (bb_desc.Format) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: {
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* src_row = src_base + static_cast<size_t>(y) * mapped.RowPitch;
+                uint8_t* dst_row = rgba.data() + static_cast<size_t>(y) * w * 4;
+                memcpy(dst_row, src_row, static_cast<size_t>(w) * 4);
+                // Force alpha to 0xFF so the PNG is fully opaque regardless
+                // of what the renderer left in the alpha channel.
+                for (uint32_t x = 0; x < w; ++x) {
+                    dst_row[x * 4 + 3] = 0xFF;
+                }
+            }
+            break;
+        }
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
+            for (uint32_t y = 0; y < h; ++y) {
+                const uint8_t* src_row = src_base + static_cast<size_t>(y) * mapped.RowPitch;
+                uint8_t* dst_row = rgba.data() + static_cast<size_t>(y) * w * 4;
+                for (uint32_t x = 0; x < w; ++x) {
+                    dst_row[x * 4 + 0] = src_row[x * 4 + 2];
+                    dst_row[x * 4 + 1] = src_row[x * 4 + 1];
+                    dst_row[x * 4 + 2] = src_row[x * 4 + 0];
+                    dst_row[x * 4 + 3] = 0xFF;
+                }
+            }
+            break;
+        }
+        default:
+            SPDLOG_WARN("portFastCaptureBackbufferPNG: unsupported format {}",
+                        static_cast<int>(bb_desc.Format));
+            supported = false;
+            break;
+    }
+
+    self->mContext->Unmap(staging.Get(), 0);
+
+    if (!supported) {
+        return false;
+    }
+
+    int ok = stbi_write_png(path, static_cast<int>(w), static_cast<int>(h), 4,
+                            rgba.data(), static_cast<int>(w * 4));
+    if (ok == 0) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG: stbi_write_png failed for {}", path);
+        return false;
+    }
+    return true;
+}
+
 } // namespace Fast
+
+// C-callable entry point for the port. Defined outside the Fast namespace so
+// the symbol is reachable from port/gameloop.cpp without any namespace dance.
+extern "C" int portFastCaptureBackbufferPNG(const char* path) {
+    try {
+        return Fast::CaptureBackbufferToPNG_DX11(path) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+#else // !ENABLE_DX11
+
+// Stub when DX11 backend is disabled, so the port always has a symbol to link.
+extern "C" int portFastCaptureBackbufferPNG(const char* path) {
+    (void)path;
+    return 0;
+}
+
 #endif
