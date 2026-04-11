@@ -1175,11 +1175,21 @@ bool Metal_IsSupported() {
     // iOS always supports Metal and MTLCopyAllDevices is not available
     return true;
 #else
+    // MTLCopyAllDevices() returns a retained, autoreleased NSArray. Calling
+    // it from a C++ context without an NSAutoreleasePool in scope crashes on
+    // some macOS versions because the framework assumes there is one to
+    // register the return value against. Wrap the probe in an explicit pool
+    // so detection is safe no matter who invoked us.
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
     NS::Array* devices = MTLCopyAllDevices();
-    NS::UInteger count = devices->count();
+    NS::UInteger count = (devices != nullptr) ? devices->count() : 0;
 
-    devices->release();
+    if (devices != nullptr) {
+        devices->release();
+    }
 
+    pool->release();
     return count > 0;
 #endif
 }
