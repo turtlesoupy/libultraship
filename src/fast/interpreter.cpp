@@ -2439,6 +2439,64 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             if (segIndex == mInterpolationIndex)
                 mSegmentPointers[segNumber] = data;
         } break;
+        case G_MW_MATRIX: {
+            // SSB64 (and other titles using draw types that build custom MVPs)
+            // emits gSPMvpRecalc + a sequence of gMoveWd(G_MW_MATRIX, ...) to
+            // patch individual integer/fractional halves of the RSP's MVP
+            // matrix in flight.  On N64 these write directly into the matrix
+            // DMEM slots; the next vertex transform reads the patched MVP.
+            //
+            // Fast3D keeps MP_matrix recomputed eagerly in GfxSpMatrix, so we
+            // emulate the patches by decomposing the relevant float entries
+            // back into the s15.16 fixed-point pair, overwriting just the
+            // half the gMoveWd targets, and recomposing.  The next G_MTX call
+            // will overwrite MP_matrix from M*P again, wiping the patches —
+            // same as the N64 hardware.
+            //
+            // Layout (mirrors GfxSpMatrix decoder above):
+            //   bytes 0x00..0x1F = integer halves, 8 u32 entries
+            //   bytes 0x20..0x3F = fractional halves, 8 u32 entries
+            //   each u32 packs two adjacent matrix elements in the same row:
+            //     high16 = m[row][col_a] half, low16 = m[row][col_b] half
+            //   slot index = (offset & 0x1F) / 4
+            //   row = slot / 2, col_a = (slot % 2) * 2, col_b = col_a + 1
+            const bool is_frac = (offset & 0x20) != 0;
+            const int slot = (offset & 0x1F) >> 2; // 0..7
+            const int row = slot >> 1;
+            const int col_a = (slot & 1) << 1;
+            const int col_b = col_a + 1;
+            const uint32_t v = (uint32_t)data;
+
+            auto encode = [](float f) -> int32_t {
+                return (int32_t)lrintf(f * 65536.0f);
+            };
+            auto decode = [](int32_t fx) -> float {
+                return (float)fx * (1.0f / 65536.0f);
+            };
+
+            int32_t fx_a = encode(mRsp->MP_matrix[row][col_a]);
+            int32_t fx_b = encode(mRsp->MP_matrix[row][col_b]);
+
+            const uint16_t new_a = (uint16_t)(v >> 16);
+            const uint16_t new_b = (uint16_t)(v & 0xFFFF);
+
+            // Replace half of each fixed-point pair without disturbing the
+            // other half.  All math is done as uint32_t to avoid signed-shift
+            // UB; the final cast back to int32_t reinterprets bit 31 as the
+            // sign of the s15.16 value, matching the existing decoder.
+            const uint32_t fx_a_u = (uint32_t)fx_a;
+            const uint32_t fx_b_u = (uint32_t)fx_b;
+            if (is_frac) {
+                fx_a = (int32_t)((fx_a_u & 0xFFFF0000u) | new_a);
+                fx_b = (int32_t)((fx_b_u & 0xFFFF0000u) | new_b);
+            } else {
+                fx_a = (int32_t)(((uint32_t)new_a << 16) | (fx_a_u & 0xFFFFu));
+                fx_b = (int32_t)(((uint32_t)new_b << 16) | (fx_b_u & 0xFFFFu));
+            }
+
+            mRsp->MP_matrix[row][col_a] = decode(fx_a);
+            mRsp->MP_matrix[row][col_b] = decode(fx_b);
+        } break;
     }
 }
 
@@ -4695,6 +4753,15 @@ static constexpr UcodeHandler otrHandlers = {
 static constexpr UcodeHandler f3dex2Handlers = {
     { F3DEX2_G_NOOP, { "G_NOOP", gfx_noop_handler_f3dex2 } },
     { F3DEX2_G_SPNOOP, { "G_SPNOOP", gfx_noop_handler_f3dex2 } },
+    // gSPMvpRecalc — SSB64 emits this before patching the MVP via G_MW_MATRIX
+    // moveword writes (see src/sys/objdisplay.c draw types 41-46).  On N64 the
+    // microcode marks the MVP cache dirty so the next vertex transform recomputes
+    // it from M*P; the patches that follow then overwrite individual MVP slots.
+    // Fast3D recomputes MP_matrix eagerly inside GfxSpMatrix, so this command is
+    // a no-op for us — the G_MW_MATRIX case in GfxSpMovewordF3dex2 does the
+    // actual work.  Without this entry the interpreter spammed [critical]
+    // "Unhandled OP code: 0xD5" once per emission.
+    { F3DEX2_G_SPECIAL_1, { "G_SPECIAL_1", gfx_noop_handler_f3dex2 } },
     { F3DEX2_G_CULLDL, { "G_CULLDL", gfx_cull_dl_handler_f3dex2 } },
     { F3DEX2_G_MTX, { "G_MTX", gfx_mtx_handler_f3dex2 } },
     { F3DEX2_G_POPMTX, { "G_POPMTX", gfx_pop_mtx_handler_f3dex2 } },
