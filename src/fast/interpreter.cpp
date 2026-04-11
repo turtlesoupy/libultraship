@@ -2625,7 +2625,7 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         uint32_t paletteByteOffset = (tmem - 256) * 2;
 
         if (high_index == 255 && paletteByteOffset == 0) {
-            // CI8: full 256-entry palette spanning both halves
+            // CI8: full 256-entry palette spanning both halves (fast path).
             memcpy(mRdp->palette_staging[0], src, 256);
             memcpy(mRdp->palette_staging[1], src + 256, 256);
             mRdp->palettes[0] = mRdp->palette_staging[0];
@@ -2633,13 +2633,32 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
             mRdp->palette_dram_addr[0] = src;
             mRdp->palette_dram_addr[1] = src + 256;
         } else if (paletteByteOffset < 256) {
-            // Palettes 0-7 range
-            uint32_t copyLen = (paletteByteOffset + byteCount <= 256) ? byteCount : (256 - paletteByteOffset);
-            memcpy(mRdp->palette_staging[0] + paletteByteOffset, src, copyLen);
+            // Load starts in the first palette half (palettes 0-7).
+            // Fill staging[0] up to the half boundary.
+            uint32_t firstLen = (paletteByteOffset + byteCount <= 256) ? byteCount : (256 - paletteByteOffset);
+            memcpy(mRdp->palette_staging[0] + paletteByteOffset, src, firstLen);
             mRdp->palettes[0] = mRdp->palette_staging[0];
             mRdp->palette_dram_addr[0] = src;
+
+            // PORT: if the load crosses the half boundary, spill the remaining
+            // bytes into staging[1].  On real N64 hardware a single LOADTLUT
+            // copies (high_index + 1) entries starting at the tile's tmem
+            // offset, and a load that begins in the lower half but extends
+            // past it naturally continues into the upper half.  SSB64 uses
+            // this pattern for several CI8 materials whose authors chose a
+            // non-standard high_index (e.g. textbooks at hi=254, wall posters
+            // at hi=212/226) — without this spill the upper half of the
+            // palette is left holding stale data and roughly half of each
+            // affected texture samples garbage colors.
+            if (paletteByteOffset + byteCount > 256) {
+                uint32_t spilloverLen = (paletteByteOffset + byteCount) - 256;
+                if (spilloverLen > 256) spilloverLen = 256;
+                memcpy(mRdp->palette_staging[1], src + firstLen, spilloverLen);
+                mRdp->palettes[1] = mRdp->palette_staging[1];
+                mRdp->palette_dram_addr[1] = src + firstLen;
+            }
         } else {
-            // Palettes 8-15 range
+            // Load starts in the second palette half (palettes 8-15).
             uint32_t offset = paletteByteOffset - 256;
             uint32_t copyLen = (offset + byteCount <= 256) ? byteCount : (256 - offset);
             memcpy(mRdp->palette_staging[1] + offset, src, copyLen);
