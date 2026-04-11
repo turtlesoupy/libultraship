@@ -2424,6 +2424,42 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             mRsp->current_num_lights = data / 24 + 1; // add ambient light
             mRsp->lights_changed = true;
             break;
+        case G_MW_LIGHTCOL: {
+            // gSPLightColor(pkt, n, col) expands to two gMoveWd(G_MW_LIGHTCOL)
+            // commands: one at offset aLIGHT_n (populates light.l.col) and one
+            // at offset bLIGHT_n (populates light.l.colc).  For F3DEX2 the
+            // light slots are 24 bytes apart (aLIGHT_1=0, bLIGHT_1=4,
+            // aLIGHT_2=0x18, bLIGHT_2=0x1C, aLIGHT_3=0x30, ...).
+            //
+            // Without this case the command was a no-op, so per-material
+            // light color overrides (e.g. SSB64's fighters) never reached the
+            // RSP and every lit material rendered with whatever stale light
+            // the RSP last held — typically the scene-default white from
+            // ftDisplayLightsDrawReflect.
+            //
+            // `data` carries an N64-format packcol where R/G/B occupy the top
+            // three bytes: (r << 24) | (g << 16) | (b << 8) | a.  This is the
+            // same byte layout the F3DLight_t struct uses in DMEM, so we
+            // write directly into col/colc.
+            const int light_idx = offset / 24;   // 0-based light slot
+            const bool is_b = (offset & 4) != 0; // bLIGHT (colc) vs aLIGHT (col)
+            if (light_idx >= 0 && light_idx <= MAX_LIGHTS) {
+                F3DLight& light = mRsp->current_lights[light_idx];
+                uint8_t r = (uint8_t)(data >> 24);
+                uint8_t g = (uint8_t)(data >> 16);
+                uint8_t b = (uint8_t)(data >> 8);
+                if (is_b) {
+                    light.l.colc[0] = r;
+                    light.l.colc[1] = g;
+                    light.l.colc[2] = b;
+                } else {
+                    light.l.col[0] = r;
+                    light.l.col[1] = g;
+                    light.l.col[2] = b;
+                }
+                mRsp->lights_changed = true;
+            }
+        } break;
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
             mRsp->fog_offset = (int16_t)data;
