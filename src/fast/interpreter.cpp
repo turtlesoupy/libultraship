@@ -39,6 +39,7 @@ extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
                                          uint32_t* out_file_id, const char** out_path);
 extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
+extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -2554,6 +2555,13 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
 
+    // PORT: lazy palette byte-order fixup.  CI texture palettes are 16-bit
+    // RGBA5551 entries that pass1 BSWAP32 has corrupted (each 4-byte word
+    // has its bytes reversed, swapping the two pixels in the word AND each
+    // pixel's byte order).  Apply BSWAP32 to restore N64 BE order before
+    // copying into palette_staging.  Idempotent.
+    portRelocFixupTextureAtRuntime(src, byteCount);
+
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;
@@ -2615,6 +2623,14 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.h_byte_scale;
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale;
     }
+
+    // PORT: lazy texture byte-order fixup.  For data that lives inside a
+    // reloc file, the on-disk texture is in N64 BE byte order; pass1 BSWAP32
+    // reversed each u32 word.  This call applies BSWAP32 again idempotently
+    // the first time a texture is loaded.  Catches runtime-built fighter
+    // material loadblocks that pass2 and the chain walk both miss.
+    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr, orig_size_bytes);
+
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
     // Compute actual per-line DRAM stride from SetTextureImage width when available.
@@ -2713,6 +2729,13 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         full_image_line_size_bytes *= h_byte_scale;
         tile_line_size_bytes *= h_byte_scale;
     }
+
+    // PORT: lazy texture byte-order fixup for the LoadTile path.  Use the
+    // upper-bound size (start offset + tile size) to over-include since we
+    // don't know the exact full-image dimensions; the fixup is idempotent so
+    // covering extra bytes is safe.
+    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr,
+                                   start_offset_bytes + orig_size_bytes);
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
