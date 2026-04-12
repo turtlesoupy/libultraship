@@ -286,6 +286,7 @@ struct RDP {
         uint8_t siz;
         uint8_t cms, cmt;
         uint8_t shifts, shiftt;
+        uint8_t masks, maskt; // PORT: wrap masks (N64 mask_s, mask_t) — 0 means no mask
         float uls, ult, lrs, lrt;
         uint16_t tmem; // 0-511, in 64-bit word units
         uint32_t line_size_bytes;

@@ -786,6 +786,20 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         height = tile_h;
     }
 
+    // PORT: clamp to masks/maskt wrap bounds. See ImportTextureCi4 for rationale.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
+    }
+
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width * 2;
@@ -1143,6 +1157,29 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         height = tile_h;
     }
 
+    // PORT: Clamp decoded width/height to the tile's `masks/maskt` wrap
+    // bounds if they're tighter than the line-derived width.  N64 hardware
+    // uses masks to define the "active" texture size, with the wrap mode
+    // repeating it beyond.  Fast3D's line_size_bytes-based width can be
+    // larger than the actual logical texture (e.g. a 16px-wide line with
+    // masks=3 = 8px-wide texture), so the trailing columns are padding
+    // whose indices decode to whatever's lying in TMEM — typically zero,
+    // yielding a half-black image for CI4 materials whose palette entry 0
+    // is opaque black.  Clamping width/height to the masks-based size
+    // matches the N64 sampler's behaviour and eliminates the black padding.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
+    }
+
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = resultLineSizeBytes;
     }
@@ -1226,6 +1263,20 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
     if (tile_h > 0 && tile_h < height) {
         height = tile_h;
+    }
+
+    // PORT: clamp to masks/maskt wrap bounds. See ImportTextureCi4 for rationale.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
@@ -2620,6 +2671,8 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     mRdp->texture_tile[tile].cmt = cmt;
     mRdp->texture_tile[tile].shifts = shifts;
     mRdp->texture_tile[tile].shiftt = shiftt;
+    mRdp->texture_tile[tile].masks = (uint8_t)masks;
+    mRdp->texture_tile[tile].maskt = (uint8_t)maskt;
     mRdp->texture_tile[tile].line_size_bytes = line * 8;
 
     mRdp->texture_tile[tile].tmem = tmem;
