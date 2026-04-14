@@ -754,6 +754,38 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
+// Clamp an upload-width to the tile's SetTileSize extent.  The game sets
+// SetTileSize(0, 0, (width-1)<<2, (height-1)<<2) to mark the drawable
+// tile area — on N64 hardware the sampler clamps s/t past these bounds
+// and the out-of-bounds texels are never read.  On the port, though,
+// ImportTexture* uploads the full TMEM line stride (rounded up from
+// `width` to qword alignment, so `width_img` ≥ `width`) as the GPU
+// texture width, while `GfxSpTri1` normalizes UV by the SetTileSize
+// clamped width.  The mismatch stretches the texture: sampling at the
+// rightmost drawn pixel lands on GPU col `width_img - 1` instead of
+// `width - 1`, so any trailing bytes in [width, width_img) bleed into
+// the render (the original MARIO title-card smear) and the bilinear
+// filter at the right edge can't average with a real clamped-edge
+// value (the later title-border dim slice).
+//
+// Fix: when SetTileSize declares a drawable extent smaller than the
+// natural TMEM line size, also clamp the upload width to match so the
+// GPU texture is exactly `width` pixels wide.  Then the UV
+// normalization, the SpTri1 tex_width clamp, and OpenGL's
+// CLAMP_TO_EDGE all agree on the same right-edge pixel.
+//
+// `naturalWidthPixels` is the per-row texel count before clamping.
+// `tile_uls` / `tile_lrs` are in S10.2 (texel * 4) units.
+static uint32_t ClampUploadWidthToTile(uint32_t naturalWidthPixels, uint32_t tile_uls, uint32_t tile_lrs) {
+    if (tile_lrs > tile_uls) {
+        uint32_t clampPixels = (tile_lrs - tile_uls + 4) / 4;
+        if (clampPixels > 0 && clampPixels < naturalWidthPixels) {
+            return clampPixels;
+        }
+    }
+    return naturalWidthPixels;
+}
+
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -942,13 +974,16 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t lineSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
 
-    uint32_t width = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
-                                          mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t height = width > 0 ? sizeBytes / width : 0;
+    uint32_t naturalWidth = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
+                                                 mRdp->texture_tile[tile].line_size_bytes);
+    uint32_t height = naturalWidth > 0 ? sizeBytes / naturalWidth : 0;
 
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width;
+        fullImageLineSizeBytes = naturalWidth;
     }
+
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -1036,13 +1071,16 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes * 2;
+    uint32_t naturalWidth = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width / 2;
+        fullImageLineSizeBytes = naturalWidth / 2;
     }
+
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
 
