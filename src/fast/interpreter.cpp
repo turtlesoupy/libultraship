@@ -1508,9 +1508,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             } else if (siz == G_IM_SIZ_32b) {
                 ImportTextureRgba32(tile, importReplacement);
             } else {
-                SPDLOG_ERROR("RGBA Texture that isn't 16 or 32 bit. Size = {}", siz);
-                // OTRTODO: Sometimes, seemingly randomly, we end up here. Could be a bad dlist, could be
-                // something F3D does not have supported. Further investigation is needed.
+                static int sRgbaErrLogCount = 0;
+                if (sRgbaErrLogCount < 40) {
+                    SPDLOG_ERROR("RGBA Texture invalid siz={} tile={} fmt={} addr={} line={} width={} height={} palette={} origSize={}",
+                        siz, tile, fmt, (const void *)origAddr,
+                        mRdp->texture_tile[tile].line_size_bytes,
+                        mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 1,
+                        mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 1,
+                        paletteIndex, origSizeBytes);
+                    sRgbaErrLogCount++;
+                }
             }
             break;
         case G_IM_FMT_IA:
@@ -1521,8 +1528,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             } else if (siz == G_IM_SIZ_16b) {
                 ImportTextureIA16(tile, importReplacement);
             } else {
-                SPDLOG_ERROR("IA Texture that isn't 4, 8, or 16 bit. Size = {}", siz);
-                ;
+                SPDLOG_ERROR("IA Texture invalid siz={} tile={}", siz, tile);
             }
             break;
         case G_IM_FMT_CI:
