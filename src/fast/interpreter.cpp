@@ -805,7 +805,17 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes / 2;
+    // naturalWidth = pre-clamp TMEM-line-derived pixel count. Used for the
+    // DRAM stride reassignment below so that the decode's source indexing
+    // stays consistent with the real row stride when `width` (the decode
+    // extent) gets clamped tighter by tile/mask bounds. Mirrors the
+    // ClampUploadWidthToTile fix landed for IA8/I4 (see
+    // docs/bugs/title_border_right_edge_slice_2026-04-14.md); without it the
+    // reassignment used the clamped width and pulled each subsequent row
+    // from the wrong offset → diagonal shear across every RGBA16 sprite
+    // whose `bitmap->width < bitmap->width_img`.
+    uint32_t naturalWidth = widthBytes / 2;
+    uint32_t width = naturalWidth;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize (mipmap pyramids include all levels).
@@ -832,9 +842,10 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         }
     }
 
-    // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
+    // Set DRAM row stride from the *unclamped* naturalWidth when the
+    // LoadBlock was flat (no explicit width). See naturalWidth comment above.
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width * 2;
+        fullImageLineSizeBytes = naturalWidth * 2;
     }
 
     uint32_t i = 0;
@@ -879,7 +890,10 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, full_image_line_size_bytes, size_bytes,
                                                mRdp->texture_tile[tile].line_size_bytes * 2);
-    uint32_t width = widthBytes / 4;
+    // See ImportTextureRgba16 for the naturalWidth / ClampUploadWidthToTile
+    // rationale — same class of bug, stretched across 4-byte pixels.
+    uint32_t naturalWidth = widthBytes / 4;
+    uint32_t width = naturalWidth;
     uint32_t height = widthBytes > 0 ? size_bytes / widthBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize
@@ -893,7 +907,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     }
 
     if (full_image_line_size_bytes == size_bytes) {
-        full_image_line_size_bytes = width * 4;
+        full_image_line_size_bytes = naturalWidth * 4;
     }
 
     // Copy pixel by pixel, respecting full image stride (handles sub-tile loads)
@@ -1267,22 +1281,15 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         return;
     }
 
-    for (uint32_t i = 0, j = 0; i < sizeBytes; j += fullImageLineSizeBytes - lineSizeBytes) {
-        for (uint32_t k = 0; k < lineSizeBytes; i++, k++, j++) {
-            uint8_t idx = addr[j];
-            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
-                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
-            uint8_t a = col16 & 1;
-            uint8_t r = col16 >> 11;
-            uint8_t g = (col16 >> 6) & 0x1f;
-            uint8_t b = (col16 >> 1) & 0x1f;
-            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
-            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
-            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
-            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
-        }
-    }
-
+    // Compute width/height + clamps *before* decode so the decode loop
+    // produces a `width × height` packed buffer that matches the
+    // UploadTexture call below.  Previously the decode wrote
+    // `lineSizeBytes × (sizeBytes/lineSizeBytes)` pixels contiguously and
+    // the post-decode width clamp made the subsequent upload read rows at
+    // the wrong offset — diagonal shear across every CI8 sprite where
+    // `bitmap->width < bitmap->width_img` (e.g. the tutorial "How to Play"
+    // banner and the textbox).  Structurally mirrors the RGBA16 /
+    // ImportTextureCi4 paths.
     uint32_t baseLineSizeBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                       mRdp->texture_tile[tile].line_size_bytes);
     uint32_t resultLineSizeBytes = baseLineSizeBytes;
@@ -1290,7 +1297,8 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         resultLineSizeBytes *= metadata->h_byte_scale;
     }
 
-    uint32_t width = resultLineSizeBytes;
+    uint32_t naturalWidth = resultLineSizeBytes;
+    uint32_t width = naturalWidth;
     uint32_t height = resultLineSizeBytes > 0 ? sizeBytes / resultLineSizeBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize
@@ -1314,6 +1322,31 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
         if (mask_h > 0 && mask_h < height) {
             height = mask_h;
+        }
+    }
+
+    // Flat-LoadBlock fallback: the real DRAM row stride is naturalWidth
+    // bytes (CI8 = 1 byte per texel), not the whole image.  Matches
+    // ImportTextureCi4 / ImportTextureRgba16.
+    if (fullImageLineSizeBytes == sizeBytes) {
+        fullImageLineSizeBytes = naturalWidth;
+    }
+
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t idx = addr[y * fullImageLineSizeBytes + x];
+            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
+                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
+            uint8_t a = col16 & 1;
+            uint8_t r = col16 >> 11;
+            uint8_t g = (col16 >> 6) & 0x1f;
+            uint8_t b = (col16 >> 1) & 0x1f;
+            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
+            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
+            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
+            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
+            i++;
         }
     }
 
