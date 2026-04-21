@@ -3183,6 +3183,21 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
 void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls,
                                         int16_t ult, int16_t dsdx, int16_t dtdy, bool flip) {
+    // Skip draws targeting the Z buffer.  N64 game code sometimes flips the
+    // color image to the Z buffer address, draws a texture or fill to it to
+    // manipulate depth values (e.g. for an alpha-based stencil that a
+    // following XLU draw AA-samples), then flips back to the primary FB.
+    // Fast3D doesn't emulate that address redirection — all draws go to the
+    // primary FB regardless of `color_image_address` — so the "mask" draw
+    // otherwise appears as a solid opaque rectangle behind the visible
+    // result. SSB64's off-screen fighter magnifier bubble in
+    // ifCommonPlayerMagnifyUpdateRender is the canonical case (rendered as
+    // a black square with the circle inside). Matches the same skip in
+    // GfxDpFillRectangle ("Don't clear Z buffer here since we already did
+    // it with glClear").
+    if (mRdp->color_image_address == mRdp->z_buf_address) {
+        return;
+    }
     // printf("render %d at %d\n", tile, lrx);
     uint64_t saved_combine_mode = mRdp->combine_mode;
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
