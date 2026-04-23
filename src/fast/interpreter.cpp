@@ -2973,12 +2973,21 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         tile_line_size_bytes *= h_byte_scale;
     }
 
-    // PORT: lazy texture byte-order fixup for the LoadTile path.  Use the
-    // upper-bound size (start offset + tile size) to over-include since we
-    // don't know the exact full-image dimensions; the fixup is idempotent so
-    // covering extra bytes is safe.
+    // PORT: lazy texture byte-order fixup for the LoadTile path.  The decode
+    // loop in ImportTexture* reads pixels at (y * full_image_line_size_bytes
+    // + x * pixel_size) for y in [0, tile_height), x in [0, tile_width), so
+    // we must fix up bytes all the way to
+    //   start_offset_bytes + (tile_height - 1) * full_image_line_size_bytes
+    //                      + tile_line_size_bytes.
+    // An earlier version used `start_offset_bytes + orig_size_bytes`, which
+    // equals `start_offset_bytes + tile_line_size_bytes * tile_height` and
+    // falls short whenever tile_width < full_image_width: the last row's
+    // rightmost (full_image_line_size_bytes - tile_line_size_bytes) bytes
+    // would stay in pass1-swapped (LE) state, rendering a byte-reversed
+    // opaque strip at the bottom of the tile (Yoster "thin line" bug).
+    // Fixup is idempotent so over-covering by one stride row is harmless.
     portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr,
-                                   start_offset_bytes + orig_size_bytes);
+                                   start_offset_bytes + tile_height * full_image_line_size_bytes);
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
