@@ -42,9 +42,36 @@ int32_t osContStartReadData(OSMesgQueue* mesg) {
 }
 
 void osContGetReadData(OSContPad* pad) {
-    memset(pad, 0, sizeof(OSContPad) * __osMaxControllers);
+    /* `OSContPad` means two different layouts in the same build: the
+     * LUS struct (0x24 bytes, with gyro/right-stick for OOT/MM) and the
+     * SSB64 decomp's PR/os.h struct (6 bytes: u16 button, s8 stick_x,
+     * s8 stick_y, u8 errno). The caller hands us a pointer to the
+     * game-sized array but this TU sees the LUS layout, so memsetting
+     * or writing sizeof(OSContPad) * N overruns into the next BSS
+     * symbol. In SSB64 that neighbor is `sSYControllerDescs[]`, whose
+     * leading `unk00` is the prior-frame button state used for edge
+     * detection — zeroing it every Read made a held button re-fire an
+     * edge every frame, which presented as 2–3x menu input.
+     *
+     * Write into a local LUS-layout buffer, then copy only the fields
+     * the game's struct actually has. */
+    struct GameContPad {
+        uint16_t button;
+        int8_t   stick_x;
+        int8_t   stick_y;
+        uint8_t  err_no;
+    };
 
-    Ship::Context::GetInstance()->GetControlDeck()->WriteToPad(pad);
+    OSContPad lus_pads[MAXCONTROLLERS] = {};
+    Ship::Context::GetInstance()->GetControlDeck()->WriteToPad(lus_pads);
+
+    GameContPad* out = reinterpret_cast<GameContPad*>(pad);
+    for (int i = 0; i < __osMaxControllers; i++) {
+        out[i].button  = static_cast<uint16_t>(lus_pads[i].button);
+        out[i].stick_x = lus_pads[i].stick_x;
+        out[i].stick_y = lus_pads[i].stick_y;
+        out[i].err_no  = lus_pads[i].err_no;
+    }
 }
 
 void osSetTime(OSTime time) {
