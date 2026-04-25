@@ -3336,7 +3336,21 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
 
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     if (mRdp->color_image_address == mRdp->z_buf_address) {
-        // Don't clear Z buffer here since we already did it with glClear
+        // PORT: SSB64's mvOpeningRoom transition Outline issues a full-screen
+        // FillRectangle to ZB right before drawing the visible silhouette tris
+        // with G_RM_AA_OPA_SURF (Z_CMP enabled). On real hardware that fill
+        // rewrites Z to a uniform value so the subsequent tris always pass
+        // depth comparison. Previously we just skipped this entirely under
+        // the assumption that the framebuffer's depth attachment had already
+        // been cleared by a glClear at start-of-frame, but that assumption
+        // doesn't hold mid-frame: the wallpaper drew with G_RM_AA_ZB_OPA_SURF
+        // (Z_UPD set) and filled the depth buffer with its own values, so
+        // Outline tris Z-fail and the transition silhouette never appears.
+        // Treat the redirect-fill as an actual depth clear so the Outline's
+        // subsequent OPA tris have a clean Z buffer to draw against.
+        Flush();
+        mRapi->ClearFramebuffer(false, true);
+        mRenderingState.depth_test_and_mask = 0xff; /* invalidate cached state */
         return;
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
