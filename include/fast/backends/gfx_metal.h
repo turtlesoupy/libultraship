@@ -208,6 +208,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     int mCurrentTile;
     uint32_t mCurrentTextureIds[SHADER_MAX_TEXTURES];
+    // 1x1 black RGBA texture used as a fallback when a fragment shader's sampler slot
+    // would otherwise alias mTextures[0] (the screen drawable). Set up in Init() after the
+    // screen framebuffer is created. Mirrors OpenGL/GLD's "zero texture for unbound sampler"
+    // substitution, preventing shader-side feedback loops on combine modes that declare
+    // TEXEL1 without loading TMEM tile 1.
+    uint32_t mFallbackTextureId = 0;
 
     int32_t mRenderTargetHeight;
     int mCurrentFramebuffer;

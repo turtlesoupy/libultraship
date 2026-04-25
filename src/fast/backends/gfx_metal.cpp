@@ -191,6 +191,43 @@ void GfxRenderingAPIMetal::Init() {
     mConvertToRgb5a1Function = library->newFunction(NS::String::string("convertToRGB5A1", NS::UTF8StringEncoding));
 
     library->release();
+
+    // Allocate a 1x1 transparent-black RGBA texture for use as a fallback when a fragment
+    // shader sampler slot would otherwise default to mTextures[0] (the screen drawable).
+    // Without this, a CC mode that declares TEXEL1 but whose tile 1 was never loaded ends
+    // up sampling the screen color buffer mid-render — a visible feedback loop on Metal.
+    // OpenGL's GLD driver substitutes a zero texture in the same situation; this matches.
+    {
+        mFallbackTextureId = NewTexture();
+        TextureDataMetal& fallback = mTextures[mFallbackTextureId];
+
+        MTL::TextureDescriptor* desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, 1, 1, false);
+        desc->setStorageMode(MTL::StorageModeShared);
+        fallback.texture = mDevice->newTexture(desc);
+        fallback.width = 1;
+        fallback.height = 1;
+        const uint8_t zero_pixel[4] = { 0, 0, 0, 0 };
+        fallback.texture->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, zero_pixel, 4);
+
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        sd->setMinFilter(MTL::SamplerMinMagFilterNearest);
+        sd->setMagFilter(MTL::SamplerMinMagFilterNearest);
+        sd->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+        sd->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+        sd->setRAddressMode(MTL::SamplerAddressModeClampToEdge);
+        fallback.sampler = mDevice->newSamplerState(sd);
+        fallback.filtering = FILTER_LINEAR;
+        fallback.linear_filtering = false;
+        sd->release();
+
+        // Point every sampler slot at the fallback by default. Real ImportTexture calls
+        // overwrite per-slot indices as they happen.
+        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+            mCurrentTextureIds[i] = mFallbackTextureId;
+        }
+    }
+
     autorelease_pool->release();
 }
 
@@ -481,20 +518,30 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
 
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
         if (mShaderProgram->usedTextures[i]) {
-            if (current_framebuffer.mLastBoundTextures[i] != mTextures[mCurrentTextureIds[i]].texture) {
-                current_framebuffer.mLastBoundTextures[i] = mTextures[mCurrentTextureIds[i]].texture;
-                current_framebuffer.mCommandEncoder->setFragmentTexture(mTextures[mCurrentTextureIds[i]].texture, i);
+            uint32_t tid = mCurrentTextureIds[i];
+            MTL::Texture* tex = mTextures[tid].texture;
+            MTL::SamplerState* smp = mTextures[tid].sampler;
+            // Backstop: if the binding for a slot the shader actually uses would alias the
+            // screen drawable (mTextures[0]) or has no MTL::Texture/sampler yet, redirect
+            // to the 1x1 black fallback so the shader samples zeros instead of the live
+            // color buffer it is rendering into.
+            if (tid == 0 || tex == nullptr || smp == nullptr) {
+                tid = mFallbackTextureId;
+                tex = mTextures[tid].texture;
+                smp = mTextures[tid].sampler;
+            }
 
-                if (current_framebuffer.mLastBoundSamplers[i] != mTextures[mCurrentTextureIds[i]].sampler) {
-                    current_framebuffer.mLastBoundSamplers[i] = mTextures[mCurrentTextureIds[i]].sampler;
-                    current_framebuffer.mCommandEncoder->setFragmentSamplerState(
-                        mTextures[mCurrentTextureIds[i]].sampler, i);
-                }
+            if (current_framebuffer.mLastBoundTextures[i] != tex) {
+                current_framebuffer.mLastBoundTextures[i] = tex;
+                current_framebuffer.mCommandEncoder->setFragmentTexture(tex, i);
+            }
+            if (current_framebuffer.mLastBoundSamplers[i] != smp) {
+                current_framebuffer.mLastBoundSamplers[i] = smp;
+                current_framebuffer.mCommandEncoder->setFragmentSamplerState(smp, i);
             }
         }
 
         if (mCurrentFilterMode == FILTER_THREE_POINT) {
-            mDrawUniforms.textureFiltering[i] = mTextures[mCurrentTextureIds[i]].filtering;
             mDrawUniforms.textureFiltering[i] = mTextures[mCurrentTextureIds[i]].filtering;
             textures_changed = true;
         }
