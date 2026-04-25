@@ -2034,6 +2034,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     bool depth_test = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    // PORT: SSB64's mvOpeningRoom transition Overlay/Outline use the N64
+    // "redirect color image to Z buffer" idiom: tris are drawn with G_ZBUFFER
+    // set in geometry_mode but no Z_CMP/Z_UPD in render mode, so on real
+    // hardware they bypass depth comparison and write into the ZB as if it
+    // were a colour buffer. Fast3D ignores the colour-image redirect (so
+    // those tris land on the primary FB instead) and also derives
+    // depth_test from G_ZBUFFER alone — which Z-rejects them against the
+    // stale ZB content from the previous scene draw, making the explosion
+    // sprite invisible. When the redirect is active, gate depth_test on
+    // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
+    // white tris reach the framebuffer.
+    if (mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr) {
+        depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+        depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
