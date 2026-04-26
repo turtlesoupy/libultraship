@@ -2045,7 +2045,8 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // sprite invisible. When the redirect is active, gate depth_test on
     // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
     // white tris reach the framebuffer.
-    if (mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr) {
+    bool redirect_active = mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr;
+    if (redirect_active) {
         depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
         depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     }
@@ -2291,9 +2292,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    // PORT: G_ZS_PRIM source overrides per-vertex Z with the constant Z set by
+    // gDPSetPrimDepth. SSB64 (and many other N64 titles) use this to place 2D
+    // sprites at a specific Z-buffer depth so subsequent 3D geometry layers
+    // correctly. We map the 16-bit N64 Z linearly to clip-space Z; combined with
+    // the per-API z_is_from_0_to_1 flag this lands the sprite at the intended
+    // depth on both Metal/D3D ([0,1]) and OpenGL ([-1,1]). dz is ignored — the
+    // depth-slope is irrelevant once we're producing post-projection Z directly.
+    bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) == G_ZS_PRIM;
+    float prim_depth_ndc = (float)mRdp->prim_depth_z / 65535.0f; // 0..1 (Metal-style)
+    if (!clip_parameters.z_is_from_0_to_1) {
+        prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
+    }
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
-        if (clip_parameters.z_is_from_0_to_1) {
+        if (use_prim_depth) {
+            // Multiply by w so the Metal/GL perspective divide produces prim_depth_ndc.
+            z = prim_depth_ndc * w;
+        } else if (clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
 
@@ -4181,8 +4198,14 @@ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     return true;
 }
 
-bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
-    // TODO Implement this command...
+bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    // gDPSetPrimDepth packs `(z, dz)` as `_SHIFTL(z,16,16) | _SHIFTL(dz,0,16)`
+    // into words.w1; both are u16 N64 Z-buffer values. Stored here for later
+    // consumption when a draw uses other_mode_l & G_ZS_PRIM.
+    gfx->mRdp->prim_depth_z = (uint16_t)((cmd->words.w1 >> 16) & 0xFFFF);
+    gfx->mRdp->prim_depth_dz = (uint16_t)(cmd->words.w1 & 0xFFFF);
     return false;
 }
 

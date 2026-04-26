@@ -302,6 +302,14 @@ struct RDP {
     bool grayscale;
 
     uint8_t prim_lod_fraction;
+    // PORT: G_SETPRIMDEPTH stores a constant Z (and dz) used when other_mode_l has
+    // G_ZS_PRIM set. Upstream Fast3D never wired this up — game sprites rendered
+    // with gDPSetDepthSource(G_ZS_PRIM) ended up at vertex Z (typically near plane),
+    // so 2D backgrounds stomped 3D foreground geometry across the port (SSB64
+    // wallpaper occluding the explosion transition, fighter description-scene 2D
+    // logo drawing in front of the model, etc.).
+    uint16_t prim_depth_z;
+    uint16_t prim_depth_dz;
     struct RGBA env_color, prim_color, fog_color, blend_color, fill_color, grayscale_color;
     struct XYWidthHeight viewport, scissor;
     bool viewport_or_scissor_changed;
