@@ -720,7 +720,7 @@ std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
 
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     while (mTextureCache.map.bucket_count() > 0) {
-        TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0 }; // bucket index only depends on the address
+        TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0, 0, 0, 0, 0 }; // bucket index only depends on the address
         size_t bucket = mTextureCache.map.bucket(key);
         bool again = false;
         for (auto it = mTextureCache.map.begin(bucket); it != mTextureCache.map.end(bucket); ++it) {
@@ -784,6 +784,244 @@ static uint32_t ClampUploadWidthToTile(uint32_t naturalWidthPixels, uint32_t til
         }
     }
     return naturalWidthPixels;
+}
+
+static bool Ssb64RenderDiagEnabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* value = getenv("SSB64_RENDER_DIAG");
+        enabled = (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static int Ssb64RenderDiagLimit() {
+    static int limit = -1;
+    if (limit < 0) {
+        const char* value = getenv("SSB64_RENDER_DIAG_LIMIT");
+        limit = value != nullptr && value[0] != '\0' ? atoi(value) : 400;
+        if (limit <= 0) {
+            limit = 400;
+        }
+    }
+    return limit;
+}
+
+static bool Ssb64RenderDiagTakeSlot() {
+    static int count = 0;
+    if (!Ssb64RenderDiagEnabled()) {
+        return false;
+    }
+    if (count >= Ssb64RenderDiagLimit()) {
+        return false;
+    }
+    count++;
+    return true;
+}
+
+static std::string Ssb64RenderDiagTexturePath(const RawTexMetadata* metadata, const void* addr) {
+    if (metadata != nullptr && metadata->resource != nullptr) {
+        return metadata->resource->GetInitData()->Path;
+    }
+
+    const char* relocPath = nullptr;
+    if (addr != nullptr && portRelocDescribePointer(addr, nullptr, nullptr, nullptr, &relocPath) && relocPath != nullptr) {
+        return relocPath;
+    }
+
+    return "(raw)";
+}
+
+static bool Ssb64RenderDiagDescribePointer(const void* addr, uintptr_t* base, size_t* size, uint32_t* fileId) {
+    if (addr == nullptr) {
+        return false;
+    }
+    return portRelocDescribePointer(addr, base, size, fileId, nullptr);
+}
+
+static bool Ssb64RenderDiagFileIdMatches(uint32_t fileId, const char* list) {
+    if (list == nullptr || list[0] == '\0') {
+        return false;
+    }
+
+    const char* cursor = list;
+    while (*cursor != '\0') {
+        char* end = nullptr;
+        unsigned long parsed = strtoul(cursor, &end, 0);
+        if (end != cursor && static_cast<uint32_t>(parsed) == fileId) {
+            return true;
+        }
+        cursor = end != cursor ? end : cursor + 1;
+        while (*cursor == ',' || *cursor == ' ' || *cursor == ';' || *cursor == ':') {
+            cursor++;
+        }
+    }
+
+    return false;
+}
+
+static bool Ssb64RenderDiagParseUlongEnv(const char* name, unsigned long* out) {
+    const char* value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    char* end = nullptr;
+    unsigned long parsed = strtoul(value, &end, 0);
+    if (end == value) {
+        return false;
+    }
+
+    *out = parsed;
+    return true;
+}
+
+static bool Ssb64RenderDiagNamedFilterMatches(uint32_t fileId, const char* filter) {
+    if (filter == nullptr) {
+        return false;
+    }
+
+    if (strcmp(filter, "Star") == 0 || strcmp(filter, "star") == 0) {
+        return fileId == 0xfb || fileId == 0xff || fileId == 0x58 || fileId == 0x2c;
+    }
+    if (strcmp(filter, "Samus") == 0 || strcmp(filter, "samus") == 0) {
+        return fileId == 0xd9 || fileId == 0x140 || fileId == 0x135 || fileId == 0xda || fileId == 0x15d;
+    }
+    if (strcmp(filter, "DreamLand") == 0 || strcmp(filter, "dreamland") == 0 || strcmp(filter, "Pupupu") == 0 ||
+        strcmp(filter, "pupupu") == 0) {
+        return fileId == 0x58 || fileId == 0xff || fileId == 0x100 || fileId == 0x102;
+    }
+
+    return false;
+}
+
+static bool Ssb64RenderDiagMatches(const RawTexMetadata* metadata, const void* addr) {
+    if (!Ssb64RenderDiagEnabled()) {
+        return false;
+    }
+
+    static bool announced = false;
+    if (!announced) {
+        const char* filter = getenv("SSB64_RENDER_DIAG_FILTER");
+        const char* fileIds = getenv("SSB64_RENDER_DIAG_FILE_ID");
+        const char* minOff = getenv("SSB64_RENDER_DIAG_MIN_OFF");
+        const char* maxOff = getenv("SSB64_RENDER_DIAG_MAX_OFF");
+        SPDLOG_INFO("SSB64_RENDER_DIAG active filter='{}' file_ids='{}' min_off='{}' max_off='{}' limit={}",
+                    filter != nullptr ? filter : "", fileIds != nullptr ? fileIds : "", minOff != nullptr ? minOff : "",
+                    maxOff != nullptr ? maxOff : "", Ssb64RenderDiagLimit());
+        announced = true;
+    }
+
+    uintptr_t base = 0;
+    size_t size = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &size, &fileId);
+    unsigned long minOff = 0;
+    unsigned long maxOff = 0;
+    bool hasMinOff = Ssb64RenderDiagParseUlongEnv("SSB64_RENDER_DIAG_MIN_OFF", &minOff);
+    bool hasMaxOff = Ssb64RenderDiagParseUlongEnv("SSB64_RENDER_DIAG_MAX_OFF", &maxOff);
+    if (hasMinOff || hasMaxOff) {
+        if (!hasReloc) {
+            return false;
+        }
+
+        uintptr_t offset = reinterpret_cast<uintptr_t>(addr) - base;
+        if (hasMinOff && offset < minOff) {
+            return false;
+        }
+        if (hasMaxOff && offset > maxOff) {
+            return false;
+        }
+    }
+
+    const char* fileIdFilter = getenv("SSB64_RENDER_DIAG_FILE_ID");
+    if (hasReloc && Ssb64RenderDiagFileIdMatches(fileId, fileIdFilter)) {
+        return true;
+    }
+
+    const char* filter = getenv("SSB64_RENDER_DIAG_FILTER");
+    if ((filter == nullptr || filter[0] == '\0') && (fileIdFilter == nullptr || fileIdFilter[0] == '\0')) {
+        return true;
+    }
+
+    std::string path = Ssb64RenderDiagTexturePath(metadata, addr);
+    if (filter != nullptr && filter[0] != '\0' && path.find(filter) != std::string::npos) {
+        return true;
+    }
+    if (hasReloc && Ssb64RenderDiagNamedFilterMatches(fileId, filter)) {
+        return true;
+    }
+
+    return false;
+}
+
+static void Ssb64RenderDiagLogImport(const char* stage, const RawTexMetadata* metadata, const void* addr, int slot,
+                                     int tile, uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms,
+                                     uint8_t cmt, uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
+                                     uint32_t lineBytes, uint32_t loadedLineBytes, uint32_t loadedFullLineBytes,
+                                     uint32_t sizeBytes, uint32_t origSizeBytes, uint32_t uls, uint32_t ult,
+                                     uint32_t lrs, uint32_t lrt, bool replacement) {
+    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+        return;
+    }
+
+    uint32_t tileW = lrs > uls ? (lrs - uls + 4) / 4 : 0;
+    uint32_t tileH = lrt > ult ? (lrt - ult + 4) / 4 : 0;
+    uintptr_t base = 0;
+    size_t relocSize = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &relocSize, &fileId);
+    SPDLOG_INFO(
+        "SSB64_RENDER_DIAG {} path='{}' addr={} file={} off=0x{:x} slot={} tile={} tmem={} fmt={} siz={} cms={} "
+        "cmt={} masks={} maskt={} shifts={} shiftt={} line={} loadedLine={} fullLine={} size={} origSize={} "
+        "tileST=({},{})->({},{}), tileWH={}x{} replacement={}",
+        stage, Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+        hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, slot, tile, tmemIndex, fmt,
+        siz, cms, cmt, masks, maskt, shifts, shiftt, lineBytes, loadedLineBytes, loadedFullLineBytes, sizeBytes,
+        origSizeBytes, uls, ult, lrs, lrt, tileW, tileH, replacement);
+}
+
+static void Ssb64RenderDiagLogUpload(const char* decoder, const RawTexMetadata* metadata, const void* addr, int tile,
+                                     uint32_t tmemIndex, uint32_t width, uint32_t height) {
+    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+        return;
+    }
+
+    uintptr_t base = 0;
+    size_t size = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &size, &fileId);
+    SPDLOG_INFO("SSB64_RENDER_DIAG upload decoder={} path='{}' addr={} file={} off=0x{:x} tile={} tmem={} uploadWH={}x{}",
+                decoder, Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+                hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, tile, tmemIndex, width,
+                height);
+}
+
+static void Ssb64RenderDiagLogDraw(const RawTexMetadata* metadata, const void* addr, int slot, int tile,
+                                   uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms, uint8_t cmt,
+                                   uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
+                                   uint32_t texWidth, uint32_t texHeight, uint32_t tileWidth, uint32_t tileHeight,
+                                   float rawUMin, float rawUMax, float rawVMin, float rawVMax, float normUMin,
+                                   float normUMax, float normVMin, float normVMax, float x0, float y0, float z0,
+                                   float w0, float x1, float y1, float z1, float w1, float x2, float y2, float z2,
+                                   float w2) {
+    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+        return;
+    }
+
+    uintptr_t base = 0;
+    size_t relocSize = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &relocSize, &fileId);
+    SPDLOG_INFO(
+        "SSB64_RENDER_DIAG draw path='{}' addr={} file={} off=0x{:x} slot={} tile={} tmem={} fmt={} siz={} cms={} cmt={} masks={} maskt={} "
+        "shifts={} shiftt={} texWH={}x{} tileWH={}x{} rawUV=({:.3f}..{:.3f},{:.3f}..{:.3f}) "
+        "normUV=({:.5f}..{:.5f},{:.5f}..{:.5f}) clip=({:.3f},{:.3f},{:.3f},{:.3f}) "
+        "({:.3f},{:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f},{:.3f})",
+        Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+        hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, slot, tile, tmemIndex, fmt,
+        siz, cms, cmt, masks, maskt, shifts, shiftt, texWidth, texHeight, tileWidth, tileHeight, rawUMin, rawUMax,
+        rawVMin, rawVMax, normUMin, normUMax, normVMin, normVMax, x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2);
 }
 
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
@@ -868,6 +1106,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64RenderDiagLogUpload("RGBA16", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1255,6 +1494,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64RenderDiagLogUpload("CI4", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1350,6 +1590,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64RenderDiagLogUpload("CI8", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1367,6 +1608,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
 
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
+    Ssb64RenderDiagLogUpload("IMG", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(addr, width, height);
 }
 
@@ -1414,6 +1656,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
+        Ssb64RenderDiagLogUpload("RAW-direct", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
         mRapi->UploadTexture(addr, width, height);
         return;
     }
@@ -1447,6 +1690,8 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
+    Ssb64RenderDiagLogUpload("RAW-copy", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index,
+                             resultNewLineSize / 4, resultNewHeight);
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
@@ -1457,6 +1702,10 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint32_t tmemIdex = mRdp->texture_tile[tile].tmem_index;
     uint8_t paletteIndex = mRdp->texture_tile[tile].palette;
     uint32_t origSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
+    uint16_t tileWidth =
+        (uint16_t)(int32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint16_t tileHeight =
+        (uint16_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
 
     // Check TLUT mode early -- before cache lookup -- so the fmt override
     // affects both the cache key and the decode path.
@@ -1502,19 +1751,56 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                     fmt,
                     siz,
                     paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes,
+                    mRdp->texture_tile[tile].masks,
+                    mRdp->texture_tile[tile].maskt,
+                    tileWidth,
+                    tileHeight };
         } else {
             // CI8 uses both palette halves
             key = { origAddr,     { mRdp->palette_dram_addr[0], mRdp->palette_dram_addr[1] }, fmt, siz, paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes, mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt, tileWidth,
+                    tileHeight };
         }
     } else {
-        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
+        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes, mRdp->texture_tile[tile].masks,
+                mRdp->texture_tile[tile].maskt, tileWidth, tileHeight };
     }
 
+    Ssb64RenderDiagLogImport("import", metadata, origAddr, i, tile, tmemIdex, fmt, siz, mRdp->texture_tile[tile].cms,
+                             mRdp->texture_tile[tile].cmt, mRdp->texture_tile[tile].masks,
+                             mRdp->texture_tile[tile].maskt, mRdp->texture_tile[tile].shifts,
+                             mRdp->texture_tile[tile].shiftt, mRdp->texture_tile[tile].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes, mRdp->texture_tile[tile].uls,
+                             mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt,
+                             importReplacement);
+
     if (TextureCacheLookup(i, key)) {
+        Ssb64RenderDiagLogImport("cache-hit", metadata, origAddr, i, tile, tmemIdex, fmt, siz,
+                                 mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                                 mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                                 mRdp->texture_tile[tile].shifts, mRdp->texture_tile[tile].shiftt,
+                                 mRdp->texture_tile[tile].line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes,
+                                 mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].ult,
+                                 mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt, importReplacement);
         return;
     }
+
+    Ssb64RenderDiagLogImport("cache-miss", metadata, origAddr, i, tile, tmemIdex, fmt, siz,
+                             mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                             mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                             mRdp->texture_tile[tile].shifts, mRdp->texture_tile[tile].shiftt,
+                             mRdp->texture_tile[tile].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes, mRdp->texture_tile[tile].uls,
+                             mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt,
+                             importReplacement);
 
     // Guard against zero-sized textures that would cause divide-by-zero
     // or GPU API errors in UploadTexture.
@@ -1616,7 +1902,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         return;
     }
 
-    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0 };
+    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0, 0, 0, 0, 0 };
 
     if (TextureCacheLookup(i, key)) {
         return;
@@ -2232,6 +2518,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 tex_height[i] = tex_height2[i];
             }
 
+            // Keep UV normalization in lockstep with the importers that shrink padded TMEM rows to mask bounds.
+            bool uploadClampsToMask =
+                ((mRdp->texture_tile[tile].fmt == G_IM_FMT_RGBA || mRdp->texture_tile[tile].fmt == G_IM_FMT_CI) &&
+                 mRdp->texture_tile[tile].siz == G_IM_SIZ_16b) ||
+                (mRdp->texture_tile[tile].fmt == G_IM_FMT_CI &&
+                 (mRdp->texture_tile[tile].siz == G_IM_SIZ_4b || mRdp->texture_tile[tile].siz == G_IM_SIZ_8b));
+            if (uploadClampsToMask && mRdp->texture_tile[tile].masks > 0) {
+                uint32_t maskWidth = 1u << mRdp->texture_tile[tile].masks;
+                if (maskWidth > 0 && maskWidth < tex_width[i]) {
+                    tex_width[i] = maskWidth;
+                }
+            }
+            if (uploadClampsToMask && mRdp->texture_tile[tile].maskt > 0) {
+                uint32_t maskHeight = 1u << mRdp->texture_tile[tile].maskt;
+                if (maskHeight > 0 && maskHeight < tex_height[i]) {
+                    tex_height[i] = maskHeight;
+                }
+            }
+
             uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
             uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
 
@@ -2303,6 +2608,86 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     float prim_depth_ndc = (float)mRdp->prim_depth_z / 65535.0f; // 0..1 (Metal-style)
     if (!clip_parameters.z_is_from_0_to_1) {
         prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
+    }
+
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t] || tex_width[t] == 0 || tex_height[t] == 0) {
+            continue;
+        }
+
+        uint32_t uv_tile = effective_tile[t];
+        uint32_t tmemIndex = mRdp->texture_tile[uv_tile].tmem_index;
+        const RawTexMetadata* metadata = &mRdp->loaded_texture[tmemIndex].raw_tex_metadata;
+        const void* addr = mRdp->loaded_texture[tmemIndex].addr;
+        float rawUMin = 0.0f;
+        float rawUMax = 0.0f;
+        float rawVMin = 0.0f;
+        float rawVMax = 0.0f;
+        float normUMin = 0.0f;
+        float normUMax = 0.0f;
+        float normVMin = 0.0f;
+        float normVMax = 0.0f;
+
+        for (int vi = 0; vi < 3; vi++) {
+            float rawU = v_arr[vi]->u / 32.0f;
+            float rawV = v_arr[vi]->v / 32.0f;
+            float u = rawU;
+            float v = rawV;
+
+            int shifts = mRdp->texture_tile[uv_tile].shifts;
+            int shiftt = mRdp->texture_tile[uv_tile].shiftt;
+            if (shifts != 0) {
+                if (shifts <= 10) {
+                    u /= 1 << shifts;
+                } else {
+                    u *= 1 << (16 - shifts);
+                }
+            }
+            if (shiftt != 0) {
+                if (shiftt <= 10) {
+                    v /= 1 << shiftt;
+                } else {
+                    v *= 1 << (16 - shiftt);
+                }
+            }
+
+            u -= mRdp->texture_tile[uv_tile].uls / 4.0f;
+            v -= mRdp->texture_tile[uv_tile].ult / 4.0f;
+
+            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect) {
+                u += 0.5f;
+                v += 0.5f;
+            }
+
+            float normU = u / tex_width[t];
+            float normV = v / tex_height[t];
+
+            if (vi == 0) {
+                rawUMin = rawUMax = rawU;
+                rawVMin = rawVMax = rawV;
+                normUMin = normUMax = normU;
+                normVMin = normVMax = normV;
+            } else {
+                rawUMin = rawU < rawUMin ? rawU : rawUMin;
+                rawUMax = rawU > rawUMax ? rawU : rawUMax;
+                rawVMin = rawV < rawVMin ? rawV : rawVMin;
+                rawVMax = rawV > rawVMax ? rawV : rawVMax;
+                normUMin = normU < normUMin ? normU : normUMin;
+                normUMax = normU > normUMax ? normU : normUMax;
+                normVMin = normV < normVMin ? normV : normVMin;
+                normVMax = normV > normVMax ? normV : normVMax;
+            }
+        }
+
+        Ssb64RenderDiagLogDraw(metadata, addr, t, uv_tile, tmemIndex, mRdp->texture_tile[uv_tile].fmt,
+                               mRdp->texture_tile[uv_tile].siz, mRdp->texture_tile[uv_tile].cms,
+                               mRdp->texture_tile[uv_tile].cmt, mRdp->texture_tile[uv_tile].masks,
+                               mRdp->texture_tile[uv_tile].maskt, mRdp->texture_tile[uv_tile].shifts,
+                               mRdp->texture_tile[uv_tile].shiftt, tex_width[t], tex_height[t], tex_width2[t],
+                               tex_height2[t], rawUMin, rawUMax, rawVMin, rawVMax, normUMin, normUMax, normVMin,
+                               normVMax, v_arr[0]->x, v_arr[0]->y, v_arr[0]->z, v_arr[0]->w, v_arr[1]->x,
+                               v_arr[1]->y, v_arr[1]->z, v_arr[1]->w, v_arr[2]->x, v_arr[2]->y, v_arr[2]->z,
+                               v_arr[2]->w);
     }
 
     for (int i = 0; i < 3; i++) {

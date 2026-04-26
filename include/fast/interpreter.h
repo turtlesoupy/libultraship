@@ -180,6 +180,8 @@ struct TextureCacheKey {
     uint8_t fmt, siz;
     uint8_t palette_index;
     uint32_t size_bytes;
+    uint8_t masks, maskt;
+    uint16_t tile_width, tile_height;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
