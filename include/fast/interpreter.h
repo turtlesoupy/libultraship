@@ -411,6 +411,7 @@ class Interpreter {
     void TextureCacheClear();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void TextureCacheDeleteRange(const uint8_t* base, size_t size);
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);

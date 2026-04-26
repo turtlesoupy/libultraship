@@ -13,6 +13,7 @@
 #include <stdio.h>
 
 #include <any>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <set>
@@ -718,6 +719,35 @@ std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
     return path;
 }
 
+void Interpreter::TextureCacheDeleteRange(const uint8_t* base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+    const uint8_t* end = base + size;
+    for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end(); ) {
+        if (it->first.texture_addr >= base && it->first.texture_addr < end) {
+            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+                if (mRenderingState.mTextures[j] == &*it) {
+                    mRenderingState.mTextures[j] = nullptr;
+                }
+            }
+            mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+            it = mTextureCache.map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+extern "C" void portTextureCacheDeleteRange(const void* base, size_t size) {
+    auto inst = mInstance.lock();
+    if (!inst) {
+        return;
+    }
+    inst->TextureCacheDeleteRange(static_cast<const uint8_t*>(base), size);
+}
+
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     while (mTextureCache.map.bucket_count() > 0) {
         TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0, 0, 0, 0, 0 }; // bucket index only depends on the address
@@ -955,13 +985,30 @@ static bool Ssb64RenderDiagMatches(const RawTexMetadata* metadata, const void* a
     return false;
 }
 
+static std::atomic<int> sArmedImportCaptureN{0};
+
+extern "C" void portDiagArmImportCapture(int n) {
+    sArmedImportCaptureN.store(n > 0 ? n : 0, std::memory_order_relaxed);
+}
+
+static bool Ssb64RenderDiagArmedTake() {
+    int prev = sArmedImportCaptureN.load(std::memory_order_relaxed);
+    while (prev > 0) {
+        if (sArmedImportCaptureN.compare_exchange_weak(prev, prev - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void Ssb64RenderDiagLogImport(const char* stage, const RawTexMetadata* metadata, const void* addr, int slot,
                                      int tile, uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms,
                                      uint8_t cmt, uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
                                      uint32_t lineBytes, uint32_t loadedLineBytes, uint32_t loadedFullLineBytes,
                                      uint32_t sizeBytes, uint32_t origSizeBytes, uint32_t uls, uint32_t ult,
                                      uint32_t lrs, uint32_t lrt, bool replacement) {
-    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+    bool armed = Ssb64RenderDiagArmedTake();
+    if (!armed && (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot())) {
         return;
     }
 
