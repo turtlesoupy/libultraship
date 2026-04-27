@@ -423,13 +423,19 @@ std::string Context::GetAppBundlePath() {
     return std::string(home) + "/Documents";
 #endif
 
-#ifdef NON_PORTABLE
-    return CMAKE_INSTALL_PREFIX;
-#else
 #ifdef __APPLE__
+    // macOS .app bundles ALWAYS resolve via NSBundle's resourcePath,
+    // even with NON_PORTABLE=ON. The Linux NON_PORTABLE story (ship to
+    // CMAKE_INSTALL_PREFIX e.g. /usr/local/share) doesn't apply to
+    // .app bundles — installed-resource paths live inside the bundle's
+    // Contents/Resources, not under /usr/local.
     FolderManager folderManager;
     return folderManager.getMainBundlePath();
 #endif
+
+#ifdef NON_PORTABLE
+    return CMAKE_INSTALL_PREFIX;
+#else
 
 #ifdef __linux__
     std::string progpath(PATH_MAX, '\0');
