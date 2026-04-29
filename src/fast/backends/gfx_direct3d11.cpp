@@ -560,7 +560,9 @@ void GfxRenderingAPIDX11::SelectTexture(int tile, uint32_t texture_id) {
 }
 
 static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
-    // TODO: handle G_TX_MIRROR | G_TX_CLAMP
+    if ((val & G_TX_MIRROR) && (val & G_TX_CLAMP)) {
+        return D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
+    }
     if (val & G_TX_CLAMP) {
         return D3D11_TEXTURE_ADDRESS_CLAMP;
     }
