@@ -3311,6 +3311,11 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         mRdp->palettes[1] = src;
         mRdp->palette_dram_addr[1] = src;
     }
+
+    // CI textures bake palette data into the decoded GPU texture, so a TLUT
+    // load must invalidate any previously imported texture using that palette.
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
 }
 
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
