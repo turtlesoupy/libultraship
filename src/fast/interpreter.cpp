@@ -1231,12 +1231,23 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes * 2;
+    uint32_t naturalWidth = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = widthBytes;
     }
+
+    // Clamp upload width to the SetTileSize extent. Same fix family as IA8/I4
+    // (see docs/bugs/title_border_right_edge_slice_2026-04-14.md). VS Record
+    // digit sprites are 4×7 IA4 tiles whose TMEM line stride rounds up to a
+    // 16-pixel-wide upload; without this clamp the upload is 16 pixels wide
+    // but `GfxSpTri1` normalises UVs by the SetTileSize-clamped tex_width=4,
+    // so each output pixel samples GPU column ~4·n instead of n — only ~1
+    // texel of useful digit data is visible per output column, producing the
+    // "squished" appearance reported in issue #2.
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
