@@ -3254,6 +3254,17 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
 
+    // PORT (issue #4): N64 RDP transfers DMA in 8-byte (qword) chunks, so a
+    // LOADTLUT with high_index_plus_one*2 not a multiple of 8 still pulls a
+    // full 8-byte qword from DRAM into TMEM. Game DLs lean on this: e.g.
+    // Mario's BTT arrow uses count=3 (6 bytes) and samples palette[3] in its
+    // image, expecting the 4th palette entry sitting at src+6..7 to also be
+    // loaded. libultraship's exact-byteCount memcpy left palette[3] as stale
+    // bytes from the previous LOADTLUT, manifesting as the per-character
+    // "blue inside the chevron" bug after the count=3 outline was already
+    // black. Round byteCount up to 8 bytes to match N64 DMA semantics.
+    byteCount = (byteCount + 7u) & ~7u;
+
     // PORT: lazy palette byte-order fixup.  CI texture palettes are 16-bit
     // RGBA5551 entries that pass1 BSWAP32 has corrupted (each 4-byte word
     // has its bytes reversed, swapping the two pixels in the word AND each
