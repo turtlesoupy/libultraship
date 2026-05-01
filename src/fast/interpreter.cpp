@@ -2824,7 +2824,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+                // Cycle-1 alpha-source mux (other_mode_l bits 26..27): G_BL_A_FOG (1) means
+                // the blender's alpha comes from the fog color register itself; G_BL_A_SHADE
+                // (2, default for OoT-style depth fog) means per-vertex shade alpha (which the
+                // RSP fills with the depth-based fog factor when G_FOG geomode is on).
+                // Without this branch, G_RM_FOG_PRIM_A degenerates to vertex alpha and the
+                // game's intended SetFogColor.a tint is lost (e.g. SSB64 respawn-platform
+                // white flash, fighter hit/F-Smash colour flashes).
+                uint8_t fog_alpha_src = (mRdp->other_mode_l >> 26) & 3;
+                float fog_a = (fog_alpha_src == G_BL_A_FOG) ? mRdp->fog_color.a / 255.0f
+                                                            : v_arr[i]->color.a / 255.0f;
+                mBufVbo[mBufVboLen++] = fog_a;
             }
         }
 
