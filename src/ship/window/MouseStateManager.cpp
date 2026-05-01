@@ -15,6 +15,16 @@ void MouseStateManager::StartFrame() {
 }
 
 void MouseStateManager::CursorVisibilityTimeoutTick() {
+#if defined(__ANDROID__)
+    // Touch devices have no system cursor. The Java-side SDLActivity
+    // wires SDL_ShowCursor / setCustomCursor through JNI — calling those
+    // from inside the SSB64 port's GFX coroutine confuses ART's CheckJNI
+    // (the coroutine swap moves SP without the JVM knowing, so jobject
+    // local refs created by Binder calls come back as "invalid JNI
+    // transition frame reference"). Skipping the entire tick on Android
+    // is correct anyway — there's nothing to hide.
+    return;
+#else
     static Coords sPrevMousePos;
 
     std::shared_ptr<Window> wnd = Context::GetInstance()->GetWindow();
@@ -41,6 +51,7 @@ void MouseStateManager::CursorVisibilityTimeoutTick() {
     if (mCursorVisibleTicksCounter > 0) {
         mCursorVisibleTicksCounter--;
     }
+#endif // !__ANDROID__
 }
 
 bool MouseStateManager::ShouldAutoCaptureMouse() {
