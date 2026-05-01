@@ -1264,18 +1264,24 @@ void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
         }
 
         if (ImGui::CollapsingHeader("D-Pad", NULL, ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("DPad");
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_UP).c_str(), portIndex, BTN_DUP);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_DOWN).c_str(), portIndex, BTN_DDOWN);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_LEFT).c_str(), portIndex, BTN_DLEFT);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_RIGHT).c_str(), portIndex, BTN_DRIGHT);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Analog Stick", NULL, ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("AnalogStick");
             DrawStickSection(portIndex, LEFT, 0);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Additional (\"Right\") Stick")) {
+            ImGui::PushID("RightStick");
             DrawStickSection(portIndex, RIGHT, 1, CHIP_COLOR_N64_YELLOW);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Rumble")) {
