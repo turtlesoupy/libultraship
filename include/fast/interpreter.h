@@ -386,6 +386,7 @@ class Interpreter {
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();
+    void SetForceRenderToFb(bool force);
     int GetTargetFps();
     void SetTargetFps(int fps);
     void SetMaxFrameLatency(int latency);
@@ -519,6 +520,14 @@ class Interpreter {
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
+    // When true, ViewportMatchesRendererResolution() always returns false,
+    // which pins mRendersToFb=true and keeps mGameFb populated every frame.
+    // Required by GPU-readback consumers (e.g. SSB64's stage-clear / scene-
+    // transition wallpaper capture) on backends where FB 0 is the swap-
+    // chain back buffer with undefined post-Present contents (D3D11 FLIP_-
+    // DISCARD on Windows). On macOS the same effect is achieved
+    // unconditionally via the __APPLE__ guard inside that method.
+    bool mForceRenderToFb{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

@@ -5809,11 +5809,23 @@ bool Interpreter::ViewportMatchesRendererResolution() {
     // to avoid issues with retina scaling.
     return false;
 #else
+    // Port-driven override: pinning this to false keeps mRendersToFb=true so
+    // mGameFb is populated every frame, which the GPU-readback bridge depends
+    // on. Without it, Windows D3D11 in the default 1x / no-MSAA config would
+    // draw straight to the swap-chain back buffer (FB 0) and the prior
+    // gameplay frame would be unrecoverable post-Present.
+    if (mForceRenderToFb) {
+        return false;
+    }
     if (mCurDimensions.width == mGameWindowViewport.width && mCurDimensions.height == mGameWindowViewport.height) {
         return true;
     }
     return false;
 #endif
+}
+
+void Interpreter::SetForceRenderToFb(bool force) {
+    mForceRenderToFb = force;
 }
 
 void Interpreter::StartFrame() {
