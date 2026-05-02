@@ -76,6 +76,9 @@ target_link_libraries(libultraship PUBLIC tinyxml2::tinyxml2)
 find_package(spdlog REQUIRED)
 target_link_libraries(libultraship PUBLIC spdlog::spdlog)
 
+# hidapi for native Raphnet N64 USB adapter (vendored via FetchContent in cmake/dependencies/common.cmake).
+target_link_libraries(libultraship PRIVATE hidapi::hidapi)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
