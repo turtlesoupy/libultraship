@@ -1,6 +1,8 @@
 #ifdef ENABLE_DX11
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include <cmath>
 
@@ -1029,19 +1031,40 @@ void GfxRenderingAPIDX11::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX
 }
 
 void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
-    if (fb_id >= (int)mFrameBuffers.size()) {
+    if (fb_id < 0 || fb_id >= (int)mFrameBuffers.size() || rgba16_buf == nullptr || width == 0 || height == 0) {
         return;
     }
 
     FramebufferDX11& fb = mFrameBuffers[fb_id];
+    if (fb.texture_id >= mTextures.size()) {
+        return;
+    }
     TextureData& td = mTextures[fb.texture_id];
+    if (!td.texture) {
+        return;
+    }
+
+    // CopyResource requires identical extents/format. Discover the source
+    // texture's true dimensions and bail on multi-sampled sources rather than
+    // letting the runtime fail asynchronously (caller needs to Resolve first).
+    D3D11_TEXTURE2D_DESC src_desc = {};
+    td.texture->GetDesc(&src_desc);
+    if (src_desc.SampleDesc.Count > 1) {
+        return;
+    }
+
+    // Pre-zero the destination so a partial overlap leaves the un-touched
+    // tail in a deterministic state.
+    std::memset(rgba16_buf, 0, sizeof(uint16_t) * (size_t)width * (size_t)height);
+
+    const uint32_t copy_w = std::min(width, src_desc.Width);
+    const uint32_t copy_h = std::min(height, src_desc.Height);
 
     ID3D11Texture2D* staging = nullptr;
 
-    // Create an staging texture with cpu read access
     D3D11_TEXTURE2D_DESC texture_desc;
-    texture_desc.Width = width;
-    texture_desc.Height = height;
+    texture_desc.Width = src_desc.Width;
+    texture_desc.Height = src_desc.Height;
     texture_desc.Usage = D3D11_USAGE_STAGING;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -1052,46 +1075,44 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
     texture_desc.SampleDesc.Count = 1;
     texture_desc.SampleDesc.Quality = 0;
 
-    ThrowIfFailed(mDevice->CreateTexture2D(&texture_desc, nullptr, &staging));
-
-    // Copy the framebuffer texture to the staging texture
-    mContext->CopyResource(staging, td.texture.Get());
-
-    // Map the staging texture to a resource that we can read
-    D3D11_MAPPED_SUBRESOURCE resource = {};
-    ThrowIfFailed(mContext->Map(staging, 0, D3D11_MAP_READ, 0, &resource));
-
-    if (!resource.pData) {
+    HRESULT hr = mDevice->CreateTexture2D(&texture_desc, nullptr, &staging);
+    if (FAILED(hr) || staging == nullptr) {
         return;
     }
 
-    // Copy the mapped values to a temp array that we can process later
-    uint32_t* temp = new uint32_t[width * height]();
-    for (size_t i = 0; i < height; i++) {
-        memcpy((uint8_t*)temp + (resource.RowPitch * i), (uint8_t*)resource.pData + (resource.RowPitch * i),
-               resource.RowPitch);
+    mContext->CopyResource(staging, td.texture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE resource = {};
+    hr = mContext->Map(staging, 0, D3D11_MAP_READ, 0, &resource);
+    if (FAILED(hr) || resource.pData == nullptr) {
+        staging->Release();
+        return;
     }
 
-    mContext->Unmap(staging, 0);
-
-    // Convert the RGBA32 values to RGBA16
-    for (size_t i = 0; i < width; i++) {
-        for (size_t j = 0; j < height; j++) {
-            uint32_t pixel = temp[i + (j * width)];
+    // Convert directly from the mapped pages into the caller's RGBA5551
+    // buffer, walking the source by `resource.RowPitch` (the GPU's natural
+    // row stride) and the destination by `width` (the caller's pitch). Read
+    // up to `copy_w x copy_h` pixels; anything outside that rect was zeroed
+    // above. The previous implementation copied to a `width*height` u32
+    // intermediate using `RowPitch` for both stride AND bytes-per-row, which
+    // overflows the heap whenever `RowPitch != width*4` (D3D11 always
+    // 256-byte-aligns `RowPitch`).
+    const uint8_t* src_bytes = static_cast<const uint8_t*>(resource.pData);
+    for (uint32_t j = 0; j < copy_h; ++j) {
+        const uint32_t* src_row = reinterpret_cast<const uint32_t*>(src_bytes + (size_t)j * resource.RowPitch);
+        uint16_t* dst_row = rgba16_buf + (size_t)j * width;
+        for (uint32_t i = 0; i < copy_w; ++i) {
+            uint32_t pixel = src_row[i];
             uint8_t r = (((pixel & 0xFF) + 4) * 0x1F) / 0xFF;
             uint8_t g = ((((pixel >> 8) & 0xFF) + 4) * 0x1F) / 0xFF;
             uint8_t b = ((((pixel >> 16) & 0xFF) + 4) * 0x1F) / 0xFF;
             uint8_t a = ((pixel >> 24) & 0xFF) ? 1 : 0;
-
-            rgba16_buf[i + (j * width)] = (r << 11) | (g << 6) | (b << 1) | a;
+            dst_row[i] = (r << 11) | (g << 6) | (b << 1) | a;
         }
     }
 
-    // Cleanup
+    mContext->Unmap(staging, 0);
     staging->Release();
-    staging = nullptr;
-
-    delete[] temp;
 }
 
 void GfxRenderingAPIDX11::SetTextureFilter(FilteringMode mode) {
