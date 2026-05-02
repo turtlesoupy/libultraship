@@ -57,10 +57,15 @@ class ControllerStick {
     bool HasMappingsForPhysicalDeviceType(PhysicalDeviceType physicalDeviceType);
     StickIndex GetStickIndex();
 
+    // Exposes the post-mapping, pre-Process() per-direction normalized magnitude
+    // (0.0..MAX_AXIS_RANGE). Lets consumers implement custom stick-shaping
+    // (e.g. per-axis remaps that need to bypass the circular deadzone /
+    // octagonal gate / notch snap baked into Process()).
+    float GetAxisDirectionValue(Direction direction);
+
   private:
     double GetClosestNotch(double angle, double approximationThreshold);
     void LoadAxisDirectionMappingFromConfig(std::string id);
-    float GetAxisDirectionValue(Direction direction);
 
     uint8_t mPortIndex;
     StickIndex mStickIndex;
