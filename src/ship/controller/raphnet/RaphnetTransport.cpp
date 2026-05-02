@@ -1,0 +1,431 @@
+#include "ship/controller/raphnet/RaphnetTransport.h"
+
+#include <hidapi.h>
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstring>
+#include <sstream>
+#include <thread>
+#include <vector>
+
+namespace Ship {
+
+namespace {
+
+// Format `len` bytes of buf as "AA BB CC DD …" for log messages. Caps at 32
+// bytes to keep log lines bounded; longer payloads get a trailing ellipsis.
+std::string HexBytes(const uint8_t* buf, size_t len) {
+    constexpr size_t kCap = 32;
+    std::ostringstream os;
+    os << std::hex << std::uppercase;
+    size_t shown = std::min(len, kCap);
+    for (size_t i = 0; i < shown; ++i) {
+        if (i > 0) {
+            os << ' ';
+        }
+        if (buf[i] < 0x10) {
+            os << '0';
+        }
+        os << (unsigned)buf[i];
+    }
+    if (len > kCap) {
+        os << " ... (+" << std::dec << (len - kCap) << ')';
+    }
+    return os.str();
+}
+
+} // namespace
+
+RaphnetTransport::RaphnetTransport()
+    : mDevice(nullptr), mVid(0), mPid(0), mReportSize(gRntDefaultReportSize) {
+    for (int i = 0; i < gRntMaxChannelsPerAdapter; ++i) {
+        mFirstPollLogged[i] = false;
+        mFirstErrorLogged[i] = false;
+        mErrorCount[i] = 0;
+    }
+}
+
+RaphnetTransport::~RaphnetTransport() {
+    Close();
+}
+
+std::string RaphnetTransport::ToUtf8(const std::wstring& w) {
+    // hidapi's wide-string outputs (error text, product name, serial) are
+    // ASCII for raphnet adapters in practice. Defensive cast keeps non-ASCII
+    // characters visible as '?' rather than crashing on conversion.
+    std::string out;
+    out.reserve(w.size());
+    for (wchar_t c : w) {
+        out.push_back((c >= 0x20 && c <= 0x7E) ? static_cast<char>(c) : '?');
+    }
+    return out;
+}
+
+std::string RaphnetTransport::FormatHidError(hid_device* dev) {
+    if (dev == nullptr) {
+        return "(no device)";
+    }
+    const wchar_t* w = hid_error(dev);
+    if (w == nullptr) {
+        return "(no error string)";
+    }
+    return ToUtf8(std::wstring(w));
+}
+
+bool RaphnetTransport::Open(const std::string& hidPath, uint16_t vid, uint16_t pid,
+                            const std::wstring& serial) {
+    std::lock_guard<std::mutex> lock(mLock);
+
+    if (mDevice != nullptr) {
+        SPDLOG_WARN("[raphnet] Open called on an already-open transport (path={}); closing first", hidPath);
+        hid_close(mDevice);
+        mDevice = nullptr;
+    }
+
+    mHidPath = hidPath;
+    mVid = vid;
+    mPid = pid;
+    mSerial = serial;
+
+    SPDLOG_INFO("[raphnet] opening adapter vid=0x{:04x} pid=0x{:04x} serial='{}' path='{}'",
+                vid, pid, ToUtf8(serial), hidPath);
+
+    mDevice = hid_open_path(hidPath.c_str());
+    if (mDevice == nullptr) {
+        // Common cause on Linux is missing udev rule (EACCES on /dev/hidraw*).
+        // hid_error(NULL) returns a global error message in this case.
+        const wchar_t* err = hid_error(nullptr);
+        std::string errStr = (err != nullptr) ? ToUtf8(std::wstring(err)) : "(no global error)";
+        SPDLOG_ERROR("[raphnet] hid_open_path('{}') failed: {}", hidPath, errStr);
+#if defined(__linux__) || defined(__OpenBSD__)
+        SPDLOG_ERROR("[raphnet] on Linux/BSD, ensure raphnet udev rules are installed: "
+                     "https://www.raphnet.net/electronique/gc_n64_usb/index_en.php (scripts/10-raphnet.rules)");
+#endif
+        return false;
+    }
+
+    // Boot sequence — release the channel from any prior wedged state, query
+    // version, then take exclusive control of the SI bus.
+
+    // 1. Defensive resume: if a prior process suspended polling and crashed
+    //    before resuming, the firmware is still in suspended state. Sending
+    //    SUSPEND_POLLING(0) clears that.
+    {
+        uint8_t cmd[2] = { gRntRqSuspendPolling, 0 };
+        uint8_t rep[8] = {};
+        int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+        if (n < 0) {
+            SPDLOG_ERROR("[raphnet] defensive SUSPEND_POLLING(0) on open failed (n={}, err={}); "
+                         "adapter may be in inconsistent state — replug recommended",
+                         n, FormatHidError(mDevice));
+            hid_close(mDevice);
+            mDevice = nullptr;
+            return false;
+        }
+        SPDLOG_DEBUG("[raphnet] defensive SUSPEND_POLLING(0) OK ({} bytes)", n);
+    }
+
+    // 2. Read firmware version. Logged at INFO so testers' bug reports
+    //    always include this.
+    if (!GetVersion(mVersionString)) {
+        SPDLOG_ERROR("[raphnet] GET_VERSION failed on '{}' — closing", hidPath);
+        hid_close(mDevice);
+        mDevice = nullptr;
+        return false;
+    }
+    SPDLOG_INFO("[raphnet] adapter '{}' (vid=0x{:04x} pid=0x{:04x}) firmware version: {}",
+                ToUtf8(serial), vid, pid, mVersionString);
+
+    // 3. Suspend firmware auto-polling so RAW_SI commands have exclusive
+    //    SI bus access.
+    {
+        uint8_t cmd[2] = { gRntRqSuspendPolling, 1 };
+        uint8_t rep[8] = {};
+        int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+        if (n < 0) {
+            SPDLOG_ERROR("[raphnet] SUSPEND_POLLING(1) failed (n={}, err={})", n, FormatHidError(mDevice));
+            hid_close(mDevice);
+            mDevice = nullptr;
+            return false;
+        }
+        SPDLOG_INFO("[raphnet] adapter polling suspended; native SI access armed");
+    }
+
+    return true;
+}
+
+void RaphnetTransport::Close() {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mDevice == nullptr) {
+        return;
+    }
+
+    // Resume firmware auto-polling so the adapter is usable as a plain HID
+    // joystick after the game exits. Important: a process that exits without
+    // sending this leaves the firmware wedged until next physical replug.
+    {
+        uint8_t cmd[2] = { gRntRqSuspendPolling, 0 };
+        uint8_t rep[8] = {};
+        int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+        if (n < 0) {
+            SPDLOG_WARN("[raphnet] SUSPEND_POLLING(0) on close failed (n={}, err={}); "
+                        "adapter may need replug before next use as HID joystick",
+                        n, FormatHidError(mDevice));
+        } else {
+            SPDLOG_INFO("[raphnet] adapter polling resumed (HID joystick mode restored)");
+        }
+    }
+
+    hid_close(mDevice);
+    mDevice = nullptr;
+    SPDLOG_INFO("[raphnet] adapter closed: path='{}'", mHidPath);
+}
+
+bool RaphnetTransport::GetVersion(std::string& outVersion) {
+    // Caller may or may not hold mLock — Exchange handles the lock idempotently
+    // via std::lock_guard. We must not double-lock here since Exchange takes
+    // mLock too. Open() calls this BEFORE releasing — so we need the public
+    // GetVersion path to lock and the internal Open path to call Exchange
+    // directly. Restructure: Exchange does NOT take the lock internally; the
+    // caller holds it. Public methods take the lock.
+    //
+    // Above, Open() already holds mLock. Below, public callers must enter via
+    // a thin wrapper that takes mLock. The only public caller right now is
+    // Open() itself (internal usage). Other future public callers should use
+    // a Locked variant. For now, this method is internal-helper-only.
+    //
+    // (There's no nice way to express "take this lock, but only if not already
+    //  held" in standard C++, so we structure call sites to be unambiguous.)
+
+    uint8_t cmd[1] = { gRntRqGetVersion };
+    uint8_t rep[64] = {};
+    int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+    if (n < 0 || n < 1) {
+        SPDLOG_ERROR("[raphnet] GET_VERSION exchange failed (n={}, err={})", n,
+                     FormatHidError(mDevice));
+        return false;
+    }
+    SPDLOG_DEBUG("[raphnet] GET_VERSION raw response ({} bytes): {}", n, HexBytes(rep, n));
+    // Format follows v3.x firmware: ASCII null-terminated string starting at
+    // rep[1] (rep[0] echoes the opcode 0x04). Older firmware may pack version
+    // bytes raw; we accept either.
+    if (n >= 2 && rep[0] == gRntRqGetVersion) {
+        size_t maxScan = static_cast<size_t>(n - 1);
+        size_t end = 1;
+        while (end < static_cast<size_t>(n) && rep[end] != 0) {
+            ++end;
+        }
+        outVersion.assign(reinterpret_cast<const char*>(rep + 1), end - 1);
+        // Sanity: if the version doesn't look printable, fall through to
+        // raw-byte format.
+        bool printable = !outVersion.empty();
+        for (char c : outVersion) {
+            if (c < 0x20 || c > 0x7E) {
+                printable = false;
+                break;
+            }
+        }
+        if (printable) {
+            return true;
+        }
+    }
+    // Fallback: present the raw bytes as a hex string.
+    std::ostringstream os;
+    os << "raw:" << HexBytes(rep, n);
+    outVersion = os.str();
+    return true;
+}
+
+bool RaphnetTransport::GetControllerType(uint8_t channel, uint8_t& outType) {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mDevice == nullptr) {
+        outType = gRntCtlTypeNone;
+        return false;
+    }
+    uint8_t cmd[2] = { gRntRqGetControllerType, channel };
+    uint8_t rep[16] = {};
+    int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+    if (n < 0) {
+        SPDLOG_ERROR("[raphnet] GET_CONTROLLER_TYPE chn={} failed (n={}, err={})", channel, n,
+                     FormatHidError(mDevice));
+        outType = gRntCtlTypeNone;
+        return false;
+    }
+    SPDLOG_DEBUG("[raphnet] GET_CONTROLLER_TYPE chn={} response ({} bytes): {}", channel, n,
+                 HexBytes(rep, n));
+    // Response layout: rep[0]=opcode echo (0x06), rep[1]=channel echo, rep[2]=type.
+    // Older v3 firmware (< v3.4) doesn't implement this command and may
+    // return garbage / repeat the opcode; we guard via opcode-echo check.
+    if (n >= 3 && rep[0] == gRntRqGetControllerType && rep[1] == channel) {
+        outType = rep[2];
+        const char* typeName = "unknown";
+        switch (outType) {
+            case gRntCtlTypeNone:     typeName = "NONE"; break;
+            case gRntCtlTypeN64:      typeName = "N64"; break;
+            case gRntCtlTypeGameCube: typeName = "GAMECUBE"; break;
+            default:                  typeName = "OTHER"; break;
+        }
+        SPDLOG_INFO("[raphnet] adapter '{}' chn={} controller type: {} (0x{:02x})",
+                    ToUtf8(mSerial), channel, typeName, outType);
+        return true;
+    }
+    SPDLOG_WARN("[raphnet] GET_CONTROLLER_TYPE chn={} unexpected response: {}", channel,
+                HexBytes(rep, n));
+    outType = gRntCtlTypeNone;
+    return false;
+}
+
+bool RaphnetTransport::SuspendPolling(bool suspend) {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mDevice == nullptr) {
+        return false;
+    }
+    uint8_t cmd[2] = { gRntRqSuspendPolling, static_cast<uint8_t>(suspend ? 1 : 0) };
+    uint8_t rep[8] = {};
+    int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+    if (n < 0) {
+        SPDLOG_ERROR("[raphnet] SUSPEND_POLLING({}) failed (n={}, err={})", suspend ? 1 : 0, n,
+                     FormatHidError(mDevice));
+        return false;
+    }
+    SPDLOG_DEBUG("[raphnet] SUSPEND_POLLING({}) OK", suspend ? 1 : 0);
+    return true;
+}
+
+bool RaphnetTransport::SetVibration(uint8_t channel, bool on) {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mDevice == nullptr) {
+        return false;
+    }
+    uint8_t cmd[3] = { gRntRqSetVibration, channel, static_cast<uint8_t>(on ? 1 : 0) };
+    uint8_t rep[8] = {};
+    int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+    if (n < 0) {
+        SPDLOG_WARN("[raphnet] SET_VIBRATION chn={} on={} failed (n={}, err={})", channel, on ? 1 : 0,
+                    n, FormatHidError(mDevice));
+        return false;
+    }
+    SPDLOG_TRACE("[raphnet] SET_VIBRATION chn={} on={} OK", channel, on ? 1 : 0);
+    return true;
+}
+
+bool RaphnetTransport::Poll(uint8_t channel, OSContPad& pad) {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mDevice == nullptr) {
+        return false;
+    }
+    if (channel >= gRntMaxChannelsPerAdapter) {
+        SPDLOG_ERROR("[raphnet] Poll: channel {} out of range (max {})", channel,
+                     gRntMaxChannelsPerAdapter - 1);
+        return false;
+    }
+
+    // Build RAW_SI request: [0x80][channel][tx_len=1][N64_GET_STATUS=0x01].
+    uint8_t cmd[4] = { gRntRqGcn64RawSi, channel, 1, gN64GetStatus };
+    // Response: [0x80 echo][channel echo][rx_len][btn_hi][btn_lo][stickX][stickY].
+    uint8_t rep[16] = {};
+    int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 50);
+
+    if (n < 0 || n < 3 || rep[0] != gRntRqGcn64RawSi || rep[1] != channel ||
+        rep[2] != gN64GetStatusReplyLen || n < 3 + gN64GetStatusReplyLen) {
+        ++mErrorCount[channel];
+        if (!mFirstErrorLogged[channel]) {
+            mFirstErrorLogged[channel] = true;
+            SPDLOG_ERROR(
+                "[raphnet] FIRST poll FAILURE chn={} on adapter '{}' vid=0x{:04x} pid=0x{:04x}: "
+                "n={} response='{}' (request='{}'). Subsequent failures throttled to 1/60.",
+                channel, ToUtf8(mSerial), mVid, mPid, n, HexBytes(rep, n > 0 ? (size_t)n : 0),
+                HexBytes(cmd, sizeof(cmd)));
+        } else if ((mErrorCount[channel] % 60) == 0) {
+            SPDLOG_WARN("[raphnet] poll FAILURE chn={} (count={}, n={}, err={})", channel,
+                        mErrorCount[channel], n, FormatHidError(mDevice));
+        }
+        return false;
+    }
+
+    const uint8_t* status = rep + 3;
+    pad.button = static_cast<uint16_t>((status[0] << 8) | status[1]);
+    pad.stick_x = static_cast<int8_t>(status[2]);
+    pad.stick_y = static_cast<int8_t>(status[3]);
+    pad.err_no = 0;
+    pad.gyro_x = 0.0f;
+    pad.gyro_y = 0.0f;
+    pad.right_stick_x = 0;
+    pad.right_stick_y = 0;
+
+    if (!mFirstPollLogged[channel]) {
+        mFirstPollLogged[channel] = true;
+        SPDLOG_INFO("[raphnet] FIRST successful poll chn={} on adapter '{}': "
+                    "request='{}' response='{}' → button=0x{:04x} stick=({},{})",
+                    channel, ToUtf8(mSerial), HexBytes(cmd, sizeof(cmd)), HexBytes(rep, n),
+                    pad.button, pad.stick_x, pad.stick_y);
+    } else {
+        SPDLOG_TRACE("[raphnet] poll chn={} button=0x{:04x} stick=({},{})", channel, pad.button,
+                     pad.stick_x, pad.stick_y);
+    }
+    return true;
+}
+
+int RaphnetTransport::Exchange(const uint8_t* tx, size_t txLen, uint8_t* rx, size_t rxMax,
+                               int timeoutMs) {
+    // Caller MUST hold mLock. We don't take it here — see GetVersion()'s
+    // commentary about the lock contract.
+    if (mDevice == nullptr) {
+        return -1;
+    }
+    if (txLen == 0 || tx == nullptr) {
+        return -1;
+    }
+
+    // Send: [report_id=0x00][...tx], padded to mReportSize+1.
+    std::vector<uint8_t> sendBuf(mReportSize + 1, 0);
+    sendBuf[0] = 0x00;
+    size_t copyLen = std::min(txLen, static_cast<size_t>(mReportSize));
+    std::memcpy(sendBuf.data() + 1, tx, copyLen);
+
+    int sent = hid_send_feature_report(mDevice, sendBuf.data(), sendBuf.size());
+    if (sent < 0) {
+        SPDLOG_ERROR("[raphnet] hid_send_feature_report failed (sent={}, err={})", sent,
+                     FormatHidError(mDevice));
+        return -1;
+    }
+    SPDLOG_TRACE("[raphnet] TX {} bytes (cmd='{}')", sent, HexBytes(tx, copyLen));
+
+    // Receive: hid_get_feature_report is BLOCKING/synchronous on every backend;
+    // hid_set_nonblocking only affects hid_read. The device replies in <1 ms
+    // in the common case. timeoutMs is informational — it bounds the retry
+    // window for backends that return 0 on no-data, but at the OS level the
+    // call may block longer if the device is wedged. A wedged adapter is rare;
+    // log loudly so testers' reports are obvious.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (true) {
+        std::vector<uint8_t> recvBuf(mReportSize + 1, 0);
+        recvBuf[0] = 0x00;  // Windows requires the report id to be set on input.
+        int got = hid_get_feature_report(mDevice, recvBuf.data(), recvBuf.size());
+        if (got > 0) {
+            int payloadLen = got - 1;
+            if (payloadLen < 0) {
+                payloadLen = 0;
+            }
+            size_t copyOut = std::min(static_cast<size_t>(payloadLen), rxMax);
+            std::memcpy(rx, recvBuf.data() + 1, copyOut);
+            SPDLOG_TRACE("[raphnet] RX {} bytes (payload='{}')", got, HexBytes(rx, copyOut));
+            return static_cast<int>(copyOut);
+        }
+        if (got < 0) {
+            SPDLOG_ERROR("[raphnet] hid_get_feature_report failed (got={}, err={})", got,
+                         FormatHidError(mDevice));
+            return -1;
+        }
+        // got == 0: backend returned no data; sleep briefly and retry until deadline.
+        if (std::chrono::steady_clock::now() >= deadline) {
+            SPDLOG_WARN("[raphnet] hid_get_feature_report timed out after {} ms (cmd='{}')",
+                        timeoutMs, HexBytes(tx, copyLen));
+            return 0;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+} // namespace Ship
