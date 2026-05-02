@@ -743,10 +743,24 @@ bool GfxWindowBackendSDL2::IsRunning() {
 }
 
 void GfxWindowBackendSDL2::Destroy() {
-    // TODO: destroy _any_ resources used by SDL
-    SDL_GL_DeleteContext(mCtx);
-    SDL_DestroyWindow(mWnd);
-    SDL_DestroyRenderer(mRenderer);
+    // SDL2 teardown order matters: a renderer holds a back-reference to its
+    // window, so SDL_DestroyRenderer must run before SDL_DestroyWindow or it
+    // dereferences freed window memory and faults deep in libSDL2. Each
+    // pointer is also guarded because Init() takes one of two mutually
+    // exclusive paths — OpenGL leaves mRenderer null, Metal leaves mCtx null
+    // — and SDL_GL_DeleteContext is not documented to accept null.
+    if (mRenderer) {
+        SDL_DestroyRenderer(mRenderer);
+        mRenderer = nullptr;
+    }
+    if (mCtx) {
+        SDL_GL_DeleteContext(mCtx);
+        mCtx = nullptr;
+    }
+    if (mWnd) {
+        SDL_DestroyWindow(mWnd);
+        mWnd = nullptr;
+    }
     SDL_Quit();
 }
 
