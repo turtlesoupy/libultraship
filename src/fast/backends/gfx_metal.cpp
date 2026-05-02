@@ -1194,6 +1194,12 @@ void GfxRenderingAPIMetal::GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id,
     });
 
     command_buffer->commit();
+    // ReadFramebufferToCPU is contract-synchronous (its OpenGL and D3D11
+    // peers block via glReadPixels / Map). Without this wait the caller
+    // returns to a still-zeroed rgba16_buf because the completion handler
+    // hasn't fired yet -- breaks SSB64's wallpaper FB-capture (issue #57)
+    // and the OTR_G_READFB GBI handler.
+    command_buffer->waitUntilCompleted();
 
     compute_pipeline_state->release();
     autorelease_pool->release();
