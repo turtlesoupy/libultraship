@@ -28,6 +28,7 @@ class ControlDeck {
     bool MouseGameInputBlocked();
     bool ProcessKeyboardEvent(KbEventType eventType, KbScancode scancode);
     bool ProcessMouseButtonEvent(bool isPressed, MouseBtn button);
+    void StopAllRumble();
 
     std::shared_ptr<ConnectedPhysicalDeviceManager> GetConnectedPhysicalDeviceManager();
     std::shared_ptr<GlobalSDLDeviceSettings> GetGlobalSDLDeviceSettings();

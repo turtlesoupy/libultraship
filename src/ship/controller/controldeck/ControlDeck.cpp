@@ -100,6 +100,24 @@ std::shared_ptr<Controller> ControlDeck::GetControllerByPort(uint8_t port) {
     return mPorts[port]->GetConnectedController();
 }
 
+// Send "motors off" to every connected gamepad. Must be called while Context,
+// ControlDeck, and SDL are all still alive — i.e. before sContext.reset() at
+// shutdown. Without this, a clean app exit leaves the last in-flight FF effect
+// (uploaded with SDL_MAX_RUMBLE_DURATION_MS ≈ 32s on the Linux evdev backend)
+// running on the device until the kernel timer expires.
+void ControlDeck::StopAllRumble() {
+    for (auto& port : mPorts) {
+        auto controller = port->GetConnectedController();
+        if (controller == nullptr) {
+            continue;
+        }
+        auto rumble = controller->GetRumble();
+        if (rumble != nullptr) {
+            rumble->StopRumble();
+        }
+    }
+}
+
 void ControlDeck::BlockGameInput(int32_t blockId) {
     mGameInputBlockers[blockId] = true;
 }
