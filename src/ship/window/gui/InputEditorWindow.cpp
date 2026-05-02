@@ -164,6 +164,9 @@ void InputEditorWindow::DrawAnalogPreview(const char* label, ImVec2 stick, float
 #define BUTTON_COLOR_GAMEPAD_PURPLE ImVec4(0.431f, 0.369f, 0.706f, 0.5f)
 #define BUTTON_COLOR_GAMEPAD_PURPLE_HOVERED ImVec4(0.431f, 0.369f, 0.706f, 1.0f)
 
+#define BUTTON_COLOR_GAMEPAD_TEAL ImVec4(0.0f, 0.55f, 0.55f, 0.5f)
+#define BUTTON_COLOR_GAMEPAD_TEAL_HOVERED ImVec4(0.0f, 0.55f, 0.55f, 1.0f)
+
 void InputEditorWindow::GetButtonColorsForPhysicalDeviceType(PhysicalDeviceType lusIndex, ImVec4& buttonColor,
                                                              ImVec4& buttonHoveredColor) {
     switch (lusIndex) {
@@ -178,6 +181,10 @@ void InputEditorWindow::GetButtonColorsForPhysicalDeviceType(PhysicalDeviceType 
         case PhysicalDeviceType::SDLGamepad:
             buttonColor = BUTTON_COLOR_GAMEPAD_BLUE;
             buttonHoveredColor = BUTTON_COLOR_GAMEPAD_BLUE_HOVERED;
+            break;
+        case PhysicalDeviceType::Raphnet:
+            buttonColor = BUTTON_COLOR_GAMEPAD_TEAL;
+            buttonHoveredColor = BUTTON_COLOR_GAMEPAD_TEAL_HOVERED;
             break;
         default:
             buttonColor = BUTTON_COLOR_GAMEPAD_PURPLE;
