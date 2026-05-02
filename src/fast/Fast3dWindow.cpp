@@ -206,6 +206,28 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     return true;
 }
 
+bool Fast3dWindow::PresentCurrentFramebuffer() {
+    std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
+
+    if (wnd->GetGfxFrameBuffer() == 0) {
+        return false;
+    }
+
+    if (!wnd->IsFrameReady()) {
+        return false;
+    }
+
+    auto gui = wnd->GetGui();
+    wnd->GetMouseStateManager()->StartFrame();
+    gui->StartDraw();
+    mInterpreter->StartFrame();
+    mInterpreter->PresentCurrentFramebuffer();
+    gui->EndDraw();
+    mInterpreter->EndFrame();
+
+    return true;
+}
+
 void Fast3dWindow::HandleEvents() {
     mWindowManagerApi->HandleEvents();
 }

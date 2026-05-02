@@ -5986,6 +5986,14 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 }
 
+void Interpreter::PresentCurrentFramebuffer() {
+    mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
+                                       false, true, true, !mRendersToFb);
+    mRapi->StartFrame();
+    mRapi->StartDrawToFramebuffer(0, 1);
+    mRapi->ClearFramebuffer(true, false);
+}
+
 void Interpreter::EndFrame() {
     mRapi->EndFrame();
     mWapi->SwapBuffersBegin();
