@@ -5,6 +5,7 @@
 #include "ship/config/ConsoleVariable.h"
 #include "ship/controller/controldevice/controller/mapping/sdl/SDLAxisDirectionToButtonMapping.h"
 #include "ship/controller/controldeck/ControlDeck.h"
+#include "ship/controller/raphnet/RaphnetPhysicalDeviceManager.h"
 #include "libultraship/libultra/controller.h"
 
 #define SCALE_IMGUI_SIZE(value) ((value / 13.0f) * ImGui::GetFontSize())
@@ -1242,6 +1243,25 @@ void InputEditorWindow::DrawClearAllButton(uint8_t portIndex) {
 
 void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
     if (ImGui::BeginTabItem(StringHelper::Sprintf("Port %d###port%d", portIndex + 1, portIndex).c_str())) {
+        // Native Raphnet ports — buttons / sticks come from raw N64 SI status,
+        // not from the SDL/keyboard mapping pipeline. Rebinding is meaningless
+        // (the firmware reports exactly what the controller hardware sends),
+        // so we draw an explanatory banner and skip the per-binding chips.
+        auto raphnetManager =
+            Context::GetInstance()->GetControlDeck()->GetRaphnetPhysicalDeviceManager();
+        if (raphnetManager != nullptr && raphnetManager->IsPortClaimed(portIndex)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, BUTTON_COLOR_GAMEPAD_TEAL_HOVERED);
+            ImGui::TextWrapped(
+                "Native Raphnet adapter (channel %d). Buttons and sticks are read directly from "
+                "the N64 controller via the adapter's vendor protocol; no rebinding available. "
+                "To rebind, set gControllers.Raphnet.Enabled=0 and relaunch (the adapter will "
+                "fall back to SDL HID joystick mode).",
+                raphnetManager->GetChannelForPort(portIndex));
+            ImGui::PopStyleColor();
+            ImGui::EndTabItem();
+            return;
+        }
+
         DrawClearAllButton(portIndex);
         DrawSetDefaultsButton(portIndex);
         DrawDeviceToggles(portIndex);
