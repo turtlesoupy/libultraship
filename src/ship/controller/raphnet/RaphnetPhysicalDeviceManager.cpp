@@ -313,6 +313,21 @@ bool RaphnetPhysicalDeviceManager::IsClaimedSdlVendor(uint16_t vid) const {
     return mClaimedVids.contains(vid);
 }
 
+void RaphnetPhysicalDeviceManager::ReleasePort(uint8_t portIndex) {
+    if (portIndex >= MAXCONTROLLERS) {
+        return;
+    }
+    auto& binding = mPortBindings[portIndex];
+    if (binding.Transport == nullptr) {
+        return;
+    }
+    SPDLOG_INFO("[raphnet] ReleasePort({}): unbinding port from adapter '{}' chn={} "
+                "(transport stays open for other ports / rumble)",
+                portIndex, Wide2Ascii(binding.Transport->GetSerial()), binding.Channel);
+    binding.Transport.reset();
+    binding.Channel = 0;
+}
+
 void RaphnetPhysicalDeviceManager::RunSelfTest() {
     SPDLOG_INFO("================== RAPHNET SELF-TEST BEGIN ==================");
     SPDLOG_INFO("[raphnet] open transports: {}", mTransports.size());

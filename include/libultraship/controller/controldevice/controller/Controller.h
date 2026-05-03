@@ -42,5 +42,10 @@ class Controller : public Ship::Controller {
     std::weak_ptr<Ship::RaphnetTransport> mRaphnetTransport;
     uint8_t mRaphnetChannel = 0;
     bool mRaphnetBindingActive = false;
+    // Auto-fallback: if Poll fails for this many consecutive frames (~1s
+    // at 60 fps), drop the binding and let the SDL/keyboard mapping pipe-
+    // line handle the port. Without this the user is stuck with a dead
+    // controller until they edit gControllers.Raphnet.Enabled=0 and relaunch.
+    uint32_t mRaphnetConsecutivePollFailures = 0;
 };
 } // namespace LUS

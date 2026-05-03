@@ -1254,10 +1254,22 @@ void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
             ImGui::TextWrapped(
                 "Native Raphnet adapter (channel %d). Buttons and sticks are read directly from "
                 "the N64 controller via the adapter's vendor protocol; no rebinding available. "
-                "To rebind, set gControllers.Raphnet.Enabled=0 and relaunch (the adapter will "
-                "fall back to SDL HID joystick mode).",
+                "If polling is failing for your hardware, click \"Disable for this session\" to "
+                "fall back to SDL/keyboard for this port (no relaunch needed). To force-disable "
+                "native mode permanently, set CVAR gControllers.Raphnet.Enabled=0 and relaunch.",
                 raphnetManager->GetChannelForPort(portIndex));
             ImGui::PopStyleColor();
+            if (ImGui::Button(StringHelper::Sprintf("Disable for this session##raphnetDisable%d", portIndex).c_str())) {
+                raphnetManager->ReleasePort(portIndex);
+                // The manager can't reach into LUS::Controller; clear the
+                // controller's own binding so its next ReadToOSContPad falls
+                // through to the SDL/keyboard mapping pipeline instead of
+                // continuing to call Poll on a still-alive transport.
+                auto ctrl = Context::GetInstance()->GetControlDeck()->GetControllerByPort(portIndex);
+                if (ctrl != nullptr) {
+                    ctrl->SetRaphnetBinding(std::weak_ptr<RaphnetTransport>(), 0);
+                }
+            }
             ImGui::EndTabItem();
             return;
         }

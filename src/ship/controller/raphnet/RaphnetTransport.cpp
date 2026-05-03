@@ -105,25 +105,54 @@ bool RaphnetTransport::Open(const std::string& hidPath, uint16_t vid, uint16_t p
         return false;
     }
 
-    // Boot sequence — release the channel from any prior wedged state, query
-    // version, then take exclusive control of the SI bus.
+    // Boot sequence — auto-negotiate report size while clearing any prior
+    // wedged state, query version, then take exclusive control of the SI bus.
 
-    // 1. Defensive resume: if a prior process suspended polling and crashed
-    //    before resuming, the firmware is still in suspended state. Sending
-    //    SUSPEND_POLLING(0) clears that.
+    // 1. Report-size auto-negotiation + defensive resume, in one step.
+    //    The protocol has no version handshake; v3 firmware accepts 63-byte
+    //    feature reports and pre-v3 (legacy) accepts 32. Send SUSPEND_-
+    //    POLLING(0) (which we want to issue anyway, to clear wedged state
+    //    from a prior crashed run) at each candidate size and keep the
+    //    first one whose response echoes the opcode. On Windows, hid_send_-
+    //    feature_report at the wrong size returns -1 immediately; on Linux/
+    //    macOS the send always succeeds but the firmware will not produce
+    //    a well-formed reply. Either way we detect the mismatch.
     {
-        uint8_t cmd[2] = { gRntRqSuspendPolling, 0 };
-        uint8_t rep[8] = {};
-        int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
-        if (n < 0) {
-            SPDLOG_ERROR("[raphnet] defensive SUSPEND_POLLING(0) on open failed (n={}, err={}); "
-                         "adapter may be in inconsistent state — replug recommended",
-                         n, FormatHidError(mDevice));
+        constexpr int kCandidates[] = { gRntDefaultReportSize, gRntLegacyReportSize };
+        bool negotiated = false;
+        int lastN = 0;
+        uint8_t lastRep0 = 0;
+        for (int candidate : kCandidates) {
+            mReportSize = candidate;
+            uint8_t cmd[2] = { gRntRqSuspendPolling, 0 };
+            uint8_t rep[8] = {};
+            int n = Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+            lastN = n;
+            lastRep0 = (n > 0) ? rep[0] : 0;
+            if (n >= 1 && rep[0] == gRntRqSuspendPolling) {
+                SPDLOG_INFO("[raphnet] report size negotiated: {} bytes "
+                            "(SUSPEND_POLLING(0) probe echoed opcode at this size)",
+                            mReportSize);
+                negotiated = true;
+                break;
+            }
+            SPDLOG_INFO("[raphnet] report size probe at {} bytes failed "
+                        "(n={}, rep[0]=0x{:02x}); trying next candidate",
+                        candidate, n, lastRep0);
+        }
+        if (!negotiated) {
+            SPDLOG_ERROR("[raphnet] auto-negotiation failed: tried {} and {} bytes, "
+                         "neither produced a valid SUSPEND_POLLING(0) response "
+                         "(last n={}, last rep[0]=0x{:02x}). Adapter firmware unsupported "
+                         "or device wedged — closing. Replug the adapter and try again; "
+                         "if that doesn't help, file a bug with the adapter's serial "
+                         "and firmware version (visible on raphnet's website by "
+                         "running their gcn64ctl --get_version).",
+                         gRntDefaultReportSize, gRntLegacyReportSize, lastN, lastRep0);
             hid_close(mDevice);
             mDevice = nullptr;
             return false;
         }
-        SPDLOG_DEBUG("[raphnet] defensive SUSPEND_POLLING(0) OK ({} bytes)", n);
     }
 
     // 2. Read firmware version. Logged at INFO so testers' bug reports
