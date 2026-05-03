@@ -4380,6 +4380,16 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
     return false;
 }
 
+// If SegAddr fell through every resolution path, w1 came back unchanged as a
+// raw value. Sub-segment-range values (<= 0x0FFFFFFF) cannot be valid host
+// pointers; dereferencing them in GfxSpVertex SIGSEGVs at fault_addr =
+// resolved_w1. Skip the load and log so the upstream state corruption that
+// seeded the bad pointer remains traceable. Mirrors the SETTIMG guard added
+// in upstream LUS PR #1042.
+static inline bool gfx_vtx_addr_is_unresolved(const void* addr) {
+    return (uintptr_t)addr <= 0x0FFFFFFFu;
+}
+
 // Almost all versions of the microcode have their own version of this opcode
 bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
@@ -4388,6 +4398,12 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     uint32_t n_vertices = C0(12, 8);
     uint32_t v_dest_end = C0(1, 7);
     const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3dex2) skipped: unresolved addr=0x{:x} n={} dest_end={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, n_vertices, v_dest_end, (uintptr_t)cmd->words.w1);
+        return false;
+    }
 
     // Lazy vertex byte-order fixup (port-side, Option A).
     // Per-vertex idempotency handles overlapping sub-region reloads.
@@ -4401,7 +4417,14 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3dex) skipped: unresolved addr=0x{:x} n={} dest={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, C0(10, 6), C0(17, 7), (uintptr_t)cmd->words.w1);
+        return false;
+    }
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), vertices);
 
     return false;
 }
@@ -4410,7 +4433,14 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3d) skipped: unresolved addr=0x{:x} n={} dest={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, (C0(0, 16)) / sizeof(F3DVtx), C0(16, 4),
+                     (uintptr_t)cmd->words.w1);
+        return false;
+    }
+    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), vertices);
 
     return false;
 }
