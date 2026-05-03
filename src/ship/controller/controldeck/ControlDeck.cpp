@@ -2,6 +2,8 @@
 
 #include "ship/Context.h"
 #include "ship/controller/controldevice/controller/Controller.h"
+#include "ship/controller/controldevice/controller/mapping/raphnet/RaphnetRumbleMapping.h"
+#include "ship/controller/raphnet/RaphnetPhysicalDeviceManager.h"
 #include "ship/utils/StringHelper.h"
 #include "ship/config/ConsoleVariable.h"
 #include <imgui.h>
@@ -22,6 +24,39 @@ ControlDeck::~ControlDeck() {
     SPDLOG_TRACE("destruct control deck");
 }
 
+void ControlDeck::PreInitRaphnet() {
+    if (mRaphnetPhysicalDeviceManager != nullptr) {
+        SPDLOG_WARN("ControlDeck::PreInitRaphnet called twice; ignoring");
+        return;
+    }
+    mRaphnetPhysicalDeviceManager = std::make_shared<RaphnetPhysicalDeviceManager>();
+    if (!mRaphnetPhysicalDeviceManager->Init()) {
+        SPDLOG_WARN("Raphnet manager Init failed; native adapter support disabled this session");
+        // Keep the manager around so accessors return a non-null but empty
+        // instance — simpler than nullptr-checking everywhere.
+        return;
+    }
+    // Tell the SDL device manager to skip every adapter VID we just claimed,
+    // BEFORE SDL_Init(SDL_INIT_GAMECONTROLLER) (which is the next thing the
+    // caller does). This wins the Windows DirectInput grab race against the
+    // raphnet HID joystick surface.
+    for (uint16_t vid : mRaphnetPhysicalDeviceManager->GetClaimedVids()) {
+        mConnectedPhysicalDeviceManager->IgnoreVendorIdGlobally(vid);
+    }
+    SPDLOG_INFO("ControlDeck::PreInitRaphnet: {} adapter(s), {} port(s) claimed",
+                mRaphnetPhysicalDeviceManager->GetOpenTransports().size(),
+                mRaphnetPhysicalDeviceManager->ClaimedPortCount());
+}
+
+void ControlDeck::ShutdownRaphnet() {
+    if (mRaphnetPhysicalDeviceManager == nullptr) {
+        return;
+    }
+    SPDLOG_INFO("ControlDeck::ShutdownRaphnet");
+    mRaphnetPhysicalDeviceManager->Shutdown();
+    mRaphnetPhysicalDeviceManager.reset();
+}
+
 void ControlDeck::Init(uint8_t* controllerBits) {
     mControllerBits = controllerBits;
     *mControllerBits |= 1 << 0;
@@ -37,6 +72,39 @@ void ControlDeck::Init(uint8_t* controllerBits) {
         mPorts[0]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::Keyboard);
         mPorts[0]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::Mouse);
         mPorts[0]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::SDLGamepad);
+    }
+
+    // Install Raphnet rumble mappings on any port the RaphnetPhysicalDeviceManager
+    // has claimed. Polling (the input read path) wires up in L7 — this commit
+    // only handles rumble wiring, which can land independently because
+    // ControllerRumble already supports adding mappings via AddRumbleMapping.
+    if (mRaphnetPhysicalDeviceManager != nullptr) {
+        for (size_t i = 0; i < mPorts.size(); ++i) {
+            const uint8_t portIndex = static_cast<uint8_t>(i);
+            auto transport = mRaphnetPhysicalDeviceManager->GetTransportForPort(portIndex);
+            if (transport == nullptr) {
+                continue;
+            }
+            const int channel = mRaphnetPhysicalDeviceManager->GetChannelForPort(portIndex);
+            if (channel < 0) {
+                continue;
+            }
+            auto controller = mPorts[i]->GetConnectedController();
+            if (controller == nullptr) {
+                continue;
+            }
+            auto rumble = controller->GetRumble();
+            if (rumble == nullptr) {
+                continue;
+            }
+            auto mapping = std::make_shared<RaphnetRumbleMapping>(
+                portIndex, DEFAULT_LOW_FREQUENCY_RUMBLE_PERCENTAGE,
+                DEFAULT_HIGH_FREQUENCY_RUMBLE_PERCENTAGE, std::weak_ptr<RaphnetTransport>(transport),
+                static_cast<uint8_t>(channel));
+            rumble->AddRumbleMapping(mapping);
+            SPDLOG_INFO("ControlDeck::Init: port {} raphnet rumble mapping installed (chn={})",
+                        portIndex, channel);
+        }
     }
 }
 
@@ -128,6 +196,10 @@ void ControlDeck::UnblockGameInput(int32_t blockId) {
 
 std::shared_ptr<ConnectedPhysicalDeviceManager> ControlDeck::GetConnectedPhysicalDeviceManager() {
     return mConnectedPhysicalDeviceManager;
+}
+
+std::shared_ptr<RaphnetPhysicalDeviceManager> ControlDeck::GetRaphnetPhysicalDeviceManager() {
+    return mRaphnetPhysicalDeviceManager;
 }
 
 std::shared_ptr<GlobalSDLDeviceSettings> ControlDeck::GetGlobalSDLDeviceSettings() {
