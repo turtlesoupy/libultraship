@@ -211,9 +211,24 @@ void Config::Reload() {
 }
 
 void Config::Save() {
+    // Serialize first, then write — opening the ofstream truncates the file
+    // immediately, so doing the unflatten/dump after the open meant any throw
+    // from nlohmann (e.g. type_error.313 on a key conflict where one cvar is
+    // both a scalar and a parent path) would leave the user with a zero-byte
+    // config and silently lose every setting. Build the string up front and
+    // only touch the file once we know we have something valid to write.
+    nlohmann::json nested;
+    std::string serialized;
+    try {
+        nested = mFlattenedJson.unflatten();
+        serialized = nested.dump(4);
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("Config::Save: refusing to truncate {} — failed to serialize cvars: {}", mPath, e.what());
+        return;
+    }
+    mNestedJson = std::move(nested);
     std::ofstream file(mPath);
-    mNestedJson = mFlattenedJson.unflatten();
-    file << mNestedJson.dump(4);
+    file << serialized;
 }
 
 template <typename T> std::vector<T> Config::GetArray(const std::string& key) {
