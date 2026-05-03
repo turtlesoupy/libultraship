@@ -1,6 +1,8 @@
 #include "ship/Context.h"
 #include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
+#include <filesystem>
 #include <iostream>
+#include <system_error>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include "ship/install_config.h"
@@ -533,16 +535,28 @@ std::string Context::GetPathRelativeToAppDirectory(const std::string path, std::
 }
 
 std::string Context::LocateFileAcrossAppDirs(const std::string path, std::string appName) {
+    // Use the noexcept exists(p, ec) overload. The throwing overload raises
+    // std::filesystem::filesystem_error whenever GetFileAttributesExW returns
+    // anything other than an ENOENT-equivalent. NON_PORTABLE Windows builds
+    // can bake an absolute CMAKE_INSTALL_PREFIX (e.g. "D:/a/<repo>/...") into
+    // install_config.h; on a user machine whose D: drive has no media,
+    // GetFileAttributesExW returns ERROR_NOT_READY ("The device is not ready"),
+    // which the throwing exists() rethrows as filesystem_error. The unwind
+    // crosses osContInit, terminate fires, and spdlog's async pool tears down
+    // on the way out, leaving a 0xE06D7363 crash with no useful traceback.
+    // For path probing, "false" is the right answer for any failure — the
+    // caller will fall through to the next candidate or the cwd-relative path.
+    std::error_code ec;
     std::string fpath;
 
     // app configuration dir
     fpath = GetPathRelativeToAppDirectory(path, appName);
-    if (std::filesystem::exists(fpath)) {
+    if (std::filesystem::exists(fpath, ec)) {
         return fpath;
     }
     // app install dir
     fpath = GetPathRelativeToAppBundle(path);
-    if (std::filesystem::exists(fpath)) {
+    if (std::filesystem::exists(fpath, ec)) {
         return fpath;
     }
     // current dir

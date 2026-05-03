@@ -15,12 +15,27 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     *controllerBits = 0;
     status->status |= 1;
 
-    std::string controllerDb = Ship::Context::LocateFileAcrossAppDirs("gamecontrollerdb.txt");
-    int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
-    if (mappingsAdded >= 0) {
-        SPDLOG_INFO("Added SDL game controllers from \"{}\" ({})", controllerDb, mappingsAdded);
-    } else {
-        SPDLOG_ERROR("Failed add SDL game controller mappings from \"{}\" ({})", controllerDb, SDL_GetError());
+    // Locating + loading gamecontrollerdb.txt is a quality-of-life feature —
+    // failure to find or parse it should never crash the controller thread.
+    // Wrap the whole probe in a try/catch in case any path helper still ends
+    // up throwing (e.g. a future CMAKE_INSTALL_PREFIX that points at a drive
+    // letter the user's machine doesn't have, see Context::LocateFileAcrossAppDirs
+    // for the canonical case). An uncaught throw here propagates out of the
+    // SSB64 controller-init thread, terminate() fires, and spdlog's async
+    // pool tears down on the way out, leaving a 0xE06D7363 crash that's
+    // hard to diagnose from a user log.
+    try {
+        std::string controllerDb = Ship::Context::LocateFileAcrossAppDirs("gamecontrollerdb.txt");
+        int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
+        if (mappingsAdded >= 0) {
+            SPDLOG_INFO("Added SDL game controllers from \"{}\" ({})", controllerDb, mappingsAdded);
+        } else {
+            SPDLOG_ERROR("Failed add SDL game controller mappings from \"{}\" ({})", controllerDb, SDL_GetError());
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("osContInit: skipping gamecontrollerdb.txt — {}", e.what());
+    } catch (...) {
+        SPDLOG_ERROR("osContInit: skipping gamecontrollerdb.txt — unknown exception");
     }
 
     // Run RaphnetPhysicalDeviceManager init BEFORE SDL_Init(GAMECONTROLLER).
