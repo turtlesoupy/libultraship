@@ -41,6 +41,23 @@ void ConnectedPhysicalDeviceManager::UnignoreInstanceIdForPort(uint8_t portIndex
     mIgnoredInstanceIds[portIndex].erase(instanceId);
 }
 
+void ConnectedPhysicalDeviceManager::IgnoreVendorIdGlobally(uint16_t vid) {
+    if (mIgnoredVendorIds.insert(vid).second) {
+        SPDLOG_INFO("ConnectedPhysicalDeviceManager: globally ignoring SDL gamepads with VID 0x{:04x} "
+                    "(claimed by another input backend, e.g. Raphnet native)", vid);
+    }
+}
+
+void ConnectedPhysicalDeviceManager::UnignoreVendorIdGlobally(uint16_t vid) {
+    if (mIgnoredVendorIds.erase(vid) > 0) {
+        SPDLOG_INFO("ConnectedPhysicalDeviceManager: no longer ignoring SDL gamepads with VID 0x{:04x}", vid);
+    }
+}
+
+bool ConnectedPhysicalDeviceManager::IsVendorIdIgnoredGlobally(uint16_t vid) const {
+    return mIgnoredVendorIds.contains(vid);
+}
+
 void ConnectedPhysicalDeviceManager::HandlePhysicalDeviceConnect(int32_t sdlDeviceIndex) {
     RefreshConnectedSDLGamepads();
 }
@@ -73,6 +90,19 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
                         "This is likely due to a missing mapping string in gamecontrollerdb.txt."
                         "Refer to https://github.com/mdqinc/SDL_GameControllerDB for more information.",
                         deviceGuidCStr);
+            continue;
+        }
+
+        // Globally ignored vendor (e.g. Raphnet adapter already claimed via
+        // hidapi by RaphnetPhysicalDeviceManager). Skip BEFORE SDL_GameController-
+        // Open so SDL never gets a handle to the device — opening here would
+        // compete with our raw-SI commands and on Windows DirectInput tends to
+        // grab first, breaking native polling.
+        uint16_t devVid = SDL_JoystickGetDeviceVendor(i);
+        if (devVid != 0 && IsVendorIdIgnoredGlobally(devVid)) {
+            SPDLOG_INFO("ConnectedPhysicalDeviceManager: skipping SDL gamepad index={} VID=0x{:04x} (GUID: {}) "
+                        "— globally ignored by another input backend",
+                        i, devVid, deviceGuidCStr);
             continue;
         }
 
