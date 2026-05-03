@@ -23,6 +23,15 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
         SPDLOG_ERROR("Failed add SDL game controller mappings from \"{}\" ({})", controllerDb, SDL_GetError());
     }
 
+    // Run RaphnetPhysicalDeviceManager init BEFORE SDL_Init(GAMECONTROLLER).
+    // The raphnet adapter exposes both a HID joystick interface (which SDL
+    // would grab) and a vendor command interface (which we drive via
+    // hidapi). On Windows, DirectInput tends to grab whichever is opened
+    // first and refuses sharing — claiming via hidapi first guarantees we
+    // win the race. Internally PreInitRaphnet also globally skip-lists the
+    // claimed VIDs so the SDL refresh below ignores them.
+    Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
+
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         SPDLOG_ERROR("Failed to initialize SDL game controllers ({})", SDL_GetError());
