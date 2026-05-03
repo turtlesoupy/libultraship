@@ -4,8 +4,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
+#include "ship/Context.h"
+#include "ship/config/ConsoleVariable.h"
 #include "ship/controller/raphnet/RaphnetAdapterEnumerator.h"
+#include "ship/utils/StringHelper.h"
 
 namespace Ship {
 
@@ -125,19 +130,62 @@ bool RaphnetPhysicalDeviceManager::Init() {
                   return a.Channel < b.Channel;
               });
 
-    // Bind to game ports in order, up to MAXCONTROLLERS.
+    // Phase 1: honor explicit per-port pinning via CVAR
+    // gControllers.PortN.RaphnetSerial. If a candidate's serial matches the
+    // pin for port P, claim that exact slot. Pinning trumps the deterministic
+    // sort so users with multiple adapters can hard-bind a specific physical
+    // adapter to a specific game port.
+    auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
+    std::vector<bool> claimed(candidates.size(), false);
+    for (int port = 0; port < MAXCONTROLLERS; ++port) {
+        std::string cvarKey = StringHelper::Sprintf(
+            CVAR_PREFIX_CONTROLLERS ".Port%d.RaphnetSerial", port + 1);
+        std::string pinSerial = cvars->GetString(cvarKey.c_str(), "");
+        if (pinSerial.empty()) {
+            continue;
+        }
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (claimed[i]) {
+                continue;
+            }
+            std::string candSerial = Wide2Ascii(candidates[i].Transport->GetSerial());
+            if (candSerial == pinSerial) {
+                mPortBindings[port].Transport = candidates[i].Transport;
+                mPortBindings[port].Channel = candidates[i].Channel;
+                claimed[i] = true;
+                SPDLOG_INFO("[raphnet] port {} ← PINNED adapter serial='{}' chn={} "
+                            "(via {})",
+                            port, candSerial, candidates[i].Channel, cvarKey);
+                break;
+            }
+        }
+        if (mPortBindings[port].Transport == nullptr) {
+            SPDLOG_WARN("[raphnet] {} = '{}' but no enumerated adapter matches; pin ignored",
+                        cvarKey, pinSerial);
+        }
+    }
+
+    // Phase 2: fill remaining unbound ports with unclaimed candidates in
+    // sorted order.
     int portIdx = 0;
-    for (auto& cand : candidates) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (claimed[i]) {
+            continue;
+        }
+        while (portIdx < MAXCONTROLLERS && mPortBindings[portIdx].Transport != nullptr) {
+            ++portIdx;
+        }
         if (portIdx >= MAXCONTROLLERS) {
             SPDLOG_WARN("[raphnet] more N64 candidates ({}) than game ports ({}); ignoring extras",
                         candidates.size(), MAXCONTROLLERS);
             break;
         }
-        mPortBindings[portIdx].Transport = cand.Transport;
-        mPortBindings[portIdx].Channel = cand.Channel;
+        mPortBindings[portIdx].Transport = candidates[i].Transport;
+        mPortBindings[portIdx].Channel = candidates[i].Channel;
         SPDLOG_INFO("[raphnet] port {} ← adapter serial='{}' chn={} (vid=0x{:04x} pid=0x{:04x})",
-                    portIdx, Wide2Ascii(cand.Transport->GetSerial()), cand.Channel,
-                    cand.Transport->GetVid(), cand.Transport->GetPid());
+                    portIdx, Wide2Ascii(candidates[i].Transport->GetSerial()),
+                    candidates[i].Channel, candidates[i].Transport->GetVid(),
+                    candidates[i].Transport->GetPid());
         ++portIdx;
     }
 
@@ -221,6 +269,52 @@ int RaphnetPhysicalDeviceManager::ClaimedPortCount() const {
 
 bool RaphnetPhysicalDeviceManager::IsClaimedSdlVendor(uint16_t vid) const {
     return mClaimedVids.contains(vid);
+}
+
+void RaphnetPhysicalDeviceManager::RunSelfTest() {
+    SPDLOG_INFO("================== RAPHNET SELF-TEST BEGIN ==================");
+    SPDLOG_INFO("[raphnet] open transports: {}", mTransports.size());
+    SPDLOG_INFO("[raphnet] claimed game ports: {}", ClaimedPortCount());
+
+    int adapterIdx = 0;
+    for (auto& transport : mTransports) {
+        SPDLOG_INFO("[raphnet] --- adapter {} (vid=0x{:04x} pid=0x{:04x} serial='{}' version='{}') ---",
+                    adapterIdx, transport->GetVid(), transport->GetPid(),
+                    Wide2Ascii(transport->GetSerial()), transport->GetVersionString());
+
+        for (uint8_t ch = 0; ch < gRntMaxChannelsPerAdapter; ++ch) {
+            uint8_t type = gRntCtlTypeNone;
+            transport->GetControllerType(ch, type);
+        }
+
+        for (uint8_t ch = 0; ch < gRntMaxChannelsPerAdapter; ++ch) {
+            // Only poll channels we know are N64 — avoid spamming non-N64
+            // channels. We probe by checking GetControllerType once more.
+            uint8_t type = gRntCtlTypeNone;
+            if (!transport->GetControllerType(ch, type) || type != gRntCtlTypeN64) {
+                continue;
+            }
+            SPDLOG_INFO("[raphnet] adapter {} chn={}: 10 polls", adapterIdx, ch);
+            for (int i = 0; i < 10; ++i) {
+                OSContPad pad = {};
+                bool ok = transport->Poll(ch, pad);
+                if (ok) {
+                    SPDLOG_INFO("[raphnet]   poll[{}] button=0x{:04x} stick=({},{})", i,
+                                pad.button, pad.stick_x, pad.stick_y);
+                } else {
+                    SPDLOG_WARN("[raphnet]   poll[{}] FAILED", i);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            }
+            SPDLOG_INFO("[raphnet] adapter {} chn={}: vibration test (100 ms on, then off)",
+                        adapterIdx, ch);
+            transport->SetVibration(ch, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            transport->SetVibration(ch, false);
+        }
+        ++adapterIdx;
+    }
+    SPDLOG_INFO("================== RAPHNET SELF-TEST END ==================");
 }
 
 } // namespace Ship

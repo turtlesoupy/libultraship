@@ -57,6 +57,14 @@ class RaphnetPhysicalDeviceManager {
 
     bool IsInitialized() const { return mInitialized; }
 
+    // Runs an exhaustive diagnostic dump for every claimed (transport, channel):
+    //   * GetVersion + GetControllerType for every channel
+    //   * 10 sequential polls with full byte logging
+    //   * 100 ms vibration on / 100 ms off
+    // Everything goes to ssb64.log at INFO. Designed for remote testers to
+    // capture-and-share via `gControllers.Raphnet.SelfTest=1; run game`.
+    void RunSelfTest();
+
     // Per-port binding accessors. Return nullptr / -1 if portIndex is
     // unclaimed.
     std::shared_ptr<RaphnetTransport> GetTransportForPort(uint8_t portIndex) const;

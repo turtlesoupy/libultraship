@@ -29,6 +29,17 @@ void ControlDeck::PreInitRaphnet() {
         SPDLOG_WARN("ControlDeck::PreInitRaphnet called twice; ignoring");
         return;
     }
+
+    // Master kill switch — lets users force-disable native mode without
+    // unplugging the adapter (it then appears as a plain SDL HID joystick).
+    int32_t enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
+        CVAR_PREFIX_CONTROLLERS ".Raphnet.Enabled", 1);
+    if (enabled == 0) {
+        SPDLOG_INFO("ControlDeck::PreInitRaphnet: gControllers.Raphnet.Enabled=0; native adapter "
+                    "support disabled by CVAR (adapter will fall back to SDL HID joystick)");
+        return;
+    }
+
     mRaphnetPhysicalDeviceManager = std::make_shared<RaphnetPhysicalDeviceManager>();
     if (!mRaphnetPhysicalDeviceManager->Init()) {
         SPDLOG_WARN("Raphnet manager Init failed; native adapter support disabled this session");
@@ -46,6 +57,16 @@ void ControlDeck::PreInitRaphnet() {
     SPDLOG_INFO("ControlDeck::PreInitRaphnet: {} adapter(s), {} port(s) claimed",
                 mRaphnetPhysicalDeviceManager->GetOpenTransports().size(),
                 mRaphnetPhysicalDeviceManager->ClaimedPortCount());
+
+    // One-shot diagnostic dump for remote testers. Runs after enumeration
+    // but before normal game startup; the game still launches normally
+    // afterward so the user can close the window when satisfied.
+    int32_t selfTest = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
+        CVAR_PREFIX_CONTROLLERS ".Raphnet.SelfTest", 0);
+    if (selfTest != 0) {
+        SPDLOG_INFO("ControlDeck::PreInitRaphnet: gControllers.Raphnet.SelfTest=1; running diagnostic dump");
+        mRaphnetPhysicalDeviceManager->RunSelfTest();
+    }
 }
 
 void ControlDeck::ShutdownRaphnet() {
