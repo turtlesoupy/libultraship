@@ -358,7 +358,13 @@ void CrashHandler::PrintStack(CONTEXT* ctx) {
         }
         symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
         symbol->MaxNameLen = MAX_SYM_NAME;
-        SymFromAddr(process, (ULONG64)stack.AddrPC.Offset, &displacement, symbol);
+        // SymFromAddr leaves symbol->Name and symbol->Address uninitialized
+        // when it fails (no PDB loaded). Clear them so the fallback path
+        // below prints a real return address rather than stale stack data.
+        BOOL haveSymbol = SymFromAddr(process, (ULONG64)stack.AddrPC.Offset, &displacement, symbol);
+        if (!haveSymbol) {
+            symbol->Name[0] = '\0';
+        }
 #if defined(_M_AMD64)
         IMAGEHLP_LINE64 line;
         line.SizeOfStruct = sizeof(IMAGEHLP_LINE64);
@@ -366,7 +372,7 @@ void CrashHandler::PrintStack(CONTEXT* ctx) {
         IMAGEHLP_LINE line;
         line.SizeOfStruct = sizeof(IMAGEHLP_LINE);
 #endif
-        if (SymGetLineFromAddr(process, stack.AddrPC.Offset, &disp, &line)) {
+        if (haveSymbol && SymGetLineFromAddr(process, stack.AddrPC.Offset, &disp, &line)) {
             AppendStr("    ");
             AppendStr(symbol->Name);
             AppendStr(" in ");
@@ -377,7 +383,7 @@ void CrashHandler::PrintStack(CONTEXT* ctx) {
         } else {
             WRITE_VAR_M("    ", symbol->Name);
             char addrString[20];
-            sprintf_s(addrString, std::size(addrString), "0x%016llX", symbol->Address);
+            sprintf_s(addrString, std::size(addrString), "0x%016llX", (ULONG64)stack.AddrPC.Offset);
             WRITE_VAR_M("(", addrString);
             AppendStr(")");
             hModule = nullptr;
