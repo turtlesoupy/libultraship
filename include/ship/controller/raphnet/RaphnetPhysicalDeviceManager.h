@@ -72,6 +72,16 @@ class RaphnetPhysicalDeviceManager {
     bool                              IsPortClaimed(uint8_t portIndex) const;
     int                               ClaimedPortCount() const;
 
+    // Drop the binding for a single game port without tearing down the
+    // underlying transport (other ports on the same multi-channel adapter
+    // stay live). Used by LUS::Controller's auto-fallback when native
+    // polling has failed for ~1 second straight, and by the InputEditor's
+    // "Disable Raphnet for this port" button. After this returns,
+    // IsPortClaimed(port) is false, so the InputEditor stops drawing the
+    // Raphnet banner and the standard SDL/keyboard mapping pipeline takes
+    // over for that port.
+    void ReleasePort(uint8_t portIndex);
+
     // For ConnectedPhysicalDeviceManager (L5) skip-list. True if vid is the
     // VID of any open transport.
     bool IsClaimedSdlVendor(uint16_t vid) const;

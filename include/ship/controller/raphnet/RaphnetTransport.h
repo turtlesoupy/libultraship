@@ -56,11 +56,15 @@ constexpr uint8_t gRntCtlTypeGameCube = 2;
 // Max channels per adapter (4-port versions exist; single-port reports 1).
 constexpr int gRntMaxChannelsPerAdapter = 4;
 
-// Default report size for raphnet command interface. The adapter accepts
-// exactly this many payload bytes after the report-id byte. Some legacy
-// firmware uses 32; v3 firmware uses 63. Auto-negotiation is not in the
-// protocol, so we default to 63 and shrink if we see short responses.
+// Report-size candidates for the raphnet command interface. The adapter
+// accepts exactly the descriptor-declared payload size after the report-id
+// byte; v3 firmware uses 63, legacy (pre-v3) firmware uses 32. The protocol
+// has no version handshake, so Open() probes a benign command (SUSPEND_-
+// POLLING(0)) at each size in order and keeps the first that gets an
+// opcode-echo response. List is ordered newest-first so modern hardware
+// settles on the first try.
 constexpr int gRntDefaultReportSize = 63;
+constexpr int gRntLegacyReportSize  = 32;
 
 class RaphnetTransport {
   public:
