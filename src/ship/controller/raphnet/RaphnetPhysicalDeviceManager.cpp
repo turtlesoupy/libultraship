@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "ship/controller/raphnet/MockRaphnetTransport.h"
 #include "ship/controller/raphnet/RaphnetAdapterEnumerator.h"
 #include "ship/utils/StringHelper.h"
 
@@ -56,6 +58,39 @@ bool RaphnetPhysicalDeviceManager::Init() {
     }
 
     auto adapters = RaphnetAdapterEnumerator::EnumerateAdapters();
+
+    // Mock-adapter injection for hardware-free testing. SSB64_RAPHNET_MOCK
+    // env var: parse as integer N (default 0). For N >= 1, prepend N
+    // synthetic adapter records to the enumeration list so the open loop
+    // builds MockRaphnetTransports for each. Real adapters (if any) are
+    // still enumerated and opened normally — the two coexist without issue.
+    int mockCount = 0;
+    if (const char* mockEnv = std::getenv("SSB64_RAPHNET_MOCK"); mockEnv != nullptr) {
+        mockCount = std::atoi(mockEnv);
+        if (mockCount < 0) {
+            mockCount = 0;
+        }
+        if (mockCount > MAXCONTROLLERS) {
+            mockCount = MAXCONTROLLERS;
+        }
+        if (mockCount > 0) {
+            SPDLOG_INFO("[raphnet] SSB64_RAPHNET_MOCK={}; injecting {} synthetic adapter(s) for "
+                        "hardware-free testing",
+                        mockEnv, mockCount);
+            for (int i = 0; i < mockCount; ++i) {
+                RaphnetAdapterInfo info;
+                info.HidPath = StringHelper::Sprintf("MOCK:%d", i);
+                info.Vid = gRaphnetVid;
+                info.Pid = 0xFFFF;  // synthetic PID; real raphnet PIDs do not collide
+                info.Serial = L"mock-" + std::to_wstring(i);
+                info.ProductName = L"Mock Raphnet Adapter";
+                info.InterfaceNumber = 1;
+                info.MaxChannelsHint = 1;  // mock only has 1 channel
+                adapters.insert(adapters.begin(), std::move(info));
+            }
+        }
+    }
+
     if (adapters.empty()) {
         SPDLOG_INFO("[raphnet] no adapters found; SDL HID joystick path will handle any plain joysticks");
         mInitialized = true;
@@ -64,9 +99,16 @@ bool RaphnetPhysicalDeviceManager::Init() {
 
     // Open each adapter and remember the open transport. Probing channels
     // happens after the open loop so we can log the full enumerate→open
-    // trace before any per-channel queries spam the log.
+    // trace before any per-channel queries spam the log. Mock-tagged paths
+    // (HidPath starts with "MOCK:") get a MockRaphnetTransport instead of
+    // a real one.
     for (auto& info : adapters) {
-        auto transport = std::make_shared<RaphnetTransport>();
+        std::shared_ptr<RaphnetTransport> transport;
+        if (info.HidPath.rfind("MOCK:", 0) == 0) {
+            transport = std::make_shared<MockRaphnetTransport>();
+        } else {
+            transport = std::make_shared<RaphnetTransport>();
+        }
         if (!transport->Open(info.HidPath, info.Vid, info.Pid, info.Serial)) {
             SPDLOG_WARN("[raphnet] failed to open '{}' (vid=0x{:04x} pid=0x{:04x}); skipping",
                         Wide2Ascii(info.Serial), info.Vid, info.Pid);

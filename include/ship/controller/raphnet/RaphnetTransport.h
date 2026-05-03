@@ -65,7 +65,7 @@ constexpr int gRntDefaultReportSize = 63;
 class RaphnetTransport {
   public:
     RaphnetTransport();
-    ~RaphnetTransport();
+    virtual ~RaphnetTransport();
 
     RaphnetTransport(const RaphnetTransport&) = delete;
     RaphnetTransport& operator=(const RaphnetTransport&) = delete;
@@ -78,35 +78,35 @@ class RaphnetTransport {
     //      auto-poll the controller during native operation.
     // Returns true on full success; false if any step fails (the device is
     // closed automatically on failure). Heavy logging at every step.
-    bool Open(const std::string& hidPath, uint16_t vid, uint16_t pid,
-              const std::wstring& serial);
+    virtual bool Open(const std::string& hidPath, uint16_t vid, uint16_t pid,
+                      const std::wstring& serial);
 
     // Sends SUSPEND_POLLING(0) (so adapter is usable as plain HID joystick
     // again after game exit), then hid_close. Idempotent.
-    void Close();
+    virtual void Close();
 
-    bool IsOpen() const { return mDevice != nullptr; }
+    virtual bool IsOpen() const { return mDevice != nullptr; }
 
     // Pulls firmware version into outVersion (e.g. "3.6.1"). Format depends
     // on firmware; we log the raw response bytes alongside the formatted
     // string so testers' logs show exactly what came back.
-    bool GetVersion(std::string& outVersion);
+    virtual bool GetVersion(std::string& outVersion);
 
     // Sends RQ_RNT_GET_CONTROLLER_TYPE [chn]. Returns true on response;
     // outType is one of gRntCtlType* values. v3.4+ firmware required —
     // older firmware returns the GET_VERSION echo instead, which we treat
     // as "unknown" (false return).
-    bool GetControllerType(uint8_t channel, uint8_t& outType);
+    virtual bool GetControllerType(uint8_t channel, uint8_t& outType);
 
     // Sends RQ_RNT_SUSPEND_POLLING [0|1]. When suspended, the firmware
     // stops auto-polling the controller so RAW_SI commands have exclusive
     // access to the SI bus.
-    bool SuspendPolling(bool suspend);
+    virtual bool SuspendPolling(bool suspend);
 
     // Sends RQ_RNT_SET_VIBRATION [chn][on?1:0]. Firmware writes the SI
     // accessory write to the rumble pak; no-op (silently) if the
     // controller doesn't have a rumble pak inserted.
-    bool SetVibration(uint8_t channel, bool on);
+    virtual bool SetVibration(uint8_t channel, bool on);
 
     // Sends RAW_SI(N64_GET_STATUS) on channel and decodes the 4-byte
     // response into pad.button (16-bit, MSB=byte0, matches LUS BTN_*
@@ -118,23 +118,19 @@ class RaphnetTransport {
     // unchanged, throttled WARN logged. First failure per channel is
     // ERROR with full context; first success per channel is INFO with
     // full bytes.
-    bool Poll(uint8_t channel, OSContPad& pad);
+    virtual bool Poll(uint8_t channel, OSContPad& pad);
 
-    // Identifying info, populated by Open().
+    // Identifying info, populated by Open(). Non-virtual — subclasses set
+    // the protected state directly in their own Open override.
     const std::string&  GetHidPath()       const { return mHidPath; }
     uint16_t            GetVid()           const { return mVid; }
     uint16_t            GetPid()           const { return mPid; }
     const std::wstring& GetSerial()        const { return mSerial; }
     const std::string&  GetVersionString() const { return mVersionString; }
 
-  private:
-    // Send command; receive response. Returns the response payload length
-    // (bytes after the report-id byte) on success, -1 on USB error, 0 on
-    // timeout. Caller holds mLock.
-    int Exchange(const uint8_t* tx, size_t txLen,
-                 uint8_t* rx, size_t rxMax,
-                 int timeoutMs);
-
+  protected:
+    // ToUtf8 / FormatHidError exposed to subclasses so they can format log
+    // lines consistently with the real transport's style.
     static std::string FormatHidError(hid_device* dev);
     static std::string ToUtf8(const std::wstring& w);
 
@@ -151,6 +147,14 @@ class RaphnetTransport {
     bool     mFirstPollLogged   [gRntMaxChannelsPerAdapter];
     bool     mFirstErrorLogged  [gRntMaxChannelsPerAdapter];
     uint32_t mErrorCount        [gRntMaxChannelsPerAdapter];
+
+  private:
+    // Send command; receive response. Returns the response payload length
+    // (bytes after the report-id byte) on success, -1 on USB error, 0 on
+    // timeout. Caller holds mLock.
+    int Exchange(const uint8_t* tx, size_t txLen,
+                 uint8_t* rx, size_t rxMax,
+                 int timeoutMs);
 };
 
 } // namespace Ship
