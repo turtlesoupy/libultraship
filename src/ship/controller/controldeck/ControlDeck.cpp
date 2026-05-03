@@ -102,7 +102,12 @@ void ControlDeck::Init(uint8_t* controllerBits) {
                 DEFAULT_HIGH_FREQUENCY_RUMBLE_PERCENTAGE, std::weak_ptr<RaphnetTransport>(transport),
                 static_cast<uint8_t>(channel));
             rumble->AddRumbleMapping(mapping);
-            SPDLOG_INFO("ControlDeck::Init: port {} raphnet rumble mapping installed (chn={})",
+            // Switch the controller's read path to native raw-SI polling.
+            // No-op on bases that don't override; LUS::Controller overrides.
+            controller->SetRaphnetBinding(std::weak_ptr<RaphnetTransport>(transport),
+                                          static_cast<uint8_t>(channel));
+            SPDLOG_INFO("ControlDeck::Init: port {} raphnet binding installed "
+                        "(chn={}, rumble + native polling active)",
                         portIndex, channel);
         }
     }

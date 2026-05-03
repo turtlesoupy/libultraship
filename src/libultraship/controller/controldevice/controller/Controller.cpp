@@ -3,6 +3,7 @@
 #include <algorithm>
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "ship/controller/raphnet/RaphnetTransport.h"
 #if __APPLE__
 #include <SDL_events.h>
 #else
@@ -23,7 +24,46 @@ void Controller::ReadToPad(void* pad) {
     ReadToOSContPad((OSContPad*)pad);
 }
 
+void Controller::SetRaphnetBinding(std::weak_ptr<Ship::RaphnetTransport> transport, uint8_t channel) {
+    mRaphnetTransport = std::move(transport);
+    mRaphnetChannel = channel;
+    mRaphnetBindingActive = !mRaphnetTransport.expired();
+    SPDLOG_INFO("[raphnet] LUS::Controller port={} bound to raphnet chn={} "
+                "(simulated-input-lag CVAR bypassed on this port)",
+                GetPortIndex(), channel);
+}
+
 void Controller::ReadToOSContPad(OSContPad* pad) {
+    // Native raphnet path: poll the bound adapter channel directly, write
+    // straight into pad, skip mappings and skip the input-lag pad buffer.
+    // Combining real adapter USB latency with CVAR_SIMULATED_INPUT_LAG would
+    // double-count delay and feel terrible.
+    if (mRaphnetBindingActive && pad != nullptr) {
+        if (auto t = mRaphnetTransport.lock()) {
+            if (t->Poll(mRaphnetChannel, *pad)) {
+                return;  // pad fully populated by Poll
+            }
+            // Poll failure (transport returned false). Zero the pad so we
+            // don't feed stale state to the game; subsequent failures are
+            // throttled inside RaphnetTransport so we don't spam logs here.
+            pad->button = 0;
+            pad->stick_x = 0;
+            pad->stick_y = 0;
+            pad->err_no = 0;
+            pad->gyro_x = 0.0f;
+            pad->gyro_y = 0.0f;
+            pad->right_stick_x = 0;
+            pad->right_stick_y = 0;
+            return;
+        }
+        // Transport gone (manager shutdown). Fall through to the mapping
+        // path so the user gets at least keyboard/SDL controls back instead
+        // of a frozen controller.
+        mRaphnetBindingActive = false;
+        SPDLOG_WARN("[raphnet] LUS::Controller port={} transport expired; falling back to mapping pipeline",
+                    GetPortIndex());
+    }
+
     OSContPad padToBuffer = { 0 };
 
     // Button Inputs

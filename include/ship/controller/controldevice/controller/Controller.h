@@ -18,10 +18,20 @@
 
 namespace Ship {
 
+class RaphnetTransport;  // ship/controller/raphnet/RaphnetTransport.h
+
 class Controller : public ControlDevice {
   public:
     Controller(uint8_t portIndex, std::vector<CONTROLLERBUTTONS_T> bitmasks);
     ~Controller();
+
+    // Bind this controller to a raphnet adapter channel. Default: no-op.
+    // The concrete subclass (LUS::Controller) overrides to switch its
+    // ReadToPad path to native raw-SI polling. Called from
+    // Ship::ControlDeck::Init for every port the RaphnetPhysicalDevice-
+    // Manager has claimed.
+    virtual void SetRaphnetBinding(std::weak_ptr<RaphnetTransport> /*transport*/,
+                                   uint8_t /*channel*/) {}
 
     void ReloadAllMappingsFromConfig();
 
