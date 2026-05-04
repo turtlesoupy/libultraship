@@ -35,6 +35,16 @@
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
 
+/* DIAG-ONLY: pre-deref ASan check in gfx_step(). When the interpreter is
+   about to read a Gfx command from poisoned memory (typically a stale
+   segment binding resolving to a freed/past-end heap address), dump the
+   full segment table + recent segment writes + recent G_DL calls so the
+   PR #133 lead-gap can be identified before ASan halts. */
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#include <sanitizer/asan_interface.h>
+#define PORT_DIAG_HAVE_ASAN 1
+#endif
+
 extern "C" void* portRelocTryResolvePointer(uint32_t token);
 extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
 extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
@@ -387,6 +397,86 @@ static std::weak_ptr<Interpreter> mInstance;
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
+}
+
+/* ─── DIAG-ONLY: PR #133 lead-gap tracing ─────────────────────────────────
+   Ring buffers of recent segment writes and recent DL pushes. Dumped from
+   gfx_step() when ASan reports the next cmd lives in poisoned memory.
+   Remove once the leak is identified and fixed. */
+namespace {
+struct DiagSegWrite {
+    int segNum;
+    uintptr_t oldVal;
+    uintptr_t newVal;
+    const char* where;  // string literal — never freed
+    uint32_t ucode;
+    uint64_t frame;
+};
+struct DiagDLPush {
+    uintptr_t caller_w0;
+    uintptr_t caller_w1;
+    void* callee;
+    void* callee_normalized;
+    const char* where;
+    uint32_t ucode;
+    uint64_t frame;
+};
+constexpr size_t DIAG_RING = 32;
+DiagSegWrite sDiagSegWrites[DIAG_RING] = {};
+size_t sDiagSegWritesIdx = 0;
+DiagDLPush sDiagDLPushes[DIAG_RING] = {};
+size_t sDiagDLPushesIdx = 0;
+uint64_t sDiagFrame = 0;
+}  // namespace
+
+extern "C" void portDiagBumpFrame() {
+    ++sDiagFrame;
+}
+
+static inline void diagRecordSegWrite(int segNum, uintptr_t oldVal, uintptr_t newVal,
+                                      const char* where, uint32_t ucode) {
+    sDiagSegWrites[sDiagSegWritesIdx] = { segNum, oldVal, newVal, where, ucode, sDiagFrame };
+    sDiagSegWritesIdx = (sDiagSegWritesIdx + 1) % DIAG_RING;
+}
+
+static inline void diagRecordDLPush(F3DGfx* caller, F3DGfx* callee, F3DGfx* normalized,
+                                    const char* where) {
+    sDiagDLPushes[sDiagDLPushesIdx] = {
+        caller ? (uintptr_t)caller->words.w0 : 0,
+        caller ? (uintptr_t)caller->words.w1 : 0,
+        (void*)callee, (void*)normalized, where, 0, sDiagFrame
+    };
+    sDiagDLPushesIdx = (sDiagDLPushesIdx + 1) % DIAG_RING;
+}
+
+static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
+    SPDLOG_CRITICAL("==== PR#133 LEAD-GAP DIAG ({}) ====", reason);
+    SPDLOG_CRITICAL("badCmd host={} frame={}", (void*)badCmd, sDiagFrame);
+    if (auto inst = mInstance.lock()) {
+        SPDLOG_CRITICAL("-- segment table --");
+        for (int i = 0; i < MAX_SEGMENT_POINTERS; ++i) {
+            if (inst->mSegmentPointers[i] != 0) {
+                SPDLOG_CRITICAL("  seg[{:#x}] = {:#x}", i, inst->mSegmentPointers[i]);
+            }
+        }
+    }
+    SPDLOG_CRITICAL("-- recent segment writes (oldest first, {} slots) --", DIAG_RING);
+    for (size_t i = 0; i < DIAG_RING; ++i) {
+        size_t k = (sDiagSegWritesIdx + i) % DIAG_RING;
+        const auto& e = sDiagSegWrites[k];
+        if (!e.where) continue;
+        SPDLOG_CRITICAL("  [frame={}] seg[{:#x}] {:#x} -> {:#x} ({})",
+                        e.frame, e.segNum, e.oldVal, e.newVal, e.where);
+    }
+    SPDLOG_CRITICAL("-- recent DL pushes (oldest first) --");
+    for (size_t i = 0; i < DIAG_RING; ++i) {
+        size_t k = (sDiagDLPushesIdx + i) % DIAG_RING;
+        const auto& e = sDiagDLPushes[k];
+        if (!e.where) continue;
+        SPDLOG_CRITICAL("  [frame={}] caller w0={:#x} w1={:#x} callee={} norm={} ({})",
+                        e.frame, e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, e.where);
+    }
+    SPDLOG_CRITICAL("==== END DIAG ====");
 }
 
 void Interpreter::Flush() {
@@ -3103,14 +3193,19 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+            uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
+            diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+                uintptr_t _old = mSegmentPointers[segNumber];
                 mSegmentPointers[segNumber] = data;
+                diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT_INTERP", 0);
+            }
         } break;
         case G_MW_MATRIX: {
             // SSB64 (and other titles using draw types that build custom MVPs)
@@ -3187,14 +3282,19 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+            uintptr_t _old = mSegmentPointers[segNumber];
             mSegmentPointers[segNumber] = data;
+            diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+                uintptr_t _old = mSegmentPointers[segNumber];
                 mSegmentPointers[segNumber] = data;
+                diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT_INTERP", 0);
+            }
         } break;
     }
 }
@@ -4066,7 +4166,9 @@ void GfxExecStack::start(F3DGfx* dlist) {
     while (!cmd_stack.empty())
         cmd_stack.pop();
     gfx_path.clear();
-    cmd_stack.push(portNormalizeDisplayListPointer(dlist));
+    F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
+    diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
+    cmd_stack.push(normalized);
     disp_stack.clear();
 }
 
@@ -4094,13 +4196,17 @@ void GfxExecStack::branch(F3DGfx* caller) {
     F3DGfx* old = cmd_stack.top();
     cmd_stack.pop();
     cmd_stack.push(nullptr);
-    cmd_stack.push(portNormalizeDisplayListPointer(old));
+    F3DGfx* normalized = portNormalizeDisplayListPointer(old);
+    diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
+    cmd_stack.push(normalized);
 
     gfx_path.push_back(caller);
 }
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
-    cmd_stack.push(portNormalizeDisplayListPointer(callee));
+    F3DGfx* normalized = portNormalizeDisplayListPointer(callee);
+    diagRecordDLPush(caller, callee, normalized, "ExecStack::call");
+    cmd_stack.push(normalized);
     gfx_path.push_back(caller);
 }
 
@@ -5683,6 +5789,17 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
+#ifdef PORT_DIAG_HAVE_ASAN
+    /* DIAG: PR #133 lead-gap. If the cmd we're about to deref is in poisoned
+       memory (typically: stale segment binding to a freed/past-end heap
+       address), dump the segment table + recent segment writes + DL pushes
+       so we can identify which lead's coverage has the hole. Then let the
+       deref proceed — ASan will halt with its own report and the diag dump
+       will be in the log just above. */
+    if (cmd != nullptr && __asan_region_is_poisoned((void*)cmd, sizeof(*cmd)) != nullptr) {
+        diagDumpAll(cmd, "gfx_step: about to deref poisoned cmd");
+    }
+#endif
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
     if (sGbiTraceCallback) {
@@ -5801,8 +5918,15 @@ void Interpreter::SpReset() {
     // freed memory (SIGSEGV) or fall through SegAddr unresolved and produce
     // the addr=0x01... fingerprint of issue #103 / #128.
     for (int i = 0; i < MAX_SEGMENT_POINTERS; i++) {
+        uintptr_t _old = mSegmentPointers[i];
         mSegmentPointers[i] = 0;
+        if (_old != 0) {
+            diagRecordSegWrite(i, _old, 0, "SpReset", 0);
+        }
     }
+    /* DIAG: bump frame counter so log entries line up with frames. SpReset is
+       called at the start of every Run/RunGuiOnly invocation. */
+    portDiagBumpFrame();
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
