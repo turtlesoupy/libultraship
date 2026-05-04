@@ -550,22 +550,25 @@ int RaphnetTransport::Exchange(const uint8_t* tx, size_t txLen, uint8_t* rx, siz
     SPDLOG_TRACE("[raphnet] TX {} bytes (cmd='{}')", sent, HexBytes(tx, copyLen));
 
     // Receive: hid_get_feature_report is BLOCKING/synchronous on every backend;
-    // hid_set_nonblocking only affects hid_read. The device replies in <1 ms
-    // in the common case. timeoutMs is informational — it bounds the retry
-    // window for backends that return 0 on no-data, but at the OS level the
-    // call may block longer if the device is wedged. A wedged adapter is rare;
-    // log loudly so testers' reports are obvious.
+    // hid_set_nonblocking only affects hid_read. The device usually replies in
+    // <1 ms, but commands like GET_VERSION can take longer than the round-trip
+    // — the firmware needs a moment to populate the response feature report.
+    // Until it does, hidapi reports a "no payload" read: on Windows the
+    // backend adds 1 to the byte count for the report-id, so an empty response
+    // surfaces as got == 1, while Linux/macOS surface it as got == 0. Either
+    // way the payload length (got - 1) is 0 and we must retry until the device
+    // produces real data or the deadline expires. This matches raphnet's
+    // gcn64tools rnt_exchange (rntlib/raphnetadapter.c), which polls
+    // HidD_GetFeature in a loop until res_len > 0. timeoutMs bounds the wait;
+    // a wedged adapter is rare so log loudly when the deadline trips.
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     int retryCount = 0;
     while (true) {
         std::vector<uint8_t> recvBuf(mReportSize + 1, 0);
         recvBuf[0] = 0x00;  // Windows requires the report id to be set on input.
         int got = hid_get_feature_report(mDevice, recvBuf.data(), recvBuf.size());
-        if (got > 0) {
+        if (got > 1) {
             int payloadLen = got - 1;
-            if (payloadLen < 0) {
-                payloadLen = 0;
-            }
             size_t copyOut = std::min(static_cast<size_t>(payloadLen), rxMax);
             std::memcpy(rx, recvBuf.data() + 1, copyOut);
             SPDLOG_TRACE("[raphnet] RX {} bytes (payload='{}')", got, HexBytes(rx, copyOut));
@@ -581,12 +584,14 @@ int RaphnetTransport::Exchange(const uint8_t* tx, size_t txLen, uint8_t* rx, siz
                          HexBytes(tx, copyLen));
             return -1;
         }
-        // got == 0: backend returned no data; sleep briefly and retry until deadline.
+        // got == 0 (Linux/macOS) or got == 1 (Windows hidapi report-id+1
+        // accounting): device hasn't produced a response yet. Sleep briefly
+        // and retry until deadline.
         ++retryCount;
         if (std::chrono::steady_clock::now() >= deadline) {
             SPDLOG_WARN("[raphnet] hid_get_feature_report timed out after {} ms "
-                        "(retry_count={}, cmd='{}', buffer_size={})",
-                        timeoutMs, retryCount, HexBytes(tx, copyLen), recvBuf.size());
+                        "(retry_count={}, last_got={}, cmd='{}', buffer_size={})",
+                        timeoutMs, retryCount, got, HexBytes(tx, copyLen), recvBuf.size());
             return 0;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
