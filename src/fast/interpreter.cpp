@@ -297,6 +297,30 @@ extern "C" void portResetPackedDisplayListCache(void) {
     sPortPackedDisplayListCache.clear();
 }
 
+// Evict cached widened display lists whose source heap address falls in a
+// range that's about to be overwritten by a fresh reloc-file load.  Same
+// pattern as Interpreter::TextureCacheDeleteRange / portTextureCacheDeleteRange,
+// applied to the packed-DL widening cache.  Without this, bump-reset heaps
+// (stage-select wallpaper rewinds, classic-mode round transitions reusing the
+// extern heap, CSS hover reloads) hit a stale cached widening that points at
+// the prior file's bytes via cached fileBase/fileSize — manifests as G_VTX
+// unresolved-segment skips and Unhandled OP-code bursts (issue #103/#128).
+extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t hi = lo + size;
+    for (auto it = sPortPackedDisplayListCache.begin(); it != sPortPackedDisplayListCache.end(); ) {
+        const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(it->first);
+        if (srcAddr >= lo && srcAddr < hi) {
+            it = sPortPackedDisplayListCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
@@ -5767,6 +5791,18 @@ void Interpreter::SpReset() {
     mRsp->lookat[1].dir[2] = 0;
     CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
     CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+    // Clear the SP segment table at the start of each frame.  On real N64,
+    // each RSP task loads fresh ucode and starts with no segments mapped;
+    // games re-bind segments via gSPSegment within the frame's display list.
+    // Without this clear, a segment written in frame N (e.g. lbtransition's
+    // gSPSegment(0x1, ...) for VS-results photocopy) survives into frame N+1
+    // pointing at heap memory the game has already freed.  Subsequent G_VTX
+    // commands that resolve through that stale segment then either deref
+    // freed memory (SIGSEGV) or fall through SegAddr unresolved and produce
+    // the addr=0x01... fingerprint of issue #103 / #128.
+    for (int i = 0; i < MAX_SEGMENT_POINTERS; i++) {
+        mSegmentPointers[i] = 0;
+    }
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
