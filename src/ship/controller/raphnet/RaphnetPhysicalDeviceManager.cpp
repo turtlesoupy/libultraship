@@ -93,7 +93,14 @@ bool RaphnetPhysicalDeviceManager::Init() {
 
     if (adapters.empty()) {
         SPDLOG_INFO("[raphnet] no adapters found; SDL HID joystick path will handle any plain joysticks");
-        mInitialized = true;
+        // hidapi opens a libudev udev_monitor on hid_init() and keeps it alive
+        // for the process lifetime. When no Raphnet adapter is present (the
+        // common case) we don't need it — and leaving it alongside SDL's own
+        // udev monitor doubles the chance of a slow sysfs read blocking the
+        // main thread (issue #137 random hangs). Release it here.
+        SPDLOG_INFO("[raphnet] hid_exit() — no Raphnet hardware, releasing hidapi udev monitor");
+        hid_exit();
+        mInitialized = false;
         return true;
     }
 

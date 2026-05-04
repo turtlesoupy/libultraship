@@ -48,6 +48,19 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
 
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+    // Disable SDL's HIDAPI joystick backend on Linux. The HIDAPI backend
+    // performs synchronous udev sysattr reads from SDL_PumpEvents on the main
+    // thread; if a USB device is in a weird transient state, those reads block
+    // for the kernel sysfs timeout (~3-5s) — exactly the watchdog signature in
+    // issue #137. Falling back to SDL's evdev backend uses inotify on
+    // /dev/input/ for hotplug, which doesn't block. SDL_HINT_JOYSTICK_THREAD
+    // alone doesn't cover this because the udev hotplug monitor still runs
+    // from PumpEvents on the main thread regardless.
+    //
+    // Cost: lose HIDAPI-specific PS4/PS5 features (rumble metadata over USB).
+    // SSB64 doesn't use any of those. Standard gamepads (Xbox / DualShock /
+    // 8BitDo / etc.) all enumerate fine through evdev.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         SPDLOG_ERROR("Failed to initialize SDL game controllers ({})", SDL_GetError());
         exit(EXIT_FAILURE);
