@@ -9,9 +9,52 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+extern "C" {
+#include <hidsdi.h>
+#include <hidpi.h>
+}
+#pragma comment(lib, "hid.lib")
+#endif
+
 namespace Ship {
 
 namespace {
+
+#if defined(_WIN32)
+// Ask Windows what feature-report buffer size the HID stack expects for this
+// device. hidapi 0.14.0's hid_send_feature_report auto-pads up to caps.-
+// FeatureReportByteLength (windows/hid.c:1189-1204) but hid_get_feature_report
+// passes our length straight to DeviceIoControl(IOCTL_HID_GET_FEATURE) — so a
+// caller-supplied buffer that's even one byte off from caps fails the read
+// with ERROR_INVALID_PARAMETER (0x57) while the matching send silently
+// works. raphnet's gc_n64_usb-v3.6.1 firmware declares REPORT_COUNT 63 with
+// no Report ID, which Windows reports as caps=64 in the common case, but
+// driver/OS-version interactions can produce other values (or transiently
+// fail until the HID handle settles). Querying caps directly here removes
+// that whole class of off-by-one. Returns 0 on any failure; caller falls
+// back to auto-negotiation.
+int QueryWindowsCapsBufferSize(const std::string& hidPath) {
+    HANDLE h = CreateFileA(hidPath.c_str(), 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    int size = 0;
+    PHIDP_PREPARSED_DATA preparsed = nullptr;
+    if (HidD_GetPreparsedData(h, &preparsed) && preparsed != nullptr) {
+        HIDP_CAPS caps = {};
+        if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
+            size = static_cast<int>(caps.FeatureReportByteLength);
+        }
+        HidD_FreePreparsedData(preparsed);
+    }
+    CloseHandle(h);
+    return size;
+}
+#endif
 
 // Format `len` bytes of buf as "AA BB CC DD …" for log messages. Caps at 32
 // bytes to keep log lines bounded; longer payloads get a trailing ellipsis.
@@ -105,19 +148,55 @@ bool RaphnetTransport::Open(const std::string& hidPath, uint16_t vid, uint16_t p
         return false;
     }
 
-    // Boot sequence — auto-negotiate report size while clearing any prior
-    // wedged state, query version, then take exclusive control of the SI bus.
+#if defined(_WIN32)
+    // Brief settle delay after hid_open_path. Without this, the very first
+    // DeviceIoControl on the freshly-opened HID handle has been observed to
+    // return ERROR_INVALID_PARAMETER intermittently on real raphnet v3.6.1
+    // hardware (user reports vid=0x289b pid=0x0061, "N64 to USB v3.6"); the
+    // same handle works on retry milliseconds later. 50 ms is invisible to
+    // the user but covers the Windows HID stack's post-open initialization.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+#endif
 
-    // 1. Report-size auto-negotiation + defensive resume, in one step.
-    //    The protocol has no version handshake; v3 firmware accepts 63-byte
-    //    feature reports and pre-v3 (legacy) accepts 32. Send SUSPEND_-
-    //    POLLING(0) (which we want to issue anyway, to clear wedged state
-    //    from a prior crashed run) at each candidate size and keep the
-    //    first one whose response echoes the opcode. On Windows, hid_send_-
-    //    feature_report at the wrong size returns -1 immediately; on Linux/
-    //    macOS the send always succeeds but the firmware will not produce
-    //    a well-formed reply. Either way we detect the mismatch.
+    // 1. Determine the feature-report buffer size for this device.
+    //    On Windows the HID stack reports it authoritatively via HidP_GetCaps;
+    //    we query directly so reads use the exact size the OS expects (any
+    //    mismatch fails hid_get_feature_report with ERROR_INVALID_PARAMETER).
+    //    On Linux/macOS hidapi's hidraw/IOKit backends are size-tolerant, so
+    //    we keep the SUSPEND_POLLING(0) opcode-echo probe to discover the
+    //    firmware's accepted size when caps aren't directly queryable. As a
+    //    side effect either path also clears any prior wedged state from a
+    //    previous run that crashed before SUSPEND_POLLING(0).
+    bool sized = false;
+#if defined(_WIN32)
     {
+        int caps_size = QueryWindowsCapsBufferSize(hidPath);
+        if (caps_size > 1) {
+            // caps reports total report length including the 1-byte report id.
+            mReportSize = caps_size - 1;
+            SPDLOG_INFO("[raphnet] Windows HidP_GetCaps: FeatureReportByteLength={} "
+                        "(setting mReportSize={}, skipping auto-negotiation)",
+                        caps_size, mReportSize);
+            // Defensive SUSPEND_POLLING(0) at the queried size to clear any
+            // wedged state. We don't gate Open() on its reply — the device
+            // may legitimately not respond if it was already in a clean state
+            // and Windows handed us a stale handle that the stack will refresh
+            // on the next request.
+            uint8_t cmd[2] = { gRntRqSuspendPolling, 0 };
+            uint8_t rep[8] = {};
+            (void)Exchange(cmd, sizeof(cmd), rep, sizeof(rep), 1000);
+            sized = true;
+        } else {
+            SPDLOG_WARN("[raphnet] HidP_GetCaps returned {} for path '{}' — falling back to "
+                        "auto-negotiation",
+                        caps_size, hidPath);
+        }
+    }
+#endif
+    if (!sized) {
+        // Fallback (and the non-Windows path): auto-negotiate by probing
+        // SUSPEND_POLLING(0) at each candidate size and keep the first that
+        // echoes the opcode.
         constexpr int kCandidates[] = { gRntDefaultReportSize, gRntLegacyReportSize };
         bool negotiated = false;
         int lastN = 0;
