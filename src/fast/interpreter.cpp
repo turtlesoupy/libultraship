@@ -402,7 +402,9 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
 /* ─── DIAG-ONLY: PR #133 lead-gap tracing ─────────────────────────────────
    Ring buffers of recent segment writes and recent DL pushes. Dumped from
    gfx_step() when ASan reports the next cmd lives in poisoned memory.
-   Remove once the leak is identified and fixed. */
+   Entirely gated on PORT_DIAG_HAVE_ASAN — non-ASan release builds compile
+   to zero bytes here and at every call site. */
+#ifdef PORT_DIAG_HAVE_ASAN
 namespace {
 struct DiagSegWrite {
     int segNum;
@@ -478,6 +480,7 @@ static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
     }
     SPDLOG_CRITICAL("==== END DIAG ====");
 }
+#endif  // PORT_DIAG_HAVE_ASAN
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
@@ -3193,18 +3196,26 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef PORT_DIAG_HAVE_ASAN
             uintptr_t _old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
             if (segIndex == mInterpolationIndex) {
+#ifdef PORT_DIAG_HAVE_ASAN
                 uintptr_t _old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT_INTERP", 0);
+#endif
             }
         } break;
         case G_MW_MATRIX: {
@@ -3282,18 +3293,26 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef PORT_DIAG_HAVE_ASAN
             uintptr_t _old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
             if (segIndex == mInterpolationIndex) {
+#ifdef PORT_DIAG_HAVE_ASAN
                 uintptr_t _old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT_INTERP", 0);
+#endif
             }
         } break;
     }
@@ -4167,7 +4186,9 @@ void GfxExecStack::start(F3DGfx* dlist) {
         cmd_stack.pop();
     gfx_path.clear();
     F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
+#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
+#endif
     cmd_stack.push(normalized);
     disp_stack.clear();
 }
@@ -4197,7 +4218,9 @@ void GfxExecStack::branch(F3DGfx* caller) {
     cmd_stack.pop();
     cmd_stack.push(nullptr);
     F3DGfx* normalized = portNormalizeDisplayListPointer(old);
+#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
+#endif
     cmd_stack.push(normalized);
 
     gfx_path.push_back(caller);
@@ -4205,7 +4228,9 @@ void GfxExecStack::branch(F3DGfx* caller) {
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
     F3DGfx* normalized = portNormalizeDisplayListPointer(callee);
+#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(caller, callee, normalized, "ExecStack::call");
+#endif
     cmd_stack.push(normalized);
     gfx_path.push_back(caller);
 }
@@ -5918,15 +5943,21 @@ void Interpreter::SpReset() {
     // freed memory (SIGSEGV) or fall through SegAddr unresolved and produce
     // the addr=0x01... fingerprint of issue #103 / #128.
     for (int i = 0; i < MAX_SEGMENT_POINTERS; i++) {
+#ifdef PORT_DIAG_HAVE_ASAN
         uintptr_t _old = mSegmentPointers[i];
+#endif
         mSegmentPointers[i] = 0;
+#ifdef PORT_DIAG_HAVE_ASAN
         if (_old != 0) {
             diagRecordSegWrite(i, _old, 0, "SpReset", 0);
         }
+#endif
     }
+#ifdef PORT_DIAG_HAVE_ASAN
     /* DIAG: bump frame counter so log entries line up with frames. SpReset is
        called at the start of every Run/RunGuiOnly invocation. */
     portDiagBumpFrame();
+#endif
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
