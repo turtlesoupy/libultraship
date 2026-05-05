@@ -39,10 +39,23 @@
    about to read a Gfx command from poisoned memory (typically a stale
    segment binding resolving to a freed/past-end heap address), dump the
    full segment table + recent segment writes + recent G_DL calls so the
-   PR #133 lead-gap can be identified before ASan halts. */
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
-#include <sanitizer/asan_interface.h>
+   PR #133 lead-gap can be identified before ASan halts.
+
+   Nested #if rather than a single `defined(__has_feature) && __has_feature(...)`
+   because MSVC's preprocessor doesn't reliably short-circuit on unknown
+   identifiers — it tries to parse __has_feature(address_sanitizer) even
+   when defined(__has_feature) is false, producing C1012. GCC defines
+   __SANITIZE_ADDRESS__ when -fsanitize=address; clang has __has_feature;
+   MSVC defines __SANITIZE_ADDRESS__ for /fsanitize=address. */
+#if defined(__SANITIZE_ADDRESS__)
 #define PORT_DIAG_HAVE_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define PORT_DIAG_HAVE_ASAN 1
+#  endif
+#endif
+#ifdef PORT_DIAG_HAVE_ASAN
+#include <sanitizer/asan_interface.h>
 #endif
 
 extern "C" void* portRelocTryResolvePointer(uint32_t token);
