@@ -769,6 +769,37 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
         }
 
+        // Metal does not zero-initialize newly allocated textures (unlike OpenGL).
+        // Subsequent passes use LoadActionLoad and the game's draws are clipped to
+        // its native viewport via scissor; pixels outside that scissor on the
+        // upscaled host target are never written. With MSAA enabled, the resolve
+        // propagates the unwritten MSAA samples into the resolve target every
+        // frame, so a fresh msaaTexture's uninitialized contents become a visible
+        // edge band around the rendered image. Clear all newly allocated render
+        // targets to opaque black up front so unscissored regions read predictably.
+        auto initRenderTargetToBlack = [this](MTL::Texture* texture) {
+            if (texture == nullptr) {
+                return;
+            }
+            if ((texture->usage() & MTL::TextureUsageRenderTarget) == 0) {
+                return;
+            }
+            MTL::RenderPassDescriptor* clear_pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            clear_pass->colorAttachments()->object(0)->setTexture(texture);
+            clear_pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+            clear_pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+            clear_pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+            MTL::CommandBuffer* clear_cb = mCommandQueue->commandBuffer();
+            clear_cb->setLabel(NS::String::string("Clear new RT to black", NS::UTF8StringEncoding));
+            MTL::RenderCommandEncoder* clear_enc = clear_cb->renderCommandEncoder(clear_pass);
+            clear_enc->endEncoding();
+            clear_cb->commit();
+        };
+        initRenderTargetToBlack(tex.texture);
+        if (msaa_level > 1) {
+            initRenderTargetToBlack(tex.msaaTexture);
+        }
+
         if (render_target) {
             MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
 
