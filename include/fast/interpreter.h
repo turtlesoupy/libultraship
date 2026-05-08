@@ -401,6 +401,29 @@ class Interpreter {
     void RegisterBlendedTexture(const char* name, uint8_t* mask, uint8_t* replacement);
     void UnregisterBlendedTexture(const char* name);
 
+    // Register a CPU address range as a mirror of a GPU framebuffer's sub-rect.
+    // When ImportTexture sees a gsDPSetTextureImage(cpuAddr) where cpuAddr falls
+    // inside [base, base+sizeBytes), it binds the registered FB via
+    // SelectTextureFb AND remaps the consumer's local UV (0..1) to the FB
+    // sub-rect [u0,u1] x [v0,v1] -- so a multi-tile sprite that samples its
+    // own 300x6 row-stripe at UV (0..1) ends up sampling a 300x6 slice of the
+    // bigger captured FB instead of the whole thing.
+    //
+    // u0/v0/u1/v1 are normalized [0,1] coordinates of the source FB.
+    // For a 1:1 substitution (single quad covering the whole FB) pass
+    // (0, 0, 1, 1).
+    //
+    // Used by the SSB64 framebuffer-capture trick (1P stage clear wallpaper
+    // = ~37 row-stripes, each registered with its slice of the photo region;
+    // lbtransition photo wipe -> VS results screen = single-tile photo heap).
+    // The UV-remap plumbing in GfxSpTri1 makes this work for any N64 game
+    // that samples a captured framebuffer via N>=1 tile loads (i.e. all of
+    // them, since N64 TMEM is 4 KB and any FB-sized region must be tiled).
+    void RegisterFbTexture(const void* base, size_t sizeBytes, int fbId,
+                           float u0, float v0, float u1, float v1);
+    void UnregisterFbTexture(const void* base);
+    void ClearFbTextures();
+
     void SetNativeDimensions(float width, float height);
     void SetResolutionMultiplier(float multiplier);
     void SetMsaaLevel(uint32_t level);
@@ -537,6 +560,27 @@ class Interpreter {
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
+    // base addr -> (end addr exclusive, GPU FB id, source-FB UV sub-rect).
+    // Ordered so range lookup can do an upper_bound + step-back walk.
+    // See RegisterFbTexture.
+    struct FbTextureRange {
+        uintptr_t end;
+        int fbId;
+        float u0, v0, u1, v1;
+    };
+    std::map<uintptr_t, FbTextureRange> mFbTextures;
+
+    // Per-tile-slot UV transform applied in GfxSpTri1 to remap a tile's local
+    // UV (0..1) into the registered FB's sub-rect [u0,u1] x [v0,v1].
+    // Identity (scale=1, offset=0) when the bound texture isn't an FB mirror,
+    // which is the common case. Set by ImportTexture's FB-mirror hook on hit
+    // and reset to identity on every miss so a previous hit's transform never
+    // leaks into a fresh non-FB binding.
+    struct FbUvTransform {
+        float scaleU, scaleV;
+        float offsetU, offsetV;
+    };
+    FbUvTransform mFbUvTransform[2] = { { 1.0f, 1.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f, 0.0f } };
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?

@@ -1926,6 +1926,75 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         texFlags = mRdp->loaded_texture[otherTmem].tex_flags;
     }
 
+    // FB-texture passthrough: if the caller has registered a range that
+    // contains this CPU address as a mirror of a GPU framebuffer
+    // (port_capture_register_fb_for_subrect), bypass the CPU decode/upload
+    // path and bind the FB directly via SelectTextureFb. Also stash the
+    // registration's source-FB UV sub-rect into mFbUvTransform[i] so
+    // GfxSpTri1 can remap the consumer's local UV (0..1) to the right
+    // slice of the bigger FB -- without this, a multi-tile sprite (TMEM is
+    // 4 KB, FB-sized region must be tiled) would render every tile sampling
+    // the WHOLE FB.
+    //
+    // On a miss, reset the transform to identity so a previous hit's
+    // sub-rect doesn't leak into a fresh non-FB binding on this tile slot.
+    //
+    // Skipped for replacement uploads -- those go through the masked-texture path.
+    if (i >= 0 && i < 2) {
+        mFbUvTransform[i] = FbUvTransform{ 1.0f, 1.0f, 0.0f, 0.0f };
+    }
+    if (!importReplacement && !mFbTextures.empty()) {
+        uintptr_t a = reinterpret_cast<uintptr_t>(origAddr);
+        auto it = mFbTextures.upper_bound(a); // first base > a
+        if (it != mFbTextures.begin()) {
+            --it; // last base <= a
+            if (a < it->second.end) {
+                Flush();
+                mRapi->SelectTextureFb(it->second.fbId);
+                if (i >= 0 && i < 2) {
+                    const FbTextureRange& r = it->second;
+
+                    /* Per-call UV slice: one registration can cover an entire
+                     * tiled image (N64 TMEM is 4 KB so any FB-sized texture
+                     * is sampled as N stripes via N gsDPSetTextureImage +
+                     * LoadBlock cycles, each with its own offset). The hook
+                     * uses the stride and load-size that the prior LoadBlock
+                     * already stashed into loaded_texture to figure out which
+                     * vertical slice of the registered FB sub-rect this call
+                     * represents.
+                     *
+                     * For the trivial single-tile case (one big SetTextureImage
+                     * at base, one LoadBlock that covers the whole range) the
+                     * math degenerates to the registered (u0,v0,u1,v1) verbatim. */
+                    uint32_t lineBytes = mRdp->loaded_texture[tmemIdex].line_size_bytes;
+                    uint32_t loadBytes = mRdp->loaded_texture[tmemIdex].size_bytes;
+                    uintptr_t totalBytes = r.end - it->first;
+                    float v0Slice = r.v0;
+                    float v1Slice = r.v1;
+                    if (lineBytes > 0 && loadBytes >= lineBytes && totalBytes >= lineBytes) {
+                        uintptr_t totalRows = totalBytes / lineBytes;
+                        uintptr_t offBytes = a - it->first;
+                        uintptr_t offRows = offBytes / lineBytes;
+                        uintptr_t loadRows = loadBytes / lineBytes;
+                        if (totalRows > 0 && offRows + loadRows <= totalRows) {
+                            float vRange = r.v1 - r.v0;
+                            float invTotal = 1.0f / (float)totalRows;
+                            v0Slice = r.v0 + (float)offRows * invTotal * vRange;
+                            v1Slice = r.v0 + (float)(offRows + loadRows) * invTotal * vRange;
+                        }
+                    }
+
+                    mFbUvTransform[i] = FbUvTransform{
+                        r.u1 - r.u0, v1Slice - v0Slice,
+                        r.u0,        v0Slice
+                    };
+                }
+                mRdp->textures_changed[i] = false;
+                return;
+            }
+        }
+    }
+
     // Use palette_dram_addr (the original DRAM source) instead of palettes[]
     // (which always points to the staging buffer) so the same texture drawn
     // with different palettes gets distinct cache entries.
@@ -2928,18 +2997,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            // Apply the FB-mirror UV transform (identity unless the bound
+            // texture is a registered sub-rect of a snapshot FB). This remaps
+            // a tile's local UV (0..1) into the FB sub-rect [u0,u1] x [v0,v1]
+            // so a multi-tile sprite samples its slice of the captured frame
+            // instead of the whole thing.
+            const FbUvTransform& xf = mFbUvTransform[t];
+            float normU = u / tex_width[t];
+            float normV = v / tex_height[t];
+            mBufVbo[mBufVboLen++] = normU * xf.scaleU + xf.offsetU;
+            mBufVbo[mBufVboLen++] = normV * xf.scaleV + xf.offsetV;
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
 
             if (clampS) {
-                mBufVbo[mBufVboLen++] = (tex_width2[t] - 0.5f) / tex_width[t];
+                float clampNormU = (tex_width2[t] - 0.5f) / tex_width[t];
+                mBufVbo[mBufVboLen++] = clampNormU * xf.scaleU + xf.offsetU;
             }
 
             if (clampT) {
-                mBufVbo[mBufVboLen++] = (tex_height2[t] - 0.5f) / tex_height[t];
+                float clampNormV = (tex_height2[t] - 0.5f) / tex_height[t];
+                mBufVbo[mBufVboLen++] = clampNormV * xf.scaleV + xf.offsetV;
             }
         }
 
@@ -6444,6 +6523,23 @@ void Interpreter::UnregisterBlendedTexture(const char* name) {
     }
 
     mMaskedTextures.erase(name);
+}
+
+void Interpreter::RegisterFbTexture(const void* base, size_t sizeBytes, int fbId,
+                                    float u0, float v0, float u1, float v1) {
+    if (base == nullptr || sizeBytes == 0) {
+        return;
+    }
+    uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    mFbTextures[b] = FbTextureRange{ b + sizeBytes, fbId, u0, v0, u1, v1 };
+}
+
+void Interpreter::UnregisterFbTexture(const void* base) {
+    mFbTextures.erase(reinterpret_cast<uintptr_t>(base));
+}
+
+void Interpreter::ClearFbTextures() {
+    mFbTextures.clear();
 }
 
 // New getters and setters

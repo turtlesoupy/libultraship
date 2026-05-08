@@ -1085,6 +1085,42 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     int target_texture_id = mFramebuffers[fb_dst_id].mTextureId;
     MTL::Texture* target_texture = mTextures[target_texture_id].texture;
 
+    // Standalone path: when called between frames (e.g. SSB64 framebuffer-
+    // capture bridge from a game-thread task FuncStart), the source FB has
+    // no live mCommandBuffer/mCommandEncoder -- EndFrame nulls them. Fall
+    // back to a fresh, self-contained command buffer + blit encoder, modeled
+    // after ReadFramebufferToCPU below. The blit reads the prior frame's
+    // committed pixels (command queues are FIFO so this runs after any
+    // pending render commands targeting the source FB).
+    if (source_framebuffer.mCommandBuffer == nullptr) {
+        NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+
+        MTL::CommandBuffer* cb = mCommandQueue->commandBuffer();
+        cb->setLabel(NS::String::string("Standalone Copy Framebuffer Command Buffer", NS::UTF8StringEncoding));
+
+        MTL::BlitCommandEncoder* blit_encoder = cb->blitCommandEncoder();
+        blit_encoder->setLabel(
+            NS::String::string("Standalone Copy Framebuffer Encoder", NS::UTF8StringEncoding));
+
+        MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
+        MTL::Origin target_origin = MTL::Origin(dstX0, dstY0, 0);
+        MTL::Size source_size = MTL::Size(srcX1 - srcX0, srcY1 - srcY0, 1);
+
+        blit_encoder->copyFromTexture(source_texture, 0, 0, source_origin, source_size, target_texture, 0, 0,
+                                      target_origin);
+        blit_encoder->endEncoding();
+
+        cb->commit();
+        // Wait so the destination texture is ready to be sampled by any draw
+        // submitted in the same frame as the eventual SelectTextureFb call.
+        // The standalone path is rare (only at scene-transition boundaries
+        // like 1P stage clear or VS results) and the blit itself is cheap.
+        cb->waitUntilCompleted();
+
+        autorelease_pool->release();
+        return;
+    }
+
     // End the current render encoder
     source_framebuffer.mCommandEncoder->endEncoding();
 
