@@ -110,3 +110,41 @@ index a1e29e849bc8..ee64116ff0cf 100644
 +
 +// handle https://github.com/ocornut/imgui/issues/1641 the old way
 +#define ImTextureID void*
+
+From a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 Mon Sep 17 00:00:00 2001
+From: SSB64 Port <noreply@example.com>
+Date: Fri, 8 May 2026 18:00:00 -0400
+Subject: [PATCH 4/4] Metal: always clear floating viewport drawable
+
+Metal's CAMetalLayer nextDrawable returns a swap-chain texture whose
+contents are undefined. ImGui's NoRendererClear viewport flag was
+designed for backends with persistent swap-chain contents (OpenGL,
+D3D11) and skips the clear when the viewport's window has an opaque
+background. On Metal that optimization leaves whatever was in the
+IOSurface (recycled content from other windows or random GPU memory)
+visible in any region the viewport's contents do not cover. Tooltips
+set NoRendererClear and sit inside an NSWindow slightly larger than
+their drawn area, so this manifests as a band of noise/magenta around
+tooltip text.
+
+Always set MTLLoadActionClear with the existing transparent black
+clearColor; the host NSWindow opacity already governs whether the
+clear is visible behind the ImGui content.
+---
+ backends/imgui_impl_metal.mm | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/backends/imgui_impl_metal.mm b/backends/imgui_impl_metal.mm
+index 388c4f3984e1..388c4f3984e2 100644
+--- a/backends/imgui_impl_metal.mm
++++ b/backends/imgui_impl_metal.mm
+@@ -493,8 +493,7 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
+     MTLRenderPassDescriptor* renderPassDescriptor = data->RenderPassDescriptor;
+     renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
+     renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+-    if ((viewport->Flags & ImGuiViewportFlags_NoRendererClear) == 0)
+-        renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
++    renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
+
+     id <MTLCommandBuffer> commandBuffer = [data->CommandQueue commandBuffer];
+     id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
