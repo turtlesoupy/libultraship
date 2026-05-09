@@ -12,6 +12,9 @@
 #include "ship/debug/CrashHandler.h"
 #include "ship/window/FileDropMgr.h"
 #include "ship/events/EventSystem.h"
+#ifndef DISABLE_SCRIPTING
+#include "ship/scripting/ScriptLoader.h"
+#endif
 
 #ifdef _WIN32
 #include <libloaderapi.h>
@@ -36,6 +39,13 @@ std::shared_ptr<Context> Context::GetInstance() {
 Context::~Context() {
     SPDLOG_TRACE("destruct context");
     GetWindow()->SaveWindowToConfig();
+
+#ifndef DISABLE_SCRIPTING
+    if (mScriptLoader) {
+        mScriptLoader->UnloadAll();
+    }
+    mScriptLoader = nullptr;
+#endif
 
     // Explicitly destructing everything so that logging is done last.
     mAudio = nullptr;
@@ -355,6 +365,29 @@ bool Context::InitEventSystem() {
     }
     return true;
 }
+
+#ifndef DISABLE_SCRIPTING
+bool Context::InitScriptLoader(std::unordered_map<std::string, std::string> compileDefines, int codeVersion,
+                               std::string buildOptions, std::vector<std::string> includePaths,
+                               std::vector<std::string> libraryPaths, std::vector<std::string> libraries) {
+    if (GetScriptLoader() != nullptr) {
+        return true;
+    }
+
+    mScriptLoader = std::make_shared<ScriptLoader>(compileDefines, codeVersion, buildOptions, includePaths,
+                                                   libraryPaths, libraries);
+
+    if (GetScriptLoader() == nullptr) {
+        SPDLOG_ERROR("Failed to initialize script loader");
+        return false;
+    }
+    return true;
+}
+
+std::shared_ptr<ScriptLoader> Context::GetScriptLoader() const {
+    return mScriptLoader;
+}
+#endif
 
 std::shared_ptr<ConsoleVariable> Context::GetConsoleVariables() {
     return mConsoleVariables;

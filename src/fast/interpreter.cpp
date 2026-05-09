@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 #include <math.h>
@@ -278,6 +280,34 @@ size_t portGetDisplayListStride(uintptr_t segmentBase) {
     }
 
     return sizeof(Fast::F3DGfx);
+}
+
+// Returns true if `ptr` lies inside the address range of any PE/ELF
+// module the OS has loaded into the current process. Used by the
+// SETTIMG and G_VTX guards to distinguish "low-VA but valid mod-DLL
+// .rodata" from "low-VA garbage that decoded back from SegAddr".
+//
+// TCC's PE backend produces DLLs that load at low preferred bases
+// (well under 4 GB), so static texture / Vtx data inside a TCC mod
+// has the same numeric range as N64 segment-token leftovers. The
+// numeric-threshold guards alone can't tell them apart; an OS module
+// lookup can.
+bool gfxPointerInLoadedModule(const void* ptr) {
+    if (ptr == nullptr) {
+        return false;
+    }
+#ifdef _WIN32
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(ptr), &mod) == 0) {
+        return false;
+    }
+    return mod != nullptr;
+#else
+    Dl_info info = {};
+    return dladdr(const_cast<void*>(ptr), &info) != 0 && info.dli_fbase != nullptr;
+#endif
 }
 
 bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
@@ -4968,13 +4998,28 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
 }
 
 // If SegAddr fell through every resolution path, w1 came back unchanged as a
-// raw value. Sub-segment-range values (<= 0x0FFFFFFF) cannot be valid host
-// pointers; dereferencing them in GfxSpVertex SIGSEGVs at fault_addr =
-// resolved_w1. Skip the load and log so the upstream state corruption that
-// seeded the bad pointer remains traceable. Mirrors the SETTIMG guard added
-// in upstream LUS PR #1042.
+// raw value. Low-VA values cannot normally be valid host pointers;
+// dereferencing them in GfxSpVertex SIGSEGVs at fault_addr = resolved_w1.
+// Skip the load and log so the upstream state corruption that seeded the
+// bad pointer remains traceable. Mirrors the SETTIMG guard logic.
+//
+// Exception: if the address lies inside a loaded PE/ELF module, it's a
+// real `.rodata` Vtx array from a TCC mod whose DLL got loaded at a low
+// preferred base. Those are valid and must NOT be rejected — accepting
+// them lets mods place Vtx tables in static storage instead of having to
+// malloc + memcpy a heap copy at every init.
 static inline bool gfx_vtx_addr_is_unresolved(const void* addr) {
-    return (uintptr_t)addr <= 0x0FFFFFFFu;
+    uintptr_t i = (uintptr_t)addr;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    if (i == 0 || i >= 0x100000000ull) {
+        return false;
+    }
+#else
+    if (i > 0x0FFFFFFFu) {
+        return false;
+    }
+#endif
+    return !gfxPointerInLoadedModule(addr);
 }
 
 // Almost all versions of the microcode have their own version of this opcode
@@ -5521,7 +5566,12 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     // invalid memory. Don't widen the cap to 4 GB on 64-bit hosts — non-PIE
     // Linux binaries hand out valid brk-arena pointers below 4 GB, and a
     // wider guard drops legitimate texture-set commands.
-    if (i <= 0x0FFFFFFF) {
+    //
+    // Exception: if the address lies inside a loaded PE/ELF module, it's a
+    // real `.rodata` texture from a TCC mod whose DLL got loaded at a low
+    // preferred base. Accepting those lets mods use static texture data
+    // without a heap-copy workaround.
+    if (i <= 0x0FFFFFFF && !gfxPointerInLoadedModule(reinterpret_cast<const void*>(i))) {
         return false;
     }
 

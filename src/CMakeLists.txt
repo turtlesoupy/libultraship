@@ -129,6 +129,14 @@ if (LUS_ENABLE_POSTPROCESS_TRANSPILER)
     target_compile_definitions(libultraship PRIVATE LUS_POSTPROCESS_TRANSPILER)
 endif()
 
+# TCC source-compiled mod scripting. libtcc/libtcc1 are vendored by
+# cmake/dependencies/common.cmake; DISABLE_SCRIPTING compiles the loader out.
+if(NOT DISABLE_SCRIPTING)
+    target_link_libraries(libultraship PUBLIC libtcc libtcc1)
+else()
+    target_compile_definitions(libultraship PUBLIC DISABLE_SCRIPTING)
+endif()
+
 #=================== Compile Options & Defs ===================
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})

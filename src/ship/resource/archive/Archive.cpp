@@ -47,11 +47,96 @@ void Archive::Load() {
         }
     }
 
+    if (opened) {
+        ParseManifest();
+    }
+
     SetLoaded(opened && (!mHasGameVersion || isGameVersionValid));
 
     if (!IsLoaded()) {
         Unload();
     }
+}
+
+void Archive::ParseManifest() {
+    auto file = LoadFile("manifest.json");
+    if (file == nullptr || !file->IsLoaded || file->Buffer == nullptr) {
+        return;
+    }
+
+    try {
+        nlohmann::json j = nlohmann::json::parse(file->Buffer->begin(), file->Buffer->end());
+
+        if (j.contains("name") && j["name"].is_string()) {
+            mManifest.Name = j["name"].get<std::string>();
+        }
+        if (j.contains("icon") && j["icon"].is_string()) {
+            mManifest.Icon = j["icon"].get<std::string>();
+        }
+        if (j.contains("author") && j["author"].is_string()) {
+            mManifest.Author = j["author"].get<std::string>();
+        }
+        if (j.contains("version") && j["version"].is_string()) {
+            mManifest.Version = j["version"].get<std::string>();
+        }
+        if (j.contains("website") && j["website"].is_string()) {
+            mManifest.Website = j["website"].get<std::string>();
+        }
+        if (j.contains("description") && j["description"].is_string()) {
+            mManifest.Description = j["description"].get<std::string>();
+        }
+        if (j.contains("license") && j["license"].is_string()) {
+            mManifest.License = j["license"].get<std::string>();
+        }
+        if (j.contains("code-version") && j["code-version"].is_number_integer()) {
+            mManifest.CodeVersion = j["code-version"].get<uint32_t>();
+        }
+        if (j.contains("game-version") && j["game-version"].is_number_integer()) {
+            mManifest.GameVersion = j["game-version"].get<uint32_t>();
+        }
+        if (j.contains("main") && j["main"].is_string()) {
+            mManifest.Main = j["main"].get<std::string>();
+        }
+        if (j.contains("binaries") && j["binaries"].is_object()) {
+            for (auto& [key, value] : j["binaries"].items()) {
+                if (value.is_string()) {
+                    mManifest.Binaries[key] = value.get<std::string>();
+                }
+            }
+        }
+        if (j.contains("dependencies") && j["dependencies"].is_array()) {
+            for (const auto& dep : j["dependencies"]) {
+                if (dep.is_string()) {
+                    mManifest.Dependencies.push_back(dep.get<std::string>());
+                }
+            }
+        }
+        if (j.contains("checksum") && j["checksum"].is_string()) {
+            mManifest.Checksum = j["checksum"].get<std::string>();
+        }
+        if (j.contains("signature") && j["signature"].is_string()) {
+            mManifest.Signature = j["signature"].get<std::string>();
+        }
+        if (j.contains("public-key") && j["public-key"].is_string()) {
+            mManifest.PublicKey = j["public-key"].get<std::string>();
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("Archive \"{}\" has malformed manifest.json: {}", GetPath(), e.what());
+    }
+}
+
+const ArchiveManifest& Archive::GetManifest() {
+    return mManifest;
+}
+
+bool Archive::IsSigned() {
+    // TODO: implement signature verification (mManifest.Signature + .PublicKey + .Checksum).
+    return false;
+}
+
+bool Archive::IsChecksumValid() {
+    // TODO: implement checksum verification (recompute + compare against mManifest.Checksum).
+    return false;
 }
 
 void Archive::Unload() {

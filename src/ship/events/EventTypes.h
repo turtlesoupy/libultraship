@@ -1,6 +1,11 @@
 #pragma once
 
 #include <stdint.h>
+/* TCC compiles mods in C mode; `bool` (used by IEvent.Cancelled below)
+ * is a keyword in C++ but in C99+ requires <stdbool.h>. */
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 
 typedef int32_t EventID;
 typedef uint32_t ListenerID;
@@ -29,17 +34,27 @@ typedef struct EventListener {
     EventMetadata Metadata;
 } EventListener;
 
+/* TCC defines __DLL__=1 when compiling a mod (see ScriptLoader::Compile).
+ * Mods need __declspec(dllimport) on the engine-exported event ID data
+ * symbols so TCC routes references through the import table — MSVC's
+ * implicit handling for function imports doesn't extend to data. */
+#if defined(_WIN32) && defined(__DLL__)
+#  define LUS_EVENT_ID_DECL extern __declspec(dllimport)
+#else
+#  define LUS_EVENT_ID_DECL extern
+#endif
+
 #ifndef __cplusplus
 #ifdef INIT_EVENT_IDS
 #define DECLARE_EVENT(eventName) uint32_t eventName##ID = -1;
 #else
-#define DECLARE_EVENT(eventName) extern uint32_t eventName##ID;
+#define DECLARE_EVENT(eventName) LUS_EVENT_ID_DECL uint32_t eventName##ID;
 #endif
 #else
 #ifdef INIT_EVENT_IDS
 #define DECLARE_EVENT(eventName) extern "C" uint32_t eventName##ID = -1;
 #else
-#define DECLARE_EVENT(eventName) extern "C" uint32_t eventName##ID;
+#define DECLARE_EVENT(eventName) extern "C" LUS_EVENT_ID_DECL uint32_t eventName##ID;
 #endif
 #endif
 

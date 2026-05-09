@@ -27,6 +27,9 @@ class Config;
 class ResourceManager;
 class FileDropMgr;
 class EventSystem;
+#ifndef DISABLE_SCRIPTING
+class ScriptLoader;
+#endif
 
 class Context {
   public:
@@ -65,6 +68,9 @@ class Context {
     std::shared_ptr<Fast::GfxDebugger> GetGfxDebugger();
     std::shared_ptr<FileDropMgr> GetFileDropMgr();
     std::shared_ptr<EventSystem> GetEventSystem();
+#ifndef DISABLE_SCRIPTING
+    std::shared_ptr<ScriptLoader> GetScriptLoader() const;
+#endif
 
     std::string GetName();
     std::string GetShortName();
@@ -84,6 +90,11 @@ class Context {
     bool InitWindow(std::shared_ptr<Window> window = nullptr);
     bool InitFileDropMgr();
     bool InitEventSystem();
+#ifndef DISABLE_SCRIPTING
+    bool InitScriptLoader(std::unordered_map<std::string, std::string> compileDefines = {}, int codeVersion = 1,
+                          std::string buildOptions = "-g -Wl", std::vector<std::string> includePaths = {},
+                          std::vector<std::string> libraryPaths = {}, std::vector<std::string> libraries = {});
+#endif
 
   protected:
     Context() = default;
@@ -103,6 +114,9 @@ class Context {
     std::shared_ptr<Fast::GfxDebugger> mGfxDebugger;
     std::shared_ptr<FileDropMgr> mFileDropMgr;
     std::shared_ptr<EventSystem> mEventSystem;
+#ifndef DISABLE_SCRIPTING
+    std::shared_ptr<ScriptLoader> mScriptLoader;
+#endif
 
     std::string mConfigFilePath;
     std::string mMainPath;

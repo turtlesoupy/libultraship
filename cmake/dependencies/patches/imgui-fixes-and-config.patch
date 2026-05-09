@@ -138,7 +138,7 @@ diff --git a/backends/imgui_impl_metal.mm b/backends/imgui_impl_metal.mm
 index 388c4f3984e1..388c4f3984e2 100644
 --- a/backends/imgui_impl_metal.mm
 +++ b/backends/imgui_impl_metal.mm
-@@ -493,8 +493,7 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
+@@ -504,8 +504,7 @@ static void ImGui_ImplMetal_RenderWindow(ImGuiViewport* viewport, void*)
      MTLRenderPassDescriptor* renderPassDescriptor = data->RenderPassDescriptor;
      renderPassDescriptor.colorAttachments[0].texture = drawable.texture;
      renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
