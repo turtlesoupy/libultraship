@@ -336,7 +336,17 @@ extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t s
     const uintptr_t hi = lo + size;
     for (auto it = sPortPackedDisplayListCache.begin(); it != sPortPackedDisplayListCache.end(); ) {
         const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(it->first);
-        if (srcAddr >= lo && srcAddr < hi) {
+        bool evict = srcAddr >= lo && srcAddr < hi;
+        if (!evict) {
+            for (const Fast::F3DGfx& cmd : *it->second.commands) {
+                const uintptr_t w1 = cmd.words.w1;
+                if (w1 >= lo && w1 < hi) {
+                    evict = true;
+                    break;
+                }
+            }
+        }
+        if (evict) {
             it = sPortPackedDisplayListCache.erase(it);
         } else {
             ++it;
@@ -876,6 +886,27 @@ extern "C" void portTextureCacheDeleteRange(const void* base, size_t size) {
         return;
     }
     inst->TextureCacheDeleteRange(static_cast<const uint8_t*>(base), size);
+}
+
+void Interpreter::ResetRdpTextureState() {
+    mRdp->texture_to_load.addr = nullptr;
+    mRdp->texture_to_load.siz = 0;
+    mRdp->texture_to_load.width = 0;
+    mRdp->texture_to_load.tex_flags = 0;
+    mRdp->texture_to_load.raw_tex_metadata = {};
+
+    for (int i = 0; i < 2; i++) {
+        mRdp->loaded_texture[i].addr = nullptr;
+        mRdp->loaded_texture[i].orig_size_bytes = 0;
+        mRdp->loaded_texture[i].size_bytes = 0;
+        mRdp->loaded_texture[i].full_image_line_size_bytes = 0;
+        mRdp->loaded_texture[i].line_size_bytes = 0;
+        mRdp->loaded_texture[i].tex_flags = 0;
+        mRdp->loaded_texture[i].raw_tex_metadata = {};
+        mRdp->loaded_texture[i].masked = false;
+        mRdp->loaded_texture[i].blended = false;
+        mRdp->textures_changed[i] = true;
+    }
 }
 
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
@@ -3506,6 +3537,10 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
 
     uint16_t tmem = mRdp->texture_tile[tile].tmem;
     const uint8_t* src = mRdp->texture_to_load.addr;
+    if (src == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTlut: missing texture image for tile {}", tile);
+        return;
+    }
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
 
@@ -3587,6 +3622,11 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
     SUPPORT_CHECK(uls == 0);
     SUPPORT_CHECK(ult == 0);
+
+    if (mRdp->texture_to_load.addr == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadBlock: missing texture image for tile {}", tile);
+        return;
+    }
 
     // The lrs field rather seems to be number of pixels to load
     uint32_t word_size_shift = 0;
@@ -3678,6 +3718,11 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
+
+    if (mRdp->texture_to_load.addr == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTile: missing texture image for tile {}", tile);
+        return;
+    }
 
     uint32_t word_size_shift = 0;
     switch (mRdp->texture_to_load.siz) {
@@ -6085,6 +6130,7 @@ void Interpreter::SpReset() {
        called at the start of every Run/RunGuiOnly invocation. */
     portDiagBumpFrame();
 #endif
+    ResetRdpTextureState();
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
