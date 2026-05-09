@@ -145,6 +145,6 @@ index 388c4f3984e1..388c4f3984e2 100644
 -    if ((viewport->Flags & ImGuiViewportFlags_NoRendererClear) == 0)
 -        renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
 +    renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-
+ 
      id <MTLCommandBuffer> commandBuffer = [data->CommandQueue commandBuffer];
      id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
