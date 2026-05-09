@@ -748,6 +748,21 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    // Register clrbuf in `textures` so SelectTextureFb-bound FB samples have
+    // populated width/height entries. SetPerDrawUniforms reads
+    // textures[mCurrentTextureIds[0]].{width,height} into the shader's
+    // texture_width/texture_height uniforms; without this, the GLSL fragment
+    // shader's `clamp(vTexCoord, 0.5/texSize, ...)` divides by zero whenever
+    // an FB-passthrough draw uses the clamp path (1P stage-clear stripes,
+    // VS results photo wipe), producing NaN sample coords and a black/hung
+    // sample on every GL driver. D3D11 sets tex.width/height in its
+    // UpdateFramebufferParameters; Metal queries texture.get_width() in its
+    // shader, so neither needs this.
+    textures.resize(std::max(textures.size(), (size_t)clrbuf + 1));
+    textures[clrbuf].width = 1;
+    textures[clrbuf].height = 1;
+    textures[clrbuf].filtering = FILTER_LINEAR;
+
     GLuint clrbufMsaa;
     glGenRenderbuffers(1, &clrbufMsaa);
 
@@ -820,6 +835,12 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     fb.has_depth_buffer = has_depth_buffer;
     fb.msaa_level = msaa_level;
     fb.invertY = opengl_invertY;
+
+    // Keep textures[clrbuf] dimensions in sync — see CreateFramebuffer for why.
+    if (fb_id != 0 && fb.clrbuf != 0 && (size_t)fb.clrbuf < textures.size()) {
+        textures[fb.clrbuf].width = (uint16_t)std::min<uint32_t>(width, UINT16_MAX);
+        textures[fb.clrbuf].height = (uint16_t)std::min<uint32_t>(height, UINT16_MAX);
+    }
 }
 
 void GfxRenderingAPIOGL::StartDrawToFramebuffer(int fb_id, float noise_scale) {
@@ -877,6 +898,20 @@ void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
     SelectTexture(tile, mFrameBuffers[fb_id].clrbuf);
+}
+
+bool GfxRenderingAPIOGL::FbNeedsSampleVFlip(int fb_id) {
+    // The interpreter's vertex Y negation for invertY=true FBs makes the
+    // rendered "game top" land at the GL pixel-bottom of storage, but
+    // sampling the same FB as a GL_TEXTURE_2D returns rows in the opposite
+    // direction (V=0 reading from the rendered display top). The
+    // FB-as-texture passthrough path needs to V-flip its UV transform so a
+    // consumer UV authored against game-top stays at game-top across all
+    // backends. D3D11 and Metal don't need this — see their default false.
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return false;
+    }
+    return mFrameBuffers[fb_id].invertY;
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,

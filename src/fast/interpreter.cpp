@@ -1988,6 +1988,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                         r.u1 - r.u0, v1Slice - v0Slice,
                         r.u0,        v0Slice
                     };
+                    // Backends whose FB-as-texture sample direction is
+                    // opposite of their FB render direction (OpenGL with
+                    // invertY=true) need a V-flip applied here so consumer
+                    // UVs remain consistent across backends. D3D11 and Metal
+                    // return false from FbNeedsSampleVFlip, so this is a
+                    // no-op there.
+                    if (mRapi->FbNeedsSampleVFlip(it->second.fbId)) {
+                        mFbUvTransform[i].scaleV = -mFbUvTransform[i].scaleV;
+                        mFbUvTransform[i].offsetV = 1.0f - mFbUvTransform[i].offsetV;
+                    }
                 }
                 mRdp->textures_changed[i] = false;
                 return;

@@ -67,6 +67,16 @@ class GfxRenderingAPI {
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
     virtual void* GetFramebufferTextureId(int fbId) = 0;
     virtual void SelectTextureFb(int fbId) = 0;
+    // True iff sampling this FB's color attachment as a texture returns rows
+    // in the opposite Y direction from the rendering side. The Fast3D
+    // FB-as-texture passthrough hook (Interpreter::ImportTexture) uses this
+    // to V-flip its FbUvTransform so consumer UVs stay consistent with the
+    // game's intent across backends. Default false; OpenGL overrides to
+    // return mFrameBuffers[fbId].invertY.
+    virtual bool FbNeedsSampleVFlip(int fbId) {
+        (void)fbId;
+        return false;
+    }
     virtual void DeleteTexture(uint32_t texId) = 0;
     virtual void SetTextureFilter(FilteringMode mode) = 0;
     virtual FilteringMode GetTextureFilter() = 0;
