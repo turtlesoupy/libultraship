@@ -2315,9 +2315,33 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
 float Interpreter::AdjXForAspectRatio(float x) const {
     if (mFbActive) {
         return x;
-    } else {
-        return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
     }
+    // SSB64 port: gated on the port-managed mWidescreenActive flag (set by
+    // port/widescreen/widescreen.cpp from the gEnhancements.Widescreen CVar).
+    // When off, this is a no-op and 4:3 GBI stretches to fill the window
+    // (matching pre-widescreen-feature behavior). When on, post-projection
+    // clip-space X is compressed by (4/3)/window_aspect so the 4:3 frustum
+    // expands horizontally into the wider window — that's the only line
+    // separating "stretched 4:3" from "native widescreen" rendering.
+    //
+    // Reads the OS window aspect from mGameWindowViewport rather than
+    // mCurDimensions because the latter can be forced to 4:3 by the
+    // Advanced Resolution CVar tree (which the SSB64 port also uses for the
+    // CVar-off-default 4:3 pillarbox); mGameWindowViewport always reflects
+    // the actual SDL window size.
+    if (!mWidescreenActive) {
+        return x;
+    }
+    const float win_w = (float)mGameWindowViewport.width;
+    const float win_h = (float)mGameWindowViewport.height;
+    if (win_w <= 0.0f || win_h <= 0.0f) {
+        return x;
+    }
+    const float win_aspect = win_w / win_h;
+    if (win_aspect <= (4.0f / 3.0f)) {
+        return x;
+    }
+    return x * (4.0f / 3.0f) / win_aspect;
 }
 
 // Scale the width and height value based on the ratio of the viewport to the native size
@@ -3878,8 +3902,22 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT(mActiveFrameBuffer))) + 1.0f;
 
-    ulxf = AdjXForAspectRatio(ulxf);
-    lrxf = AdjXForAspectRatio(lrxf);
+    // SSB64 port widescreen: do NOT apply the clip-x compression to
+    // TextureRectangle ops. The 3D world (Interpreter::GfxSpVertex) widens
+    // via AdjXForAspectRatio so the camera shows more world horizontally,
+    // but stage backgrounds and HUD elements are authored as full-screen
+    // 2D rects whose UV mapping is fixed to a 4:3 layout — compressing
+    // their X bounds shrinks them inward and leaves black side strips. We
+    // keep them at their authored 4:3 NDC range; the FB clear (black) fills
+    // the side strips. Bringing those into widescreen needs per-game rect
+    // anchoring (cf. SoH's GFX_DIMENSIONS_FROM_LEFT_EDGE), which is Phase 2
+    // scope.
+    if (mWidescreenActive) {
+        // Phase 1: leave rect coords at their 4:3-authored NDC values.
+    } else {
+        ulxf = AdjXForAspectRatio(ulxf);
+        lrxf = AdjXForAspectRatio(lrxf);
+    }
 
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
@@ -6227,7 +6265,12 @@ void Interpreter::RunGuiOnly() {
     mRapi->StartDrawToFramebuffer(0, 1);
     mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6272,7 +6315,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->StartDrawToFramebuffer(0, 1);
     mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};

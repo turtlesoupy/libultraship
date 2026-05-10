@@ -429,6 +429,13 @@ class Interpreter {
     void SetMsaaLevel(uint32_t level);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
 
+    // Port hook: when set true, AdjXForAspectRatio compresses post-projection
+    // clip-space X by (4/3) / window_aspect, expanding the visible 4:3
+    // frustum into the wider window. Refreshed per-frame by the game's port
+    // glue from a CVar; default false means non-widescreen-aware ports get
+    // exactly the prior unconditional behaviour as a no-op fallback.
+    void SetWidescreenActive(bool active) { mWidescreenActive = active; }
+
     // private: TODO make these private
     void Flush();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
@@ -551,6 +558,8 @@ class Interpreter {
     // DISCARD on Windows). On macOS the same effect is achieved
     // unconditionally via the __APPLE__ guard inside that method.
     bool mForceRenderToFb{};
+    // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
+    bool mWidescreenActive{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 
