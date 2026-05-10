@@ -5121,34 +5121,6 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetdata = {};
 
-    // Catch unresolved low-32-bit pointers BEFORE handing them to the OTR
-    // signature check. SegAddr can return a raw value back — either an N64
-    // segment-encoded address whose segment isn't bound at this moment, or
-    // a stale token / chain-encoded slot value that decodes through every
-    // SegAddr branch unsuccessfully — in which case `imgData` is a low
-    // 32-bit value with no valid host-pointer mapping. Without this guard
-    // gfx_check_image_signature dereferences the bogus pointer (POSIX
-    // gfxPointerHasReadableBytes is a no-op) and segfaults.
-    //
-    // The original guard at `if (i <= 0x0FFFFFFF) return false;` below was
-    // (a) too narrow — it only covered the strict N64 segmented range,
-    // missing values like 0x3596da68 that fit no segment but are still
-    // not host-mapped — and (b) placed AFTER the OTR sig check, so the
-    // bogus pointer crash happened before the guard could fire.
-    //
-    // On 64-bit hosts every valid mmap'd pointer is above 4 GB; anything
-    // below is unresolvable. On a 32-bit host the original 256 MB N64
-    // segmented-range cap is the right threshold.
-#if UINTPTR_MAX > 0xFFFFFFFFu
-    if (i != 0 && i < 0x100000000ull) {
-        return false;
-    }
-#else
-    if (i <= 0x0FFFFFFF) {
-        return false;
-    }
-#endif
-
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
@@ -5170,9 +5142,14 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
         }
     }
 
-    // (Earlier guard at the top of this handler already covered the
-    // unresolved-pointer case — `i` here is guaranteed to be a host-mapped
-    // address.)
+    // If the resolved address is still in the N64 segmented range, SegAddr
+    // failed to resolve it (segment not set up). Skip to avoid dereferencing
+    // invalid memory. Don't widen the cap to 4 GB on 64-bit hosts — non-PIE
+    // Linux binaries hand out valid brk-arena pointers below 4 GB, and a
+    // wider guard drops legitimate texture-set commands.
+    if (i <= 0x0FFFFFFF) {
+        return false;
+    }
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
 
