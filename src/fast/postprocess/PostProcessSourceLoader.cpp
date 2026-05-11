@@ -50,25 +50,43 @@ bool ReadArchiveFile(const std::string& path, std::string& outText) {
 
 } // namespace
 
+namespace {
+
+// Populate one language slot in `out`. Looks first on the filesystem (where a
+// user drops a sibling file next to the `.glsl` they authored), then in
+// f3d.o2r for the bundled builtins. Silently no-ops if no file is found —
+// the SPIRV-Cross transpiler will fill the gap once it lands, and backends
+// that need a non-GLSL source check for emptiness and bail with a clear log.
+void TryLoadLanguage(const std::string& name, const std::string& extension, std::string& outText) {
+    if (ReadFilesystemFile("shaders/" + name + "." + extension, outText)) {
+        return;
+    }
+    ReadArchiveFile("shaders/postprocess/" + name + "." + extension, outText);
+}
+
+} // namespace
+
 bool LoadPostProcessShader(const std::string& name, PostProcessSource& out) {
     if (name.empty()) {
         return false;
     }
-    std::string text;
+    std::string glsl;
     const std::string fsPath = "shaders/" + name + ".glsl";
-    if (ReadFilesystemFile(fsPath, text)) {
-        out.name = name;
-        out.glsl = std::move(text);
-        return true;
+    if (!ReadFilesystemFile(fsPath, glsl)) {
+        const std::string arPath = "shaders/postprocess/" + name + ".glsl";
+        if (!ReadArchiveFile(arPath, glsl)) {
+            SPDLOG_ERROR("Post-process shader '{}' not found (tried '{}' and archive '{}')", name, fsPath, arPath);
+            return false;
+        }
     }
-    const std::string arPath = "shaders/postprocess/" + name + ".glsl";
-    if (ReadArchiveFile(arPath, text)) {
-        out.name = name;
-        out.glsl = std::move(text);
-        return true;
-    }
-    SPDLOG_ERROR("Post-process shader '{}' not found (tried '{}' and archive '{}')", name, fsPath, arPath);
-    return false;
+    out.name = name;
+    out.glsl = std::move(glsl);
+    // Optionally pick up hand-written backend-specific siblings. Phase 1
+    // ships these alongside the bundled builtins until SPIRV-Cross glue
+    // can synthesize them from the .glsl source.
+    TryLoadLanguage(name, "msl", out.msl);
+    TryLoadLanguage(name, "hlsl", out.hlsl);
+    return true;
 }
 
 std::vector<std::string> ListBuiltinPostProcessShaders() {

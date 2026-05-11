@@ -68,6 +68,28 @@ struct ShaderProgramMetal {
     MTL::RenderPipelineState* pipeline_state_variants[9];
 };
 
+// Compiled post-process program. The pipeline state expects:
+//   - vertex function:   "postprocess_vertex" (uses [[vertex_id]] only)
+//   - fragment function: "postprocess_fragment"
+//   - fragment binding texture(0)=Source, sampler(0)=SourceSampler,
+//     buffer(0) = PostProcessUniformsMetal
+// The sampler is owned alongside so DestroyPostProcessProgram is one call.
+struct PostProcessProgramMetal {
+    MTL::RenderPipelineState* pipeline;
+    MTL::SamplerState* sampler;
+    std::string name;
+};
+
+// Layout must match the `PostProcessUniforms` struct in
+// libultraship/src/fast/shaders/postprocess/*.msl.
+struct PostProcessUniformsMetal {
+    simd::float2 sourceSize;
+    simd::float2 outputSize;
+    simd::float2 inputSize;
+    simd::int1 frameCount;
+    simd::float1 frameDirection;
+};
+
 struct TextureDataMetal {
     MTL::Texture* texture;
     MTL::Texture* msaaTexture;
@@ -165,6 +187,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    bool SupportsPostProcess() override;
+    int CreatePostProcessProgram(const PostProcessSource& src) override;
+    void DestroyPostProcessProgram(int progId) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
+
     void NewFrame();
     void SetupFloatingFrame();
     void RenderDrawData(ImDrawData* drawData);
@@ -221,6 +248,11 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     bool mNonUniformThreadgroupSupported;
+
+    // Post-process programs allocated via CreatePostProcessProgram. Slots
+    // with pipeline==nullptr are empty (returned to the free list when
+    // DestroyPostProcessProgram clears them).
+    std::vector<PostProcessProgramMetal> mPostProcessPrograms;
 };
 
 } // namespace Fast

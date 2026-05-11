@@ -1288,6 +1288,221 @@ ImTextureID GfxRenderingAPIMetal::GetTextureById(int fb_id) {
 void GfxRenderingAPIMetal::SetSrgbMode() {
     mSrgbMode = true;
 }
+
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+//
+// Ordering note: Metal command buffers execute in enqueue() order, not
+// commit() order. By the time ComposeFinalFrame runs, the source FB's cb
+// (mGameFb) was enqueued during game rendering, then StartDrawToFramebuffer(0)
+// enqueued FB 0's cb for the GUI pass. A freshly-allocated cb here would
+// land *after* FB 0's, so the GUI would sample a stale destination texture.
+// We chain the post-process render encoder onto an already-enqueued
+// non-screen cb (preferably the source FB's) so its work executes before
+// FB 0 reads our output, without needing fences or events.
+
+bool GfxRenderingAPIMetal::SupportsPostProcess() {
+    return true;
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.msl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no MSL source. The Metal "
+                     "backend requires hand-authored MSL (with vertex entry "
+                     "'postprocess_vertex' and fragment entry "
+                     "'postprocess_fragment') until SPIRV-Cross GLSL→MSL "
+                     "glue lands. See libultraship/src/fast/shaders/"
+                     "postprocess/scanlines.msl for the schema.",
+                     src.name);
+        return -1;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = nullptr;
+    MTL::Library* library =
+        mDevice->newLibrary(NS::String::string(src.msl.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+    if (library == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': MSL compile failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        pool->release();
+        return -1;
+    }
+
+    MTL::Function* vsFn = library->newFunction(NS::String::string("postprocess_vertex", NS::UTF8StringEncoding));
+    MTL::Function* fsFn = library->newFunction(NS::String::string("postprocess_fragment", NS::UTF8StringEncoding));
+    if (vsFn == nullptr || fsFn == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': MSL must export postprocess_vertex / postprocess_fragment", src.name);
+        if (vsFn) {
+            vsFn->release();
+        }
+        if (fsFn) {
+            fsFn->release();
+        }
+        library->release();
+        pool->release();
+        return -1;
+    }
+
+    MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    desc->setVertexFunction(vsFn);
+    desc->setFragmentFunction(fsFn);
+    desc->colorAttachments()->object(0)->setPixelFormat(
+        mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+    desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+    desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+    desc->setSampleCount(1);
+    // Destination FB has no depth attachment (PostProcessChain::OnResize
+    // passes has_depth_buffer=false), so depth/stencil pixel formats stay
+    // at the default of Invalid.
+
+    MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
+
+    vsFn->release();
+    fsFn->release();
+    library->release();
+    desc->release();
+
+    if (pipeline == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': pipeline state failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        pool->release();
+        return -1;
+    }
+
+    MTL::SamplerDescriptor* sdesc = MTL::SamplerDescriptor::alloc()->init();
+    sdesc->setMinFilter(MTL::SamplerMinMagFilterLinear);
+    sdesc->setMagFilter(MTL::SamplerMinMagFilterLinear);
+    sdesc->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+    sdesc->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+    MTL::SamplerState* sampler = mDevice->newSamplerState(sdesc);
+    sdesc->release();
+
+    PostProcessProgramMetal slot{};
+    slot.pipeline = pipeline;
+    slot.sampler = sampler;
+    slot.name = src.name;
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        if (mPostProcessPrograms[i].pipeline == nullptr) {
+            mPostProcessPrograms[i] = std::move(slot);
+            pool->release();
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    pool->release();
+    return (int)mPostProcessPrograms.size() - 1;
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessPrograms[progId];
+    if (slot.pipeline != nullptr) {
+        slot.pipeline->release();
+    }
+    if (slot.sampler != nullptr) {
+        slot.sampler->release();
+    }
+    slot = PostProcessProgramMetal{};
+}
+
+void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    const PostProcessProgramMetal& slot = mPostProcessPrograms[progId];
+    if (slot.pipeline == nullptr) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFramebuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& src = mFramebuffers[srcFb];
+    FramebufferMetal& dst = mFramebuffers[dstFb];
+    if (dst.mRenderPassDescriptor == nullptr) {
+        return;
+    }
+    MTL::Texture* srcTexture = mTextures[src.mTextureId].texture;
+    MTL::Texture* dstTexture = mTextures[dst.mTextureId].texture;
+    if (srcTexture == nullptr || dstTexture == nullptr) {
+        return;
+    }
+
+    // Find a host command buffer to append our render encoder to. The cb
+    // must already be enqueued ahead of FB 0's GUI cb to satisfy the
+    // GPU-side read-after-write ordering described above.
+    MTL::CommandBuffer* hostCb = nullptr;
+    FramebufferMetal* hostFb = nullptr;
+    if (src.mCommandBuffer != nullptr) {
+        hostCb = src.mCommandBuffer;
+        hostFb = &src;
+    } else {
+        for (int id : mDrawnFramebuffers) {
+            if (id == 0 || id == dstFb) {
+                continue;
+            }
+            if ((size_t)id >= mFramebuffers.size()) {
+                continue;
+            }
+            FramebufferMetal& candidate = mFramebuffers[id];
+            if (candidate.mCommandBuffer != nullptr) {
+                hostCb = candidate.mCommandBuffer;
+                hostFb = &candidate;
+                break;
+            }
+        }
+    }
+    if (hostCb == nullptr || hostFb == nullptr) {
+        SPDLOG_WARN("Post-process: no live non-screen command buffer; skipping pass for '{}'", slot.name);
+        return;
+    }
+    if (!hostFb->mHasEndedEncoding && hostFb->mCommandEncoder != nullptr) {
+        hostFb->mCommandEncoder->endEncoding();
+        hostFb->mHasEndedEncoding = true;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Temporarily switch the destination's load action to DontCare — the
+    // fullscreen triangle writes every pixel, so a load is wasted bandwidth.
+    // Restore after the encoder so any later use of the descriptor (resize
+    // path) keeps the default Load semantics it was set up with.
+    MTL::RenderPassColorAttachmentDescriptor* color = dst.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::LoadAction origLoad = color->loadAction();
+    color->setLoadAction(MTL::LoadActionDontCare);
+
+    MTL::RenderCommandEncoder* enc = hostCb->renderCommandEncoder(dst.mRenderPassDescriptor);
+    enc->setLabel(NS::String::string("Post-process pass", NS::UTF8StringEncoding));
+
+    MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
+    enc->setViewport(vp);
+    enc->setRenderPipelineState(slot.pipeline);
+    enc->setFragmentTexture(srcTexture, 0);
+    enc->setFragmentSamplerState(slot.sampler, 0);
+
+    PostProcessUniformsMetal uni{};
+    uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
+    uni.outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
+    uni.inputSize = uni.sourceSize;
+    uni.frameCount = (int)params.frameCount;
+    uni.frameDirection = 1.0f;
+    enc->setFragmentBytes(&uni, sizeof(uni), 0);
+
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
+    enc->endEncoding();
+
+    color->setLoadAction(origLoad);
+
+    pool->release();
+}
+
 } // namespace Fast
 
 bool Metal_IsSupported() {
