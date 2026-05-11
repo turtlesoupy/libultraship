@@ -1,6 +1,14 @@
 #version 330 core
 
-// MIT-licensed Lottes-style CRT shader for the LUS post-process runtime.
+// SPDX-License-Identifier: CC0-1.0
+//
+// Lottes-style CRT shader for the LUS post-process runtime, dedicated
+// to the public domain by the author under CC0 1.0 Universal
+// (https://creativecommons.org/publicdomain/zero/1.0/). To the extent
+// possible under law, all copyright and related or neighboring rights
+// to this work have been waived; it may be used, modified, sublicensed
+// and redistributed without restriction or attribution.
+//
 // Original work for this repository, implementing the classic Lottes CRT
 // technique (per-source-row Gaussian scanline + bandlimited cosine
 // subpixel mask + gamma in/out) from the published public description;

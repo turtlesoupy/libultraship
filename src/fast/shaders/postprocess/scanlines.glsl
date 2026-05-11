@@ -1,9 +1,18 @@
 #version 330 core
 
-// MIT-licensed default scanline shader for the LUS post-process runtime.
-// Original work for this repository; not derived from any third-party
-// CRT shader implementation. Demonstrates the standard runtime uniform
-// schema (see PostProcessTypes.h):
+// SPDX-License-Identifier: CC0-1.0
+//
+// Default scanline shader for the LUS post-process runtime, dedicated
+// to the public domain by the author under CC0 1.0 Universal
+// (https://creativecommons.org/publicdomain/zero/1.0/). To the extent
+// possible under law, all copyright and related or neighboring rights
+// to this work have been waived; it may be used, modified, sublicensed
+// and redistributed without restriction or attribution. Original work
+// for this repository; not derived from any third-party CRT shader
+// implementation.
+//
+// Demonstrates the standard runtime uniform schema (see
+// PostProcessTypes.h):
 //
 //   sampler2D Source     -- input game framebuffer
 //   vec2      SourceSize -- input texture pixel dimensions
