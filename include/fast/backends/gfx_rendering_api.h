@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <set>
 #include "imconfig.h"
+#include "../postprocess/PostProcessTypes.h"
 
 namespace Fast {
 struct ShaderProgram;
@@ -82,6 +83,43 @@ class GfxRenderingAPI {
     virtual FilteringMode GetTextureFilter() = 0;
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
+
+    // Post-process / user-shader runtime.
+    //
+    // Phase 1 of the CRT-shader plan (docs/crt_shader_plan_2026-05-11.md
+    // §3.2). The interface is small on purpose: the interpreter owns
+    // the FBO chain and the per-frame parameter pack; backends are only
+    // responsible for compiling a fragment program and running it as a
+    // fullscreen pass that samples a source FB's color texture and
+    // writes into a destination FB.
+    //
+    // SupportsPostProcess() is the runtime gate. Backends that haven't
+    // implemented the feature leave the default `return false` and the
+    // interpreter skips the pass; backends that have implemented it
+    // return true and the other three methods become live. This avoids
+    // forcing every backend to ship a full implementation in lockstep.
+    //
+    // Returned program IDs are opaque to the interpreter — backends
+    // can use vector indices, handle ints, whatever — but must be
+    // round-trippable: a value handed back from CreatePostProcessProgram
+    // is what the interpreter passes to RunPostProcess / Destroy.
+    // -1 means "compile failed".
+    virtual bool SupportsPostProcess() {
+        return false;
+    }
+    virtual int CreatePostProcessProgram(const PostProcessSource& src) {
+        (void)src;
+        return -1;
+    }
+    virtual void DestroyPostProcessProgram(int progId) {
+        (void)progId;
+    }
+    virtual void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+        (void)progId;
+        (void)srcFb;
+        (void)dstFb;
+        (void)params;
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

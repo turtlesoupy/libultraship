@@ -69,6 +69,7 @@ extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int nu
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/Utils.h"
 #include "ship/Context.h"
+#include "fast/postprocess/PostProcessSourceLoader.h"
 #include "ship/config/ConsoleVariable.h"
 
 #include "libultraship/libultra/os.h"
@@ -6193,6 +6194,10 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
     mGameFb = mRapi->CreateFramebuffer();
     mGameFbMsaaResolved = mRapi->CreateFramebuffer();
 
+    // Post-process pipeline. On backends that don't yet implement
+    // post-process this is a no-op — see GfxRenderingAPI::SupportsPostProcess.
+    mPostProcessChain.Init(mRapi);
+
     mNativeDimensions.width = SCREEN_WIDTH;
     mNativeDimensions.height = SCREEN_HEIGHT;
 
@@ -6264,6 +6269,10 @@ void Interpreter::SetForceRenderToFb(bool force) {
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
+    // Reconcile post-process state from CVars before the FBO-size
+    // decisions below, since a fresh shader load flips
+    // mPostProcessChain.IsActive() true and forces mRendersToFb.
+    UpdatePostProcessFromCVars();
     if (mCurDimensions.height == 0) {
         // Avoid division by zero
         mCurDimensions.height = 1;
@@ -6290,7 +6299,7 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || mPostProcessChain.IsActive()) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution()) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
@@ -6308,6 +6317,12 @@ void Interpreter::StartFrame() {
     } else {
         mRendersToFb = false;
     }
+
+    // Resize the post-process output FBO to track the window. The chain
+    // bails out internally when dimensions are unchanged or zero, and is
+    // a no-op when no shader is loaded / the backend lacks support.
+    mPostProcessChain.OnResize(mRapi, mGfxCurrentWindowDimensions.width,
+                               mGfxCurrentWindowDimensions.height);
 
     mFbActive = false;
 }
@@ -6349,18 +6364,7 @@ void Interpreter::RunGuiOnly() {
     mGfxFrameBuffer = 0;
 
     if (mRendersToFb) {
-        mRapi->StartDrawToFramebuffer(0, 1);
-        mRapi->ClearFramebuffer(true, true);
-        if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
-                mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
-            } else {
-                mRapi->ResolveMSAAColorBuffer(0, mGameFb);
-            }
-        } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
-        }
+        ComposeFinalFrame();
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
         mFbActive = 0;
@@ -6420,24 +6424,86 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     currentDir = std::stack<std::string>();
 
     if (mRendersToFb) {
-        mRapi->StartDrawToFramebuffer(0, 1);
-        mRapi->ClearFramebuffer(true, true);
-        if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
-                mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
-            } else {
-                mRapi->ResolveMSAAColorBuffer(0, mGameFb);
-            }
-        } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
-        }
+        ComposeFinalFrame();
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
         mFbActive = 0;
         mRapi->StartDrawToFramebuffer(0, 1);
 
         assert(0 && "active framebuffer was never reset back to original");
+    }
+}
+
+void Interpreter::UpdatePostProcessFromCVars() {
+    auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
+    if (cvars == nullptr) {
+        return;
+    }
+    const bool enabled = cvars->GetInteger(CVAR_POSTPROCESS_ENABLED, 0) != 0;
+    const char* nameCStr = cvars->GetString(CVAR_POSTPROCESS_SHADER, "");
+    const std::string name = nameCStr != nullptr ? nameCStr : "";
+
+    const bool wantActive = enabled && !name.empty();
+    const bool nameChanged = name != mPostProcessName;
+    const bool enabledChanged = enabled != mPostProcessEnabled;
+
+    if (!wantActive) {
+        if (mPostProcessChain.IsActive()) {
+            mPostProcessChain.UnloadShader(mRapi);
+        }
+    } else if (nameChanged || enabledChanged || !mPostProcessChain.IsActive()) {
+        PostProcessSource src;
+        if (LoadPostProcessShader(name, src)) {
+            if (!mPostProcessChain.LoadShader(mRapi, src)) {
+                SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
+            }
+        } else if (mPostProcessChain.IsActive()) {
+            // New shader name failed to load; unload the previous one
+            // rather than silently keeping a stale program live.
+            mPostProcessChain.UnloadShader(mRapi);
+        }
+    }
+
+    mPostProcessEnabled = enabled;
+    mPostProcessName = name;
+}
+
+void Interpreter::ComposeFinalFrame() {
+    mRapi->StartDrawToFramebuffer(0, 1);
+    mRapi->ClearFramebuffer(true, true);
+
+    // The texture-backed FBO whose color attachment the post-process pass
+    // samples (or, when no pass is active, the GUI samples directly).
+    // -1 means "the MSAA result went straight to the swap-chain back
+    // buffer; no texture is available this frame" — only possible on the
+    // existing MSAA fast path when post-process is inactive.
+    int srcFb = -1;
+    if (mMsaaLevel > 1) {
+        // §3.1 of the plan: with post-process active we always resolve to
+        // mGameFbMsaaResolved so the pass has a sampleable input, even on
+        // the matched-resolution fast path.
+        if (mPostProcessChain.IsActive() || !ViewportMatchesRendererResolution()) {
+            mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
+            srcFb = mGameFbMsaaResolved;
+        } else {
+            mRapi->ResolveMSAAColorBuffer(0, mGameFb);
+        }
+    } else {
+        srcFb = mGameFb;
+    }
+
+    if (mPostProcessChain.IsActive() && srcFb >= 0) {
+        PostProcessParams params{};
+        params.srcWidth = mCurDimensions.width;
+        params.srcHeight = mCurDimensions.height;
+        params.dstWidth = mGfxCurrentWindowDimensions.width;
+        params.dstHeight = mGfxCurrentWindowDimensions.height;
+        params.frameCount = mFrameCounter++;
+        params.frameDeltaSeconds = 0.0f;
+        const int outFb = mPostProcessChain.Run(mRapi, srcFb, params);
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(outFb);
+    } else if (srcFb >= 0) {
+        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(srcFb);
     }
 }
 

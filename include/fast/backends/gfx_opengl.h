@@ -1,6 +1,8 @@
 #ifdef ENABLE_OPENGL
 #pragma once
 
+#include <string>
+
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -47,6 +49,20 @@ struct FramebufferOGL {
     bool invertY;
 
     GLuint fbo, clrbuf, clrbufMsaa, rbo;
+};
+
+// Post-process fragment program + its standard-uniform locations. The
+// runtime emits a fixed vertex shader (NDC fullscreen triangle) so only
+// the FS source is user-controlled.
+struct PostProcessProgramOGL {
+    GLuint program = 0;
+    GLint sourceLocation = -1;
+    GLint sourceSizeLocation = -1;
+    GLint outputSizeLocation = -1;
+    GLint inputSizeLocation = -1;
+    GLint frameCountLocation = -1;
+    GLint frameDirectionLocation = -1;
+    std::string name;
 };
 
 struct TextureInfo {
@@ -102,10 +118,17 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    bool SupportsPostProcess() override;
+    int CreatePostProcessProgram(const PostProcessSource& src) override;
+    void DestroyPostProcessProgram(int progId) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
+
   private:
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+    GLuint CompilePostProcessProgram(const std::string& fsSource, std::string& errOut);
+    GLuint EnsurePostProcessVao();
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES];
@@ -135,6 +158,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    std::vector<PostProcessProgramOGL> mPostProcessPrograms;
+    GLuint mPostProcessVao = 0;
+    GLuint mPostProcessVbo = 0;
 };
 
 } // namespace Fast

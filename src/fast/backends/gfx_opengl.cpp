@@ -894,6 +894,243 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
     return (void*)(uintptr_t)mFrameBuffers[fb_id].clrbuf;
 }
 
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+
+static const char kPostProcessVertexShader[] =
+    "#version 330 core\n"
+    "in vec2 aPos;\n"
+    "out vec2 vTexCoord;\n"
+    "uniform int FlipY;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "    vec2 uv = aPos * 0.5 + 0.5;\n"
+    "    if (FlipY != 0) uv.y = 1.0 - uv.y;\n"
+    "    vTexCoord = uv;\n"
+    "}\n";
+
+bool GfxRenderingAPIOGL::SupportsPostProcess() {
+    return true;
+}
+
+GLuint GfxRenderingAPIOGL::CompilePostProcessProgram(const std::string& fsSource, std::string& errOut) {
+    auto compile = [&](GLenum type, const char* src) -> GLuint {
+        GLuint sh = glCreateShader(type);
+        glShaderSource(sh, 1, &src, nullptr);
+        glCompileShader(sh);
+        GLint ok = GL_FALSE;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            GLint len = 0;
+            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+            std::string log(std::max(len, 1) - 1, '\0');
+            if (len > 0) {
+                glGetShaderInfoLog(sh, len, nullptr, log.data());
+            }
+            errOut = std::move(log);
+            glDeleteShader(sh);
+            return 0;
+        }
+        return sh;
+    };
+    GLuint vs = compile(GL_VERTEX_SHADER, kPostProcessVertexShader);
+    if (vs == 0) {
+        return 0;
+    }
+    GLuint fs = compile(GL_FRAGMENT_SHADER, fsSource.c_str());
+    if (fs == 0) {
+        glDeleteShader(vs);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    // Tie the only vertex attribute to slot 0; the FS doesn't have any so
+    // there is no fragment-output binding to worry about (single FS
+    // output is assumed at location 0).
+    glBindAttribLocation(prog, 0, "aPos");
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        std::string log(std::max(len, 1) - 1, '\0');
+        if (len > 0) {
+            glGetProgramInfoLog(prog, len, nullptr, log.data());
+        }
+        errOut = std::move(log);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.glsl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no GLSL source", src.name);
+        return -1;
+    }
+    std::string err;
+    GLuint prog = CompilePostProcessProgram(src.glsl, err);
+    if (prog == 0) {
+        SPDLOG_ERROR("Post-process shader '{}' failed to compile/link: {}", src.name, err);
+        return -1;
+    }
+
+    PostProcessProgramOGL slot{};
+    slot.program = prog;
+    slot.name = src.name;
+    slot.sourceLocation = glGetUniformLocation(prog, "Source");
+    slot.sourceSizeLocation = glGetUniformLocation(prog, "SourceSize");
+    slot.outputSizeLocation = glGetUniformLocation(prog, "OutputSize");
+    slot.inputSizeLocation = glGetUniformLocation(prog, "InputSize");
+    slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
+    slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        if (mPostProcessPrograms[i].program == 0) {
+            mPostProcessPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    return (int)(mPostProcessPrograms.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessPrograms[progId];
+    if (slot.program != 0) {
+        glDeleteProgram(slot.program);
+        slot = PostProcessProgramOGL{};
+    }
+}
+
+GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
+    if (mPostProcessVao != 0 && mPostProcessVbo != 0) {
+        return mPostProcessVao;
+    }
+    // Fullscreen triangle in NDC. Extends past the [-1,1] viewport on two
+    // edges so a single triangle covers the entire output without the
+    // diagonal seam of a two-triangle quad.
+    static const GLfloat kFullscreenTriangle[] = {
+        -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f,
+    };
+    glGenVertexArrays(1, &mPostProcessVao);
+    glBindVertexArray(mPostProcessVao);
+    glGenBuffers(1, &mPostProcessVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kFullscreenTriangle), kFullscreenTriangle, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), (void*)0);
+    return mPostProcessVao;
+}
+
+void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    const PostProcessProgramOGL& slot = mPostProcessPrograms[progId];
+    if (slot.program == 0) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFrameBuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& srcFbInfo = mFrameBuffers[srcFb];
+    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
+    if (srcFbInfo.clrbuf == 0 || dstFbInfo.fbo == 0) {
+        return;
+    }
+
+    // Fixed-function state for a fullscreen pass. No scissor, no depth,
+    // no blend. The next regular draw resets viewport / blend / depth.
+    if (mLastScissorEnabled != 0) {
+        glDisable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 0;
+    }
+    if (mLastBlendEnabled != 0) {
+        glDisable(GL_BLEND);
+        mLastBlendEnabled = 0;
+    }
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
+    mCurrentFrameBuffer = dstFb;
+    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Sample source FB's color texture on TU0 with edge-clamped linear
+    // filtering. Edge-clamp matters for CRT shaders that read beyond
+    // [0,1] for sub-pixel/scanline math.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, srcFbInfo.clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    mLastBoundTextures[0] = srcFbInfo.clrbuf;
+    mLastActiveTexture = 0;
+
+    glUseProgram(slot.program);
+    mLastLoadedShader = nullptr; // Force LoadShader to re-glUseProgram next frame.
+    if (slot.sourceLocation >= 0) {
+        glUniform1i(slot.sourceLocation, 0);
+    }
+    if (slot.sourceSizeLocation >= 0) {
+        glUniform2f(slot.sourceSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
+    }
+    if (slot.inputSizeLocation >= 0) {
+        glUniform2f(slot.inputSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
+    }
+    if (slot.outputSizeLocation >= 0) {
+        glUniform2f(slot.outputSizeLocation, (float)params.dstWidth, (float)params.dstHeight);
+    }
+    if (slot.frameCountLocation >= 0) {
+        glUniform1i(slot.frameCountLocation, (int)params.frameCount);
+    }
+    if (slot.frameDirectionLocation >= 0) {
+        glUniform1f(slot.frameDirectionLocation, 1.0f);
+    }
+    // FlipY uniform lives on the vertex shader; re-resolve each frame in
+    // case the source FB changed between mGameFb (invertY=true) and
+    // mGameFbMsaaResolved (invertY=false).
+    GLint flipYLoc = glGetUniformLocation(slot.program, "FlipY");
+    if (flipYLoc >= 0) {
+        glUniform1i(flipYLoc, srcFbInfo.invertY ? 1 : 0);
+    }
+
+    EnsurePostProcessVao();
+    glBindVertexArray(mPostProcessVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Restore the driver-visible VAO/VBO bindings the regular draw path
+    // assumes. On Apple / GLES the backend keeps mOpenglVao bound at all
+    // times; elsewhere it uses the default VAO (0) and an always-bound
+    // mOpenglVbo on GL_ARRAY_BUFFER.
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray(mOpenglVao);
+#else
+    glBindVertexArray(0);
+#endif
+    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
+}
+
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
