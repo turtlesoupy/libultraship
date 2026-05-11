@@ -1,0 +1,96 @@
+// MIT-licensed Lottes-style CRT shader (MSL companion to crt-lottes.glsl).
+// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler that will
+// eventually synthesize MSL from the .glsl source. See the .glsl file for
+// the technique reference and authorship note.
+
+#include <metal_stdlib>
+using namespace metal;
+
+struct PostProcessUniforms {
+    float2 SourceSize;
+    float2 OutputSize;
+    float2 InputSize;
+    int    FrameCount;
+    float  FrameDirection;
+};
+
+struct VOut {
+    float4 position [[position]];
+    float2 vTexCoord;
+};
+
+constant float2 kWarp = float2(0.031, 0.041);
+constant float kMaskStrength = 0.35;
+constant float kScanMin = 0.55;
+
+static inline float3 SrgbToLinear(float3 c) { return pow(c, float3(2.2)); }
+static inline float3 LinearToSrgb(float3 c) { return pow(c, float3(1.0 / 2.2)); }
+
+static inline float2 WarpUV(float2 uv) {
+    float2 c = uv * 2.0 - 1.0;
+    c *= 1.0 + (c.yx * c.yx) * kWarp;
+    return c * 0.5 + 0.5;
+}
+
+static inline float ScanWeight(float frac) {
+    return mix(1.0, kScanMin, 0.5 - 0.5 * cos(frac * 6.283185));
+}
+
+static inline float3 FetchScanline(texture2d<float> src, sampler s, float2 srcSize, float2 uv, float row) {
+    float2 rowUv = float2(uv.x, (row + 0.5) / srcSize.y);
+    float2 dx = float2(1.0 / srcSize.x, 0.0);
+    float3 a = SrgbToLinear(src.sample(s, rowUv - dx).rgb);
+    float3 b = SrgbToLinear(src.sample(s, rowUv).rgb);
+    float3 c = SrgbToLinear(src.sample(s, rowUv + dx).rgb);
+    return a * 0.25 + b * 0.5 + c * 0.25;
+}
+
+static inline float3 PhosphorMask(float2 fragPos) {
+    float col = fmod(fragPos.x, 3.0);
+    float lo = 1.0 - kMaskStrength;
+    if (col < 1.0) {
+        return float3(1.0, lo, lo);
+    } else if (col < 2.0) {
+        return float3(lo, 1.0, lo);
+    } else {
+        return float3(lo, lo, 1.0);
+    }
+}
+
+vertex VOut postprocess_vertex(uint vid [[vertex_id]]) {
+    const float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0),
+    };
+    const float2 texCoords[3] = {
+        float2(0.0, 1.0),
+        float2(2.0, 1.0),
+        float2(0.0, -1.0),
+    };
+    VOut o;
+    o.position = float4(positions[vid], 0.0, 1.0);
+    o.vTexCoord = texCoords[vid];
+    return o;
+}
+
+fragment float4 postprocess_fragment(VOut in [[stage_in]],
+                                     texture2d<float> Source [[texture(0)]],
+                                     sampler SourceSampler [[sampler(0)]],
+                                     constant PostProcessUniforms& u [[buffer(0)]]) {
+    float2 uv = WarpUV(in.vTexCoord);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float rowF = uv.y * u.SourceSize.y - 0.5;
+    float row0 = floor(rowF);
+    float frac = rowF - row0;
+    float3 lineA = FetchScanline(Source, SourceSampler, u.SourceSize, uv, row0) * ScanWeight(frac);
+    float3 lineB = FetchScanline(Source, SourceSampler, u.SourceSize, uv, row0 + 1.0) * ScanWeight(frac - 1.0);
+
+    float3 color = lineA + lineB;
+    color *= PhosphorMask(in.position.xy);
+
+    return float4(LinearToSrgb(color), 1.0);
+}

@@ -95,7 +95,7 @@ std::vector<std::string> ListBuiltinPostProcessShaders() {
     // enumerated at runtime so the menu picker stays stable across
     // archive contents and so a port that ships a stripped f3d.o2r still
     // gets a usable default selection.
-    return { "scanlines" };
+    return { "scanlines", "crt-lottes" };
 }
 
 } // namespace Fast
