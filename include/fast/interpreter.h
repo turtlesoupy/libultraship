@@ -429,6 +429,26 @@ class Interpreter {
     void SetMsaaLevel(uint32_t level);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
 
+    // Port hook: when set true, AdjXForAspectRatio compresses post-projection
+    // clip-space X by (4/3) / window_aspect, expanding the visible 4:3
+    // frustum into the wider window. Refreshed per-frame by the game's port
+    // glue from a CVar; default false means non-widescreen-aware ports get
+    // exactly the prior unconditional behaviour as a no-op fallback.
+    void SetWidescreenActive(bool active) { mWidescreenActive = active; }
+
+    // Returns the same scale factor AdjXForAspectRatio applies to clip-space X.
+    // Port glue uses this to compress game-side world-to-screen projection
+    // results so HUD sprites that attach to 3D characters track them after
+    // the camera frustum widens. Returns 1.0f when widescreen is off or when
+    // the window is not wider than 4:3.
+    float GetWidescreenClipXScale() const;
+
+    // Port hook: when set true AND widescreen is active, the GPU scissor is
+    // narrowed to the original 4:3 sub-region of the wider FB. Game code
+    // flips this on for scene-specific effects whose mesh geometry would
+    // otherwise expose perspective-foreshortened slants in widescreen.
+    void SetTight4_3ScissorWindow(bool active) { mTight4_3ScissorWindow = active; }
+
     // private: TODO make these private
     void Flush();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
@@ -552,6 +572,9 @@ class Interpreter {
     // DISCARD on Windows). On macOS the same effect is achieved
     // unconditionally via the __APPLE__ guard inside that method.
     bool mForceRenderToFb{};
+    // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
+    bool mWidescreenActive{};
+    bool mTight4_3ScissorWindow{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

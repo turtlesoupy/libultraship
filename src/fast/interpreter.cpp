@@ -2343,12 +2343,38 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
     mRsp->lights_changed = true;
 }
 
+float Interpreter::GetWidescreenClipXScale() const {
+    // SSB64 port: gated on the port-managed mWidescreenActive flag (set by
+    // port/widescreen/widescreen.cpp from the gEnhancements.Widescreen CVar).
+    // When off, returns 1.0f and 4:3 GBI stretches to fill the window
+    // (matching pre-widescreen-feature behavior). When on, returns
+    // (4/3)/window_aspect so callers can compress post-projection clip-space
+    // X — expanding the visible 4:3 frustum into the wider window. Reads the
+    // OS window aspect from mGameWindowViewport rather than mCurDimensions
+    // because the latter can be forced to 4:3 by the Advanced Resolution
+    // CVar tree (which the SSB64 port also uses for the CVar-off-default 4:3
+    // pillarbox); mGameWindowViewport always reflects the actual SDL window
+    // size.
+    if (!mWidescreenActive) {
+        return 1.0f;
+    }
+    const float win_w = (float)mGameWindowViewport.width;
+    const float win_h = (float)mGameWindowViewport.height;
+    if (win_w <= 0.0f || win_h <= 0.0f) {
+        return 1.0f;
+    }
+    const float win_aspect = win_w / win_h;
+    if (win_aspect <= (4.0f / 3.0f)) {
+        return 1.0f;
+    }
+    return (4.0f / 3.0f) / win_aspect;
+}
+
 float Interpreter::AdjXForAspectRatio(float x) const {
     if (mFbActive) {
         return x;
-    } else {
-        return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
     }
+    return x * GetWidescreenClipXScale();
 }
 
 // Scale the width and height value based on the ratio of the viewport to the native size
@@ -3475,6 +3501,28 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
 
     AdjustVIewportOrScissor(&mRdp->scissor);
 
+    // SSB64 port: when the tight-4:3-scissor hook is active alongside
+    // widescreen, narrow the GPU scissor to the centered 4:3 sub-region of
+    // the wider FB. Game code flips this for scene-specific effects whose
+    // mesh geometry would otherwise show perspective slants beyond the 4:3
+    // crop (e.g. OpeningRun impact-flash starburst).
+    if (mWidescreenActive && mTight4_3ScissorWindow && !mFbActive) {
+        const float win_w = (float)mGameWindowViewport.width;
+        const float win_h = (float)mGameWindowViewport.height;
+        if (win_w > 0.0f && win_h > 0.0f) {
+            const float win_aspect = win_w / win_h;
+            const float base_aspect = 4.0f / 3.0f;
+            if (win_aspect > base_aspect) {
+                const float target_w = mRdp->scissor.height * base_aspect;
+                const float margin = (mRdp->scissor.width - target_w) * 0.5f;
+                if (margin > 0.0f) {
+                    mRdp->scissor.x += margin;
+                    mRdp->scissor.width = target_w;
+                }
+            }
+        }
+    }
+
     mRdp->viewport_or_scissor_changed = true;
 }
 
@@ -3923,8 +3971,22 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT(mActiveFrameBuffer))) + 1.0f;
 
-    ulxf = AdjXForAspectRatio(ulxf);
-    lrxf = AdjXForAspectRatio(lrxf);
+    // SSB64 port widescreen: do NOT apply the clip-x compression to
+    // TextureRectangle ops. The 3D world (Interpreter::GfxSpVertex) widens
+    // via AdjXForAspectRatio so the camera shows more world horizontally,
+    // but stage backgrounds and HUD elements are authored as full-screen
+    // 2D rects whose UV mapping is fixed to a 4:3 layout — compressing
+    // their X bounds shrinks them inward and leaves black side strips. We
+    // keep them at their authored 4:3 NDC range; the FB clear (black) fills
+    // the side strips. Bringing those into widescreen needs per-game rect
+    // anchoring (cf. SoH's GFX_DIMENSIONS_FROM_LEFT_EDGE), which is Phase 2
+    // scope.
+    if (mWidescreenActive) {
+        // Phase 1: leave rect coords at their 4:3-authored NDC values.
+    } else {
+        ulxf = AdjXForAspectRatio(ulxf);
+        lrxf = AdjXForAspectRatio(lrxf);
+    }
 
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
@@ -5166,34 +5228,6 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetdata = {};
 
-    // Catch unresolved low-32-bit pointers BEFORE handing them to the OTR
-    // signature check. SegAddr can return a raw value back — either an N64
-    // segment-encoded address whose segment isn't bound at this moment, or
-    // a stale token / chain-encoded slot value that decodes through every
-    // SegAddr branch unsuccessfully — in which case `imgData` is a low
-    // 32-bit value with no valid host-pointer mapping. Without this guard
-    // gfx_check_image_signature dereferences the bogus pointer (POSIX
-    // gfxPointerHasReadableBytes is a no-op) and segfaults.
-    //
-    // The original guard at `if (i <= 0x0FFFFFFF) return false;` below was
-    // (a) too narrow — it only covered the strict N64 segmented range,
-    // missing values like 0x3596da68 that fit no segment but are still
-    // not host-mapped — and (b) placed AFTER the OTR sig check, so the
-    // bogus pointer crash happened before the guard could fire.
-    //
-    // On 64-bit hosts every valid mmap'd pointer is above 4 GB; anything
-    // below is unresolvable. On a 32-bit host the original 256 MB N64
-    // segmented-range cap is the right threshold.
-#if UINTPTR_MAX > 0xFFFFFFFFu
-    if (i != 0 && i < 0x100000000ull) {
-        return false;
-    }
-#else
-    if (i <= 0x0FFFFFFF) {
-        return false;
-    }
-#endif
-
     if ((i & 1) != 1) {
         if (gfx_check_image_signature(imgData) == 1) {
             std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
@@ -5215,9 +5249,14 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
         }
     }
 
-    // (Earlier guard at the top of this handler already covered the
-    // unresolved-pointer case — `i` here is guaranteed to be a host-mapped
-    // address.)
+    // If the resolved address is still in the N64 segmented range, SegAddr
+    // failed to resolve it (segment not set up). Skip to avoid dereferencing
+    // invalid memory. Don't widen the cap to 4 GB on 64-bit hosts — non-PIE
+    // Linux binaries hand out valid brk-arena pointers below 4 GB, and a
+    // wider guard drops legitimate texture-set commands.
+    if (i <= 0x0FFFFFFF) {
+        return false;
+    }
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
 
@@ -6296,7 +6335,12 @@ void Interpreter::RunGuiOnly() {
     mRapi->StartDrawToFramebuffer(0, 1);
     mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6341,7 +6385,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->StartDrawToFramebuffer(0, 1);
     mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
