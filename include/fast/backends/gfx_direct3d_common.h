@@ -62,6 +62,27 @@ struct ShaderProgramD3D11 {
     bool usedTextures[SHADER_MAX_TEXTURES];
 };
 
+// Compiled post-process program. The fullscreen-triangle vertex shader
+// reads SV_VertexID only (no input layout, no vertex buffer); the pixel
+// shader samples t0 with s0 and reads PostProcessUniformsD3D11 from b0.
+struct PostProcessProgramD3D11 {
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
+    std::string name;
+};
+
+// Layout mirrors `cbuffer PostProcessUniforms` in the bundled HLSL.
+// Members are arranged so the natural HLSL packing (each row is 16
+// bytes) matches without explicit padding; if you reorder, also reorder
+// the cbuffer declaration in shaders/postprocess/*.hlsl.
+struct PostProcessUniformsD3D11 {
+    float SourceSize[2];
+    float OutputSize[2];
+    float InputSize[2];
+    int FrameCount;
+    float FrameDirection;
+};
+
 class GfxWindowBackendDXGI;
 
 class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
@@ -111,6 +132,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+
+    bool SupportsPostProcess() override;
+    int CreatePostProcessProgram(const PostProcessSource& src) override;
+    void DestroyPostProcessProgram(int progId) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -184,6 +210,15 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
 
     D3D_PRIMITIVE_TOPOLOGY mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    // Post-process programs. Empty slots have null vertex_shader and are
+    // returned to the free list when DestroyPostProcessProgram clears them.
+    std::vector<PostProcessProgramD3D11> mPostProcessPrograms;
+    // Shared sampler used by every post-process pass (linear, clamp-to-edge).
+    // Created lazily on first RunPostProcess.
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mPostProcessSampler;
+    // Constant buffer for PostProcessUniformsD3D11; created lazily.
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessCb;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,

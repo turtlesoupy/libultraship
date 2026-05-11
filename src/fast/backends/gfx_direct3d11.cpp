@@ -1599,6 +1599,213 @@ static bool CaptureBackbufferToPNG_DX11(const char* path) {
     return true;
 }
 
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+//
+// D3D11 has an immediate context model (single global pipeline state), so
+// unlike Metal there's no enqueue-order question — draw calls execute in
+// submission order. The pass binds dst's RTV, src's SRV at t0, a shared
+// linear/clamp sampler at s0, and the post-process uniforms at b0; then
+// emits a fullscreen triangle synthesized from SV_VertexID with no input
+// layout. After the draw, the regular IA/VS/PS/blend state on the
+// immediate context is dirty — the next DrawTriangles call resets every
+// piece it cares about via the existing LoadShader / mLast* tracking
+// path, so we only have to invalidate `mLastShaderProgram` and the
+// resource-view cache.
+
+bool GfxRenderingAPIDX11::SupportsPostProcess() {
+    return true;
+}
+
+int GfxRenderingAPIDX11::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.hlsl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no HLSL source. The D3D11 "
+                     "backend requires hand-authored HLSL (with vertex entry "
+                     "'VSMain' and pixel entry 'PSMain') until SPIRV-Cross "
+                     "GLSL→HLSL glue lands. See libultraship/src/fast/shaders/"
+                     "postprocess/scanlines.hlsl for the schema.",
+                     src.name);
+        return -1;
+    }
+
+#if DEBUG_D3D
+    UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    HRESULT hr = mD3dCompile(src.hlsl.data(), src.hlsl.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+                             compileFlags, 0, vsBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': VSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+    errBlob.Reset();
+    hr = mD3dCompile(src.hlsl.data(), src.hlsl.size(), nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compileFlags, 0,
+                     psBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': PSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+
+    PostProcessProgramD3D11 slot;
+    hr = mDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                     slot.vertex_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': CreateVertexShader failed (hr=0x{:08X})", src.name, (uint32_t)hr);
+        return -1;
+    }
+    hr = mDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                    slot.pixel_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': CreatePixelShader failed (hr=0x{:08X})", src.name, (uint32_t)hr);
+        return -1;
+    }
+    slot.name = src.name;
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        if (mPostProcessPrograms[i].vertex_shader.Get() == nullptr) {
+            mPostProcessPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    return (int)mPostProcessPrograms.size() - 1;
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    mPostProcessPrograms[progId] = PostProcessProgramD3D11{};
+}
+
+void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    const PostProcessProgramD3D11& slot = mPostProcessPrograms[progId];
+    if (slot.vertex_shader.Get() == nullptr) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFrameBuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& srcFbInfo = mFrameBuffers[srcFb];
+    FramebufferDX11& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.render_target_view.Get() == nullptr) {
+        return;
+    }
+    TextureData& srcTex = mTextures[srcFbInfo.texture_id];
+    TextureData& dstTex = mTextures[dstFbInfo.texture_id];
+    if (srcTex.resource_view.Get() == nullptr) {
+        // MSAA source can't be sampled; the interpreter should have resolved
+        // into a non-MSAA target before reaching this path.
+        return;
+    }
+
+    // Lazily allocate the shared sampler and uniform constant buffer.
+    if (mPostProcessSampler.Get() == nullptr) {
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sd, mPostProcessSampler.GetAddressOf()));
+    }
+    if (mPostProcessCb.Get() == nullptr) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.ByteWidth = sizeof(PostProcessUniformsD3D11);
+        // Round up to a 16-byte multiple.
+        bd.ByteWidth = (bd.ByteWidth + 15) & ~15u;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ThrowIfFailed(mDevice->CreateBuffer(&bd, nullptr, mPostProcessCb.GetAddressOf()));
+    }
+
+    PostProcessUniformsD3D11 uni{};
+    uni.SourceSize[0] = (float)params.srcWidth;
+    uni.SourceSize[1] = (float)params.srcHeight;
+    uni.OutputSize[0] = (float)params.dstWidth;
+    uni.OutputSize[1] = (float)params.dstHeight;
+    uni.InputSize[0] = uni.SourceSize[0];
+    uni.InputSize[1] = uni.SourceSize[1];
+    uni.FrameCount = (int)params.frameCount;
+    uni.FrameDirection = 1.0f;
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    ThrowIfFailed(mContext->Map(mPostProcessCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
+    memcpy(ms.pData, &uni, sizeof(uni));
+    mContext->Unmap(mPostProcessCb.Get(), 0);
+
+    // Bind destination as the sole render target, no depth.
+    ID3D11RenderTargetView* rtv = dstFbInfo.render_target_view.Get();
+    mContext->OMSetRenderTargets(1, &rtv, nullptr);
+
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)dstTex.width;
+    vp.Height = (float)dstTex.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &vp);
+
+    // Fullscreen triangle has no input data.
+    mContext->IASetInputLayout(nullptr);
+    UINT stride = 0;
+    UINT offset = 0;
+    ID3D11Buffer* nullVbo = nullptr;
+    mContext->IASetVertexBuffers(0, 1, &nullVbo, &stride, &offset);
+    mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    mContext->VSSetShader(slot.vertex_shader.Get(), nullptr, 0);
+    mContext->PSSetShader(slot.pixel_shader.Get(), nullptr, 0);
+
+    // Disable blending so the fragment's alpha=1 lands intact.
+    const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+    // No depth/stencil state needed (no DSV bound).
+
+    ID3D11ShaderResourceView* srv = srcTex.resource_view.Get();
+    mContext->PSSetShaderResources(0, 1, &srv);
+    ID3D11SamplerState* samp = mPostProcessSampler.Get();
+    mContext->PSSetSamplers(0, 1, &samp);
+    ID3D11Buffer* cb = mPostProcessCb.Get();
+    mContext->VSSetConstantBuffers(0, 1, &cb);
+    mContext->PSSetConstantBuffers(0, 1, &cb);
+
+    mContext->Draw(3, 0);
+
+    // Invalidate the per-context state caches used by the regular draw
+    // path so the next DrawTriangles call rebinds everything that matters
+    // (shader, layout, blend, SRVs at slots 0/1, primitive topology).
+    mLastShaderProgram = nullptr;
+    for (size_t i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastBlendState.Reset();
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    mLastVertexBufferStride = 0;
+
+    // Detach the SRV so the next pass that wants to render into srcFb
+    // (some other game frame) doesn't trip the "RTV-and-SRV-bound" warning.
+    ID3D11ShaderResourceView* nullSrv = nullptr;
+    mContext->PSSetShaderResources(0, 1, &nullSrv);
+}
+
 } // namespace Fast
 
 // C-callable entry point for the port. Defined outside the Fast namespace so
