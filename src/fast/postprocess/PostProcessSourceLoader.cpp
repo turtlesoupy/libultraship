@@ -9,6 +9,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "fast/postprocess/PostProcessGlslNormalizer.h"
 #include "fast/postprocess/PostProcessTranspiler.h"
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
@@ -82,7 +83,11 @@ bool LoadPostProcessShader(const std::string& name, PostProcessSource& out) {
         }
     }
     out.name = name;
-    out.glsl = std::move(glsl);
+    // Run the canonical-form normalizer so libretro single-file shaders
+    // (Texture / TextureSize / TEX0 / FragColor, combined VS+FS) load
+    // without manual adaptation. LUS-schema shaders pass through with
+    // only the `#version` line reset.
+    out.glsl = NormalizeUserGlsl(glsl);
     // Hand-written backend-specific siblings, if present, win over the
     // transpiler output (they're treated as authoritative — useful when a
     // shader author wants tighter control of the HLSL/MSL emit). If a
