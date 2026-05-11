@@ -3,11 +3,13 @@
 #include "fast/postprocess/PostProcessSourceLoader.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
 #include <spdlog/spdlog.h>
 
+#include "fast/postprocess/PostProcessTranspiler.h"
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/resource/File.h"
@@ -81,11 +83,28 @@ bool LoadPostProcessShader(const std::string& name, PostProcessSource& out) {
     }
     out.name = name;
     out.glsl = std::move(glsl);
-    // Optionally pick up hand-written backend-specific siblings. Phase 1
-    // ships these alongside the bundled builtins until SPIRV-Cross glue
-    // can synthesize them from the .glsl source.
-    TryLoadLanguage(name, "msl", out.msl);
-    TryLoadLanguage(name, "hlsl", out.hlsl);
+    // Hand-written backend-specific siblings, if present, win over the
+    // transpiler output (they're treated as authoritative — useful when a
+    // shader author wants tighter control of the HLSL/MSL emit). If a
+    // sibling is missing, SynthesizeMissing fills the slot from the GLSL.
+    //
+    // Setting LUS_FORCE_POSTPROCESS_TRANSPILE in the environment skips the
+    // sibling lookups so the transpile path always runs — handy for
+    // smoke-testing transpiler changes against the bundled builtins.
+    const bool forceTranspile = std::getenv("LUS_FORCE_POSTPROCESS_TRANSPILE") != nullptr;
+    if (!forceTranspile) {
+        TryLoadLanguage(name, "msl", out.msl);
+        TryLoadLanguage(name, "hlsl", out.hlsl);
+    }
+    if (out.hlsl.empty() || out.msl.empty()) {
+        std::string err;
+        if (!PostProcessTranspiler::SynthesizeMissing(out, err)) {
+            // Non-fatal: backends that need the missing slot will log a
+            // clearer error of their own at compile time. The OpenGL
+            // backend only consumes `out.glsl` so it stays unaffected.
+            SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", name, err);
+        }
+    }
     return true;
 }
 

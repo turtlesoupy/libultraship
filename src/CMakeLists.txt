@@ -112,6 +112,23 @@ endif()
 
 target_link_libraries(libultraship PUBLIC prism)
 
+# Post-process shader transpiler (glslang + SPIRV-Cross). Pulled in by
+# cmake/dependencies/common.cmake when LUS_ENABLE_POSTPROCESS_TRANSPILER is
+# ON (desktop default). The runtime code in src/fast/postprocess/ keys off
+# the LUS_POSTPROCESS_TRANSPILER compile def to enable the transpile path.
+if (LUS_ENABLE_POSTPROCESS_TRANSPILER)
+    target_link_libraries(libultraship PRIVATE
+        glslang
+        glslang-default-resource-limits
+        SPIRV
+        spirv-cross-core
+        spirv-cross-glsl
+        spirv-cross-hlsl
+        spirv-cross-msl
+    )
+    target_compile_definitions(libultraship PRIVATE LUS_POSTPROCESS_TRANSPILER)
+endif()
+
 #=================== Compile Options & Defs ===================
 
 target_compile_definitions(libultraship PRIVATE ${GBI_UCODE})
