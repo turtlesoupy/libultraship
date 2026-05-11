@@ -2312,36 +2312,38 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
     mRsp->lights_changed = true;
 }
 
-float Interpreter::AdjXForAspectRatio(float x) const {
-    if (mFbActive) {
-        return x;
-    }
+float Interpreter::GetWidescreenClipXScale() const {
     // SSB64 port: gated on the port-managed mWidescreenActive flag (set by
     // port/widescreen/widescreen.cpp from the gEnhancements.Widescreen CVar).
-    // When off, this is a no-op and 4:3 GBI stretches to fill the window
-    // (matching pre-widescreen-feature behavior). When on, post-projection
-    // clip-space X is compressed by (4/3)/window_aspect so the 4:3 frustum
-    // expands horizontally into the wider window — that's the only line
-    // separating "stretched 4:3" from "native widescreen" rendering.
-    //
-    // Reads the OS window aspect from mGameWindowViewport rather than
-    // mCurDimensions because the latter can be forced to 4:3 by the
-    // Advanced Resolution CVar tree (which the SSB64 port also uses for the
-    // CVar-off-default 4:3 pillarbox); mGameWindowViewport always reflects
-    // the actual SDL window size.
+    // When off, returns 1.0f and 4:3 GBI stretches to fill the window
+    // (matching pre-widescreen-feature behavior). When on, returns
+    // (4/3)/window_aspect so callers can compress post-projection clip-space
+    // X — expanding the visible 4:3 frustum into the wider window. Reads the
+    // OS window aspect from mGameWindowViewport rather than mCurDimensions
+    // because the latter can be forced to 4:3 by the Advanced Resolution
+    // CVar tree (which the SSB64 port also uses for the CVar-off-default 4:3
+    // pillarbox); mGameWindowViewport always reflects the actual SDL window
+    // size.
     if (!mWidescreenActive) {
-        return x;
+        return 1.0f;
     }
     const float win_w = (float)mGameWindowViewport.width;
     const float win_h = (float)mGameWindowViewport.height;
     if (win_w <= 0.0f || win_h <= 0.0f) {
-        return x;
+        return 1.0f;
     }
     const float win_aspect = win_w / win_h;
     if (win_aspect <= (4.0f / 3.0f)) {
+        return 1.0f;
+    }
+    return (4.0f / 3.0f) / win_aspect;
+}
+
+float Interpreter::AdjXForAspectRatio(float x) const {
+    if (mFbActive) {
         return x;
     }
-    return x * (4.0f / 3.0f) / win_aspect;
+    return x * GetWidescreenClipXScale();
 }
 
 // Scale the width and height value based on the ratio of the viewport to the native size

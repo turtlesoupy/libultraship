@@ -436,6 +436,13 @@ class Interpreter {
     // exactly the prior unconditional behaviour as a no-op fallback.
     void SetWidescreenActive(bool active) { mWidescreenActive = active; }
 
+    // Returns the same scale factor AdjXForAspectRatio applies to clip-space X.
+    // Port glue uses this to compress game-side world-to-screen projection
+    // results so HUD sprites that attach to 3D characters track them after
+    // the camera frustum widens. Returns 1.0f when widescreen is off or when
+    // the window is not wider than 4:3.
+    float GetWidescreenClipXScale() const;
+
     // Port hook: when set true AND widescreen is active, the GPU scissor is
     // narrowed to the original 4:3 sub-region of the wider FB. Game code
     // flips this on for scene-specific effects whose mesh geometry would
