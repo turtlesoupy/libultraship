@@ -9,10 +9,19 @@
 // to this work have been waived; it may be used, modified, sublicensed
 // and redistributed without restriction or attribution.
 //
+// Acknowledgment (not a legal attribution requirement — CC0 disclaims
+// attribution rights — but useful as a heritage reference): the CRT
+// emulation technique this shader implements was pioneered by Timothy
+// Lottes ("CRT Simulation in a GPU Shader," GDC 2014). His own
+// reference implementation is in the public domain. The code below is
+// an original implementation written from scratch from the published
+// technique description; it is not transcribed from Lottes's source or
+// from any of the libretro / RetroArch GPL ports that adapted his work.
+//
 // Original work for this repository, implementing the classic Lottes CRT
 // technique (per-source-row Gaussian scanline + bandlimited cosine
-// subpixel mask + gamma in/out) from the published public description;
-// no code copied from RetroArch / libretro/glsl-shaders or any GPL source.
+// subpixel mask + gamma in/out); no code copied from RetroArch /
+// libretro/glsl-shaders or any GPL source.
 //
 // No barrel warp by default. The warp's spatially-varying magnification
 // makes the scanline period in output pixels drift across the screen,

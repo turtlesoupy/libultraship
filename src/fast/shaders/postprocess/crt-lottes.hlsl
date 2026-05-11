@@ -7,8 +7,13 @@
 // to this work have been waived; it may be used, modified, sublicensed
 // and redistributed without restriction or attribution.
 //
+// The CRT emulation technique implemented here was pioneered by Timothy
+// Lottes ("CRT Simulation in a GPU Shader," GDC 2014); his reference
+// implementation is public domain. This file is an original
+// implementation, not transcribed from Lottes's source.
+//
 // Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler. See the
-// .glsl file for the technique reference and authorship note.
+// .glsl file for the full technique reference and authorship note.
 
 Texture2D Source : register(t0);
 SamplerState SourceSampler : register(s0);
