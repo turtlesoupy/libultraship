@@ -2,9 +2,17 @@
 
 // MIT-licensed Lottes-style CRT shader for the LUS post-process runtime.
 // Original work for this repository, implementing the classic Lottes CRT
-// technique (subpixel triad mask + per-row scanline falloff + optional
-// barrel warp + gamma in/out) from the published public description; no
-// code copied from RetroArch / libretro/glsl-shaders or any GPL source.
+// technique (per-source-row Gaussian scanline + bandlimited cosine
+// subpixel mask + gamma in/out) from the published public description;
+// no code copied from RetroArch / libretro/glsl-shaders or any GPL source.
+//
+// No barrel warp by default. The warp's spatially-varying magnification
+// makes the scanline period in output pixels drift across the screen,
+// which beats against the output pixel grid and produces the curved
+// moire fringes the prior revision suffered from. Anyone who wants
+// curvature on a CRT preset will need a multipass setup that integrates
+// the warp's Jacobian into the scanline kernel — out of scope for the
+// single-pass Phase 1 runtime.
 //
 // Uniform schema matches PostProcessTypes.h.
 
@@ -17,38 +25,25 @@ uniform vec2 OutputSize;
 uniform vec2 InputSize;
 uniform int FrameCount;
 
-// Curvature strength in normalized-coordinate units. 0.0 disables warp.
-// Larger values bulge the image outward more strongly at the edges.
-const vec2 kWarp = vec2(0.031, 0.041);
+// Phosphor mask strength: 0.0 disables, 1.0 = full subpixel separation.
+// Smooth cosine across three output columns. Phase-offset for R/G/B so
+// the average across the triad stays at 1.0.
+const float kMaskStrength = 0.22;
 
-// Phosphor mask strength: 1.0 = full subpixel separation (very dark
-// off-channels), 0.0 = mask disabled. Lottes original uses ~0.3 on PC,
-// higher on phone-DPI displays.
-const float kMaskStrength = 0.35;
+// Scanline base tightness. Wider/narrower gap is determined by the
+// fragment's source-row footprint at runtime (bandlimit below); this
+// value is the "fully-resolved" gaussian sharpness used when the
+// fragment covers a small fraction of a source row.
+const float kScanlineK = 5.0;
 
-// Scanline darkness profile. Lower values make scan gaps darker.
-const float kScanMin = 0.55;
+// Average-brightness gain to compensate for the scanline energy loss.
+const float kBrightnessGain = 1.25;
 
-// Working in linear light; sRGB-decode on input and re-encode on output.
-// Faster than per-pixel branchy pow() — approximate gamma 2.2 with pow.
 vec3 SrgbToLinear(vec3 c) { return pow(c, vec3(2.2)); }
 vec3 LinearToSrgb(vec3 c) { return pow(c, vec3(1.0 / 2.2)); }
 
-// Barrel distortion. Identity at uv = (0.5, 0.5); UVs near the edges get
-// pushed outward by a quadratic in distance-from-center.
-vec2 WarpUV(vec2 uv) {
-    vec2 c = uv * 2.0 - 1.0;
-    c *= 1.0 + (c.yx * c.yx) * kWarp;
-    return c * 0.5 + 0.5;
-}
-
-// Three-tap horizontal filter approximating Lottes' per-source-pixel
-// gather, weighting the nearest source column more heavily than its
-// neighbors. SourceSize.x converts UV → source columns; the integer
-// part picks the texel, fractional part drives the weight.
+// Three-tap horizontal filter.
 vec3 FetchScanline(vec2 uv, float row) {
-    // Snap UV to the row center so the same scanline is sampled
-    // regardless of where in the row the fragment lies.
     vec2 rowUv = vec2(uv.x, (row + 0.5) / SourceSize.y);
     vec2 dx = vec2(1.0 / SourceSize.x, 0.0);
     vec3 a = SrgbToLinear(texture(Source, rowUv - dx).rgb);
@@ -57,47 +52,41 @@ vec3 FetchScanline(vec2 uv, float row) {
     return (a * 0.25) + (b * 0.5) + (c * 0.25);
 }
 
-// Per-row scanline weight. `frac` is the fractional distance from the
-// row center; the cosine gives a smooth dark-band peak at frac = 0.5.
-float ScanWeight(float frac) {
-    return mix(1.0, kScanMin, 0.5 - 0.5 * cos(frac * 6.283185));
-}
-
-// Output-pixel-aligned RGB triad mask. Three columns of physical pixels
-// each emphasize one channel; the off-channels are dimmed by maskStrength.
-vec3 PhosphorMask(vec2 fragPos) {
-    float col = mod(fragPos.x, 3.0);
-    float lo = 1.0 - kMaskStrength;
-    if (col < 1.0) {
-        return vec3(1.0, lo, lo);
-    } else if (col < 2.0) {
-        return vec3(lo, 1.0, lo);
-    } else {
-        return vec3(lo, lo, 1.0);
-    }
+vec3 PhosphorMask(float fragX) {
+    float angle = fragX * (6.283185 / 3.0);
+    vec3 phase = vec3(0.0, 2.094395, 4.188790);
+    vec3 m = 0.5 + 0.5 * cos(angle - phase);
+    return mix(vec3(1.0 - kMaskStrength), vec3(1.0 + kMaskStrength), m);
 }
 
 void main() {
-    vec2 uv = WarpUV(vTexCoord);
+    vec2 uv = vTexCoord;
 
-    // Drop pixels that warp outside the [0,1] frame so the curve produces
-    // a hard mask edge instead of a stretched repeat.
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
+    float subY = uv.y * SourceSize.y;
+    float row0 = floor(subY);
+    float dA = subY - row0;
+    float dB = subY - (row0 + 1.0);
 
-    // Two adjacent source rows; blend their scanline contributions by the
-    // sub-row coordinate. Both rows are kept in linear space.
-    float rowF = uv.y * SourceSize.y - 0.5;
-    float row0 = floor(rowF);
-    float frac = rowF - row0;
-    vec3 lineA = FetchScanline(uv, row0) * ScanWeight(frac);
-    vec3 lineB = FetchScanline(uv, row0 + 1.0) * ScanWeight(frac - 1.0);
+    // Bandlimit the scanline Gaussian by the local output-pixel footprint
+    // in source rows. fwidth() gives the per-fragment rate of change of
+    // subY in screen-space units; deltaY is the box-filter width we
+    // convolve our Gaussian with. The closed-form variance of a
+    // gaussian * box approximation is sigma^2 += delta^2 / 12, which
+    // translates to an effective sharpness of
+    //   kEff = k / (1 + delta^2 * k / 6)
+    // — at fine resolution kEff -> k (sharp scanlines); at coarse
+    // resolution kEff -> 6/delta^2 (the band saturates rather than
+    // aliasing into beat fringes).
+    float deltaY = fwidth(subY);
+    float kEff = kScanlineK / (1.0 + (deltaY * deltaY) * kScanlineK / 6.0);
 
-    vec3 color = lineA + lineB;
+    float wA = exp(-(dA * dA) * kEff);
+    float wB = exp(-(dB * dB) * kEff);
 
-    color *= PhosphorMask(gl_FragCoord.xy);
+    vec3 color = FetchScanline(uv, row0) * wA
+               + FetchScanline(uv, row0 + 1.0) * wB;
+    color *= kBrightnessGain;
+    color *= PhosphorMask(gl_FragCoord.x);
 
     fragColor = vec4(LinearToSrgb(color), 1.0);
 }

@@ -1,7 +1,6 @@
 // MIT-licensed Lottes-style CRT shader (HLSL companion to crt-lottes.glsl).
-// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler that will
-// eventually synthesize HLSL from the .glsl source. See the .glsl file
-// for the technique reference and authorship note.
+// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler. See the
+// .glsl file for the technique reference and authorship note.
 
 Texture2D Source : register(t0);
 SamplerState SourceSampler : register(s0);
@@ -19,22 +18,12 @@ struct VOut {
     float2 vTexCoord : TEXCOORD0;
 };
 
-static const float2 kWarp = float2(0.031, 0.041);
-static const float kMaskStrength = 0.35;
-static const float kScanMin = 0.55;
+static const float kMaskStrength = 0.22;
+static const float kScanlineK = 5.0;
+static const float kBrightnessGain = 1.25;
 
 float3 SrgbToLinear(float3 c) { return pow(c, float3(2.2, 2.2, 2.2)); }
 float3 LinearToSrgb(float3 c) { return pow(c, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2)); }
-
-float2 WarpUV(float2 uv) {
-    float2 c = uv * 2.0 - 1.0;
-    c *= 1.0 + (c.yx * c.yx) * kWarp;
-    return c * 0.5 + 0.5;
-}
-
-float ScanWeight(float frac) {
-    return lerp(1.0, kScanMin, 0.5 - 0.5 * cos(frac * 6.283185));
-}
 
 float3 FetchScanline(float2 uv, float row) {
     float2 rowUv = float2(uv.x, (row + 0.5) / SourceSize.y);
@@ -45,16 +34,12 @@ float3 FetchScanline(float2 uv, float row) {
     return a * 0.25 + b * 0.5 + c * 0.25;
 }
 
-float3 PhosphorMask(float2 fragPos) {
-    float col = fmod(fragPos.x, 3.0);
-    float lo = 1.0 - kMaskStrength;
-    if (col < 1.0) {
-        return float3(1.0, lo, lo);
-    } else if (col < 2.0) {
-        return float3(lo, 1.0, lo);
-    } else {
-        return float3(lo, lo, 1.0);
-    }
+float3 PhosphorMask(float fragX) {
+    float angle = fragX * (6.283185 / 3.0);
+    float3 phase = float3(0.0, 2.094395, 4.188790);
+    float3 m = 0.5 + 0.5 * cos(angle - phase);
+    return lerp(float3(1.0 - kMaskStrength, 1.0 - kMaskStrength, 1.0 - kMaskStrength),
+                float3(1.0 + kMaskStrength, 1.0 + kMaskStrength, 1.0 + kMaskStrength), m);
 }
 
 VOut VSMain(uint vid : SV_VertexID) {
@@ -75,19 +60,25 @@ VOut VSMain(uint vid : SV_VertexID) {
 }
 
 float4 PSMain(VOut input) : SV_Target {
-    float2 uv = WarpUV(input.vTexCoord);
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return float4(0.0, 0.0, 0.0, 1.0);
-    }
+    float2 uv = input.vTexCoord;
 
-    float rowF = uv.y * SourceSize.y - 0.5;
-    float row0 = floor(rowF);
-    float frac = rowF - row0;
-    float3 lineA = FetchScanline(uv, row0) * ScanWeight(frac);
-    float3 lineB = FetchScanline(uv, row0 + 1.0) * ScanWeight(frac - 1.0);
+    float subY = uv.y * SourceSize.y;
+    float row0 = floor(subY);
+    float dA = subY - row0;
+    float dB = subY - (row0 + 1.0);
 
-    float3 color = lineA + lineB;
-    color *= PhosphorMask(input.position.xy);
+    // Bandlimit the scanline Gaussian by the output pixel's source-row
+    // footprint. See crt-lottes.glsl for the variance-addition derivation.
+    float deltaY = abs(ddx(subY)) + abs(ddy(subY));
+    float kEff = kScanlineK / (1.0 + (deltaY * deltaY) * kScanlineK / 6.0);
+
+    float wA = exp(-(dA * dA) * kEff);
+    float wB = exp(-(dB * dB) * kEff);
+
+    float3 color = FetchScanline(uv, row0) * wA
+                 + FetchScanline(uv, row0 + 1.0) * wB;
+    color *= kBrightnessGain;
+    color *= PhosphorMask(input.position.x);
 
     return float4(LinearToSrgb(color), 1.0);
 }
