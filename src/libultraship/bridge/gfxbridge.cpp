@@ -45,3 +45,20 @@ extern "C" void GfxSetWidescreenActive(int active) {
     }
     interp->SetWidescreenActive(active != 0);
 }
+
+extern "C" void GfxSetTight4_3ScissorWindow(int active) {
+    auto window = Ship::Context::GetInstance()->GetWindow();
+    if (window == nullptr) {
+        return;
+    }
+    auto fast3d = std::dynamic_pointer_cast<Fast::Fast3dWindow>(window);
+    if (fast3d == nullptr) {
+        return;
+    }
+    auto interp = fast3d->GetInterpreterWeak().lock();
+    if (interp == nullptr) {
+        return;
+    }
+    interp->SetTight4_3ScissorWindow(active != 0);
+}
+

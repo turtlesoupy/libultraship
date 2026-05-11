@@ -436,6 +436,12 @@ class Interpreter {
     // exactly the prior unconditional behaviour as a no-op fallback.
     void SetWidescreenActive(bool active) { mWidescreenActive = active; }
 
+    // Port hook: when set true AND widescreen is active, the GPU scissor is
+    // narrowed to the original 4:3 sub-region of the wider FB. Game code
+    // flips this on for scene-specific effects whose mesh geometry would
+    // otherwise expose perspective-foreshortened slants in widescreen.
+    void SetTight4_3ScissorWindow(bool active) { mTight4_3ScissorWindow = active; }
+
     // private: TODO make these private
     void Flush();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
@@ -560,6 +566,7 @@ class Interpreter {
     bool mForceRenderToFb{};
     // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
     bool mWidescreenActive{};
+    bool mTight4_3ScissorWindow{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

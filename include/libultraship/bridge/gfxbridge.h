@@ -17,6 +17,13 @@ uint16_t GfxGetPixelDepth(float x, float y);
 // AdjXForAspectRatio is a no-op (4:3 content stretches to fill window).
 void GfxSetWidescreenActive(int active);
 
+// SSB64 port hook: when set non-zero AND widescreen is active, the GPU
+// scissor is tightened to the original 4:3 sub-region of the wider FB.
+// Used to crop scene-specific effects whose mesh geometry exposes
+// perspective-foreshortened slants in widescreen (e.g. the OpeningRun
+// impact-flash starburst). Default 0 ⇒ no scissor narrowing.
+void GfxSetTight4_3ScissorWindow(int active);
+
 #ifdef __cplusplus
 }
 #endif

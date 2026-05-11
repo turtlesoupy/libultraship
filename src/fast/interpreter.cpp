@@ -3468,6 +3468,28 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
 
     AdjustVIewportOrScissor(&mRdp->scissor);
 
+    // SSB64 port: when the tight-4:3-scissor hook is active alongside
+    // widescreen, narrow the GPU scissor to the centered 4:3 sub-region of
+    // the wider FB. Game code flips this for scene-specific effects whose
+    // mesh geometry would otherwise show perspective slants beyond the 4:3
+    // crop (e.g. OpeningRun impact-flash starburst).
+    if (mWidescreenActive && mTight4_3ScissorWindow && !mFbActive) {
+        const float win_w = (float)mGameWindowViewport.width;
+        const float win_h = (float)mGameWindowViewport.height;
+        if (win_w > 0.0f && win_h > 0.0f) {
+            const float win_aspect = win_w / win_h;
+            const float base_aspect = 4.0f / 3.0f;
+            if (win_aspect > base_aspect) {
+                const float target_w = mRdp->scissor.height * base_aspect;
+                const float margin = (mRdp->scissor.width - target_w) * 0.5f;
+                if (margin > 0.0f) {
+                    mRdp->scissor.x += margin;
+                    mRdp->scissor.width = target_w;
+                }
+            }
+        }
+    }
+
     mRdp->viewport_or_scissor_changed = true;
 }
 
