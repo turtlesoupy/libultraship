@@ -12,8 +12,10 @@
 // implementation is public domain. This file is an original
 // implementation, not transcribed from Lottes's source.
 //
-// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler. See the
-// .glsl file for the full technique reference and authorship note.
+// Hand-tuned HLSL companion that takes priority over the transpiled
+// output PostProcessTranspiler would otherwise synthesize from
+// crt-lottes.glsl. See the .glsl file for the full technique reference
+// and authorship note.
 
 Texture2D Source : register(t0);
 SamplerState SourceSampler : register(s0);

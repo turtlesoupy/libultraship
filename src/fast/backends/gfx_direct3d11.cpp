@@ -1621,11 +1621,9 @@ bool GfxRenderingAPIDX11::SupportsPostProcess() {
 
 int GfxRenderingAPIDX11::CreatePostProcessProgram(const PostProcessSource& src) {
     if (src.hlsl.empty()) {
-        SPDLOG_ERROR("Post-process shader '{}' has no HLSL source. The D3D11 "
-                     "backend requires hand-authored HLSL (with vertex entry "
-                     "'VSMain' and pixel entry 'PSMain') until SPIRV-Cross "
-                     "GLSL→HLSL glue lands. See libultraship/src/fast/shaders/"
-                     "postprocess/scanlines.hlsl for the schema.",
+        SPDLOG_ERROR("Post-process shader '{}' has no HLSL source. The .glsl "
+                     "should have been transpiled by PostProcessTranspiler "
+                     "at load time — check earlier log for the parse error.",
                      src.name);
         return -1;
     }

@@ -12,8 +12,10 @@
 // implementation is public domain. This file is an original
 // implementation, not transcribed from Lottes's source.
 //
-// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler. See the
-// .glsl file for the full technique reference and authorship note.
+// Hand-tuned MSL companion that takes priority over the transpiled
+// output PostProcessTranspiler would otherwise synthesize from
+// crt-lottes.glsl. See the .glsl file for the full technique reference
+// and authorship note.
 
 #include <metal_stdlib>
 using namespace metal;

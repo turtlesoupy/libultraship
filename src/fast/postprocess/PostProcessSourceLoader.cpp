@@ -3,7 +3,6 @@
 #include "fast/postprocess/PostProcessSourceLoader.h"
 
 #include <cstddef>
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -88,19 +87,13 @@ bool LoadPostProcessShader(const std::string& name, PostProcessSource& out) {
     // without manual adaptation. LUS-schema shaders pass through with
     // only the `#version` line reset.
     out.glsl = NormalizeUserGlsl(glsl);
-    // Hand-written backend-specific siblings, if present, win over the
-    // transpiler output (they're treated as authoritative — useful when a
-    // shader author wants tighter control of the HLSL/MSL emit). If a
-    // sibling is missing, SynthesizeMissing fills the slot from the GLSL.
-    //
-    // Setting LUS_FORCE_POSTPROCESS_TRANSPILE in the environment skips the
-    // sibling lookups so the transpile path always runs — handy for
-    // smoke-testing transpiler changes against the bundled builtins.
-    const bool forceTranspile = std::getenv("LUS_FORCE_POSTPROCESS_TRANSPILE") != nullptr;
-    if (!forceTranspile) {
-        TryLoadLanguage(name, "msl", out.msl);
-        TryLoadLanguage(name, "hlsl", out.hlsl);
-    }
+    // Hand-tuned backend-specific siblings, if present, win over the
+    // transpiler output. Authors who want tighter control over the HLSL
+    // or MSL emit (precision, sampler semantics, etc.) drop a `<name>.hlsl`
+    // / `<name>.msl` next to the `.glsl`; missing slots fall through to
+    // PostProcessTranspiler::SynthesizeMissing below.
+    TryLoadLanguage(name, "msl", out.msl);
+    TryLoadLanguage(name, "hlsl", out.hlsl);
     if (out.hlsl.empty() || out.msl.empty()) {
         std::string err;
         if (!PostProcessTranspiler::SynthesizeMissing(out, err)) {

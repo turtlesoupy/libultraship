@@ -7,9 +7,10 @@
 // to this work have been waived; it may be used, modified, sublicensed
 // and redistributed without restriction or attribution.
 //
-// Hand-authored Phase 1 stand-in for the SPIRV-Cross transpiler that will
-// eventually synthesize HLSL from the .glsl source. Keeps the bundled
-// builtin usable on Windows / D3D11 before the transpiler lands.
+// Hand-tuned HLSL companion that takes priority over the transpiled
+// output PostProcessTranspiler would otherwise synthesize from
+// scanlines.glsl. Kept in tree so the bundled built-in matches what
+// shipped in earlier Phase 1 builds byte-for-byte.
 //
 // Vertex entry: VSMain (uses SV_VertexID only — no input layout)
 // Pixel entry:  PSMain

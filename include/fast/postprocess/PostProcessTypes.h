@@ -27,17 +27,17 @@ struct PostProcessParams {
 
 // Per-backend source text for a single fragment-shader pass.
 //
-// The core layer (PostProcessSourceLoader, to land in a follow-up commit
-// alongside the SPIRV-Cross transpiler) populates whichever language
-// strings are needed for the active backend. Phase 1 ships only `glsl`
-// populated; `hlsl` and `msl` are reserved fields that backends ignore
-// when empty so the SPIRV-Cross transpiler can drop in later without
-// reshaping this struct.
+// PostProcessSourceLoader populates `glsl` from a `<name>.glsl` on disk
+// (or in f3d.o2r), then either copies hand-tuned `<name>.hlsl` /
+// `<name>.msl` siblings into the matching slots or hands off to
+// PostProcessTranspiler::SynthesizeMissing to fill them from `glsl`.
+// Backends consume the slot matching their target API and ignore the
+// others.
 struct PostProcessSource {
     std::string name; // Diagnostic label (typically the shader filename).
     std::string glsl; // GLSL 330 core fragment-shader source.
-    std::string hlsl; // HLSL SM 5.0 fragment-shader source. May be empty.
-    std::string msl;  // MSL 2.2 fragment-shader source. May be empty.
+    std::string hlsl; // HLSL SM 5.0 fragment-shader source.
+    std::string msl;  // MSL 2.2 fragment-shader source.
 };
 
 } // namespace Fast

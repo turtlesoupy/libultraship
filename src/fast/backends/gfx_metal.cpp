@@ -1309,12 +1309,9 @@ bool GfxRenderingAPIMetal::SupportsPostProcess() {
 
 int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src) {
     if (src.msl.empty()) {
-        SPDLOG_ERROR("Post-process shader '{}' has no MSL source. The Metal "
-                     "backend requires hand-authored MSL (with vertex entry "
-                     "'postprocess_vertex' and fragment entry "
-                     "'postprocess_fragment') until SPIRV-Cross GLSL→MSL "
-                     "glue lands. See libultraship/src/fast/shaders/"
-                     "postprocess/scanlines.msl for the schema.",
+        SPDLOG_ERROR("Post-process shader '{}' has no MSL source. The .glsl "
+                     "should have been transpiled by PostProcessTranspiler "
+                     "at load time — check earlier log for the parse error.",
                      src.name);
         return -1;
     }
