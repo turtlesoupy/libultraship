@@ -636,6 +636,57 @@ void GfxRenderingAPIMetal::EndFrame() {
 void GfxRenderingAPIMetal::FinishRender() {
 }
 
+void GfxRenderingAPIMetal::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& fb = mFramebuffers[fbId];
+    if (fb.mTextureId == UINT32_MAX) {
+        return; // Already destroyed.
+    }
+    if (fb.mDepthTexture != nullptr) {
+        fb.mDepthTexture->release();
+        fb.mDepthTexture = nullptr;
+    }
+    if (fb.mMsaaDepthTexture != nullptr) {
+        fb.mMsaaDepthTexture->release();
+        fb.mMsaaDepthTexture = nullptr;
+    }
+    // The color attachment lives in mTextures[mTextureId]; release the
+    // MTL::Texture so its GPU memory frees. Metal's command buffer /
+    // render pass / encoder objects are autoreleased pool-managed, so
+    // dropping our pointers is sufficient.
+    if (fb.mTextureId < mTextures.size()) {
+        TextureDataMetal& tex = mTextures[fb.mTextureId];
+        if (tex.texture != nullptr) {
+            tex.texture->release();
+            tex.texture = nullptr;
+        }
+        if (tex.msaaTexture != nullptr) {
+            tex.msaaTexture->release();
+            tex.msaaTexture = nullptr;
+        }
+        if (tex.sampler != nullptr) {
+            tex.sampler->release();
+            tex.sampler = nullptr;
+        }
+        tex.width = 0;
+        tex.height = 0;
+    }
+    delete fb.mScissorRect;
+    fb.mScissorRect = nullptr;
+    delete fb.mViewport;
+    fb.mViewport = nullptr;
+    fb.mCommandBuffer = nullptr;
+    fb.mRenderPassDescriptor = nullptr;
+    fb.mCommandEncoder = nullptr;
+    fb.mLastShaderProgram = nullptr;
+    fb.mHasDepthBuffer = false;
+    fb.mMsaaLevel = 0;
+    fb.mRenderTarget = false;
+    fb.mTextureId = UINT32_MAX;
+}
+
 int GfxRenderingAPIMetal::CreateFramebuffer() {
     uint32_t texture_id = NewTexture();
     TextureDataMetal& t = mTextures[texture_id];

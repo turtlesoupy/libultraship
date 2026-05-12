@@ -839,6 +839,33 @@ int GfxRenderingAPIDX11::CreateFramebuffer() {
     return (int)index;
 }
 
+void GfxRenderingAPIDX11::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& fb = mFrameBuffers[fbId];
+    // .Reset() on the ComPtrs drops our refcount; D3D11 frees the
+    // underlying object when no more views reference it.
+    fb.render_target_view.Reset();
+    fb.depth_stencil_view.Reset();
+    fb.depth_stencil_srv.Reset();
+    // The color attachment lives in mTextures[fb.texture_id]; clear it
+    // too so the GPU memory frees with the rest of the slot. The
+    // texture_id slot itself stays tombstoned — D3D11's NewTexture() is
+    // monotonic and slot reuse isn't worth adding for the bookkeeping
+    // saving.
+    if (fb.texture_id < mTextures.size()) {
+        TextureData& tex = mTextures[fb.texture_id];
+        tex.texture.Reset();
+        tex.resource_view.Reset();
+        tex.sampler_state.Reset();
+        tex.width = 0;
+        tex.height = 0;
+    }
+    fb.has_depth_buffer = false;
+    fb.msaa_level = 0;
+}
+
 void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                       bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                       bool can_extract_depth) {

@@ -55,6 +55,16 @@ class GfxRenderingAPI {
     virtual void EndFrame() = 0;
     virtual void FinishRender() = 0;
     virtual int CreateFramebuffer() = 0;
+    // Release the backend resources backing `fbId` (color texture, depth
+    // attachment, RTV, etc.) and mark the slot reusable so a later
+    // CreateFramebuffer can return the same id. Calling Destroy on -1,
+    // an out-of-range id, or an already-destroyed id is a no-op. The
+    // default empty body keeps backends that haven't overridden it
+    // source-compatible — they just leak, which matches the prior
+    // behaviour of every backend before this hook existed.
+    virtual void DestroyFramebuffer(int fbId) {
+        (void)fbId;
+    }
     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                              bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                              bool can_extract_depth) = 0;

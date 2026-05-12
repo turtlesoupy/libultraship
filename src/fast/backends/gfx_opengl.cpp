@@ -786,6 +786,43 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     return i;
 }
 
+void GfxRenderingAPIOGL::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferOGL& fb = mFrameBuffers[fbId];
+    if (fb.fbo == 0 && fb.clrbuf == 0 && fb.clrbufMsaa == 0 && fb.rbo == 0) {
+        return; // Already destroyed.
+    }
+    if (fb.fbo != 0) {
+        glDeleteFramebuffers(1, &fb.fbo);
+    }
+    if (fb.clrbuf != 0) {
+        glDeleteTextures(1, &fb.clrbuf);
+        // Drop the matching entry in our textures table; SelectTextureFb
+        // never references this id again because the chain releases the
+        // FBO before it could be sampled.
+        if ((size_t)fb.clrbuf < textures.size()) {
+            textures[fb.clrbuf].width = 0;
+            textures[fb.clrbuf].height = 0;
+        }
+    }
+    if (fb.clrbufMsaa != 0) {
+        glDeleteRenderbuffers(1, &fb.clrbufMsaa);
+    }
+    if (fb.rbo != 0) {
+        glDeleteRenderbuffers(1, &fb.rbo);
+    }
+    fb.fbo = 0;
+    fb.clrbuf = 0;
+    fb.clrbufMsaa = 0;
+    fb.rbo = 0;
+    fb.width = 0;
+    fb.height = 0;
+    fb.has_depth_buffer = false;
+    fb.msaa_level = 0;
+}
+
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                      bool can_extract_depth) {
