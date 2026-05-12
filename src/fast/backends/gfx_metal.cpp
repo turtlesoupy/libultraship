@@ -1487,7 +1487,7 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, cons
     PostProcessUniformsMetal uni{};
     uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
     uni.outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
-    uni.inputSize = uni.sourceSize;
+    uni.inputSize = simd::float2{ (float)params.inputWidth, (float)params.inputHeight };
     uni.frameCount = (int)params.frameCount;
     uni.frameDirection = 1.0f;
     enc->setFragmentBytes(&uni, sizeof(uni), 0);

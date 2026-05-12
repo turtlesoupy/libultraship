@@ -1738,8 +1738,8 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, const
     uni.SourceSize[1] = (float)params.srcHeight;
     uni.OutputSize[0] = (float)params.dstWidth;
     uni.OutputSize[1] = (float)params.dstHeight;
-    uni.InputSize[0] = uni.SourceSize[0];
-    uni.InputSize[1] = uni.SourceSize[1];
+    uni.InputSize[0] = (float)params.inputWidth;
+    uni.InputSize[1] = (float)params.inputHeight;
     uni.FrameCount = (int)params.frameCount;
     uni.FrameDirection = 1.0f;
     D3D11_MAPPED_SUBRESOURCE ms{};

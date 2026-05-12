@@ -1096,7 +1096,7 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, const 
         glUniform2f(slot.sourceSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
     }
     if (slot.inputSizeLocation >= 0) {
-        glUniform2f(slot.inputSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
+        glUniform2f(slot.inputSizeLocation, (float)params.inputWidth, (float)params.inputHeight);
     }
     if (slot.outputSizeLocation >= 0) {
         glUniform2f(slot.outputSizeLocation, (float)params.dstWidth, (float)params.dstHeight);

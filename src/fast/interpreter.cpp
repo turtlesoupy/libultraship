@@ -6496,6 +6496,12 @@ void Interpreter::ComposeFinalFrame() {
         PostProcessParams params{};
         params.srcWidth = mCurDimensions.width;
         params.srcHeight = mCurDimensions.height;
+        // The video signal the game itself targets is N64 320x240
+        // (mNativeDimensions). Per-source-row CRT shaders use the
+        // source/input ratio to space scanlines correctly relative to
+        // game pixels rather than output pixels.
+        params.inputWidth = mNativeDimensions.width;
+        params.inputHeight = mNativeDimensions.height;
         params.dstWidth = mGfxCurrentWindowDimensions.width;
         params.dstHeight = mGfxCurrentWindowDimensions.height;
         params.frameCount = mFrameCounter++;
