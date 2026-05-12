@@ -44,11 +44,19 @@ constexpr const char* kSchemaLineStarts[] = {
 //   set=0, binding=0 — sampler2D Source   (previous-pass output)
 //   set=0, binding=1 — sampler2D Original (game FB, multipass-only)
 //   set=0, binding=2 — PostProcessUniforms UBO
+//   set=0, binding=3+ — per-alias / external-texture sampler2D
 // Sampler bindings 0/1 map directly to t0/s0 + t1/s1 (HLSL) and
 // texture(0)/sampler(0) + texture(1)/sampler(1) (MSL); the UBO maps
 // to b0 / buffer(0) after explicit remapping in the per-language
 // compile steps below.
-constexpr const char* kInjectedDeclarations =
+//
+// The UBO's tail varies per pass: each alias / external-texture name
+// gets an appended `vec2 <name>Size` slot in declaration order. The
+// C++ runtime structs in each backend mirror this layout (std140
+// places vec2 at offset that's a multiple of 8), so a backend that
+// writes `<name>Size` at offset 40 + 8*i ends up populating the slot
+// SPIRV-Cross emitted at the same byte offset.
+constexpr const char* kInjectedHeader =
     "layout(set=0, binding=0) uniform sampler2D Source;\n"
     "layout(set=0, binding=1) uniform sampler2D Original;\n"
     "layout(set=0, binding=2, std140) uniform PostProcessUniforms {\n"
@@ -57,10 +65,33 @@ constexpr const char* kInjectedDeclarations =
     "    vec2 InputSize;\n"
     "    vec2 OriginalSize;\n"
     "    int  FrameCount;\n"
-    "    float FrameDirection;\n"
+    "    float FrameDirection;\n";
+
+constexpr const char* kInjectedFooter =
     "};\n"
     "layout(location=0) in vec2 vTexCoord;\n"
     "layout(location=0) out vec4 fragColor;\n";
+
+// Build the Vulkan-flavored preamble. The injected UBO block is closed
+// after appending one `vec2 <alias>Size` member per alias name, so the
+// transpiled HLSL / MSL output reserves the matching trailing bytes
+// at the same std140-derived offsets the backends write.
+std::string BuildInjectedDeclarations(const std::vector<std::string>& aliasNames) {
+    std::string out;
+    out.reserve(std::strlen(kInjectedHeader) + std::strlen(kInjectedFooter) +
+                aliasNames.size() * 24);
+    out += kInjectedHeader;
+    for (const std::string& alias : aliasNames) {
+        if (alias.empty()) {
+            continue;
+        }
+        out += "    vec2 ";
+        out += alias;
+        out += "Size;\n";
+    }
+    out += kInjectedFooter;
+    return out;
+}
 
 bool LineStartMatchesSchema(const std::string& trimmed) {
     for (const char* prefix : kSchemaLineStarts) {
@@ -82,36 +113,57 @@ bool LineStartMatchesSchema(const std::string& trimmed) {
     return false;
 }
 
-// Strip the user's `uniform sampler2D <alias>` declaration — the
-// Vulkan-flavored preamble injects a binding-explicit version. Only
-// looks at lines starting with `uniform`; ignores `<alias>Size` (not
-// in scope for Phase 2H).
+// Strip the user's `uniform sampler2D <alias>` and `uniform vec2
+// <alias>Size` declarations — the Vulkan-flavored preamble injects
+// binding-explicit + UBO-block versions of both. Only inspects lines
+// starting with `uniform`.
 bool LineStartMatchesAlias(const std::string& trimmed,
                            const std::vector<std::string>& aliasNames) {
     if (aliasNames.empty()) {
         return false;
     }
-    static constexpr const char* kPrefix = "uniform sampler2D ";
-    constexpr size_t kPrefixLen = 18; // strlen("uniform sampler2D ")
-    if (trimmed.size() <= kPrefixLen || trimmed.compare(0, kPrefixLen, kPrefix) != 0) {
-        return false;
-    }
-    // After the prefix, expect the alias name as the next identifier
-    // followed by ` ` / `;` / `=`.
-    for (const std::string& alias : aliasNames) {
-        if (alias.empty() || trimmed.size() < kPrefixLen + alias.size()) {
-            continue;
+    constexpr const char* kSamplerPrefix = "uniform sampler2D ";
+    constexpr size_t kSamplerPrefixLen = 18; // strlen("uniform sampler2D ")
+    constexpr const char* kVec2Prefix = "uniform vec2 ";
+    constexpr size_t kVec2PrefixLen = 13; // strlen("uniform vec2 ")
+
+    auto matchAfterPrefix = [&](size_t prefixLen, const std::string& ident) -> bool {
+        if (trimmed.size() < prefixLen + ident.size()) {
+            return false;
         }
-        if (trimmed.compare(kPrefixLen, alias.size(), alias) != 0) {
-            continue;
+        if (trimmed.compare(prefixLen, ident.size(), ident) != 0) {
+            return false;
         }
-        const size_t end = kPrefixLen + alias.size();
+        const size_t end = prefixLen + ident.size();
         if (end == trimmed.size()) {
             return true;
         }
         const char c = trimmed[end];
-        if (c == ' ' || c == '\t' || c == ';' || c == '=') {
-            return true;
+        return c == ' ' || c == '\t' || c == ';' || c == '=';
+    };
+
+    if (trimmed.size() > kSamplerPrefixLen &&
+        trimmed.compare(0, kSamplerPrefixLen, kSamplerPrefix) == 0) {
+        for (const std::string& alias : aliasNames) {
+            if (alias.empty()) {
+                continue;
+            }
+            if (matchAfterPrefix(kSamplerPrefixLen, alias)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (trimmed.size() > kVec2PrefixLen &&
+        trimmed.compare(0, kVec2PrefixLen, kVec2Prefix) == 0) {
+        for (const std::string& alias : aliasNames) {
+            if (alias.empty()) {
+                continue;
+            }
+            const std::string sizeIdent = alias + "Size";
+            if (matchAfterPrefix(kVec2PrefixLen, sizeIdent)) {
+                return true;
+            }
         }
     }
     return false;
@@ -144,7 +196,7 @@ std::string PreprocessForVulkan(const std::string& src,
     std::string out;
     out.reserve(src.size() + 512);
     out += "#version 450\n";
-    out += kInjectedDeclarations;
+    out += BuildInjectedDeclarations(aliasNames);
     // Per-alias binding-explicit sampler declarations at slots 3, 4, ...
     // (Source=0, Original=1, PostProcessUniforms=2, aliases=3+).
     for (size_t i = 0; i < aliasNames.size(); ++i) {

@@ -88,12 +88,13 @@ constexpr const char* kSchemaIdentifiers[] = {
     "Original", "OriginalSize",
 };
 
-// Per-alias check: strip the user's `uniform sampler2D <alias>`
-// declarations so the preamble's canonical, binding-explicit version
-// doesn't collide. `<alias>Size` uniforms are NOT in scope for Phase
-// 2H — shaders that reference them currently see zero on HLSL/MSL.
-// Use `textureSize(<alias>, 0)` instead until a later phase plumbs
-// alias-size members through the runtime UBO.
+// Per-alias check: strip the user's `uniform sampler2D <alias>` and
+// `uniform vec2 <alias>Size` declarations so the preamble's
+// canonical, binding-explicit versions don't collide. The preamble
+// injects both the sampler and the matching `<alias>Size` vec2 for
+// every alias / external-texture name — chain-side bookkeeping
+// populates them from PostProcessExtraBinding::{width,height} every
+// frame.
 bool IsAliasDeclarationLine(const std::string& line, const std::vector<std::string>& aliases) {
     if (!LineStartsWithKeyword(line, "uniform")) {
         return false;
@@ -103,6 +104,14 @@ bool IsAliasDeclarationLine(const std::string& line, const std::vector<std::stri
             continue;
         }
         if (LineHasIdentifier(line, a.c_str())) {
+            return true;
+        }
+        // `<alias>Size` would not whole-word match `<alias>` (the
+        // trailing 'S' is an id-char), so check the size identifier
+        // explicitly to catch user declarations like
+        // `uniform vec2 MyAliasSize;`.
+        const std::string sizeName = a + "Size";
+        if (LineHasIdentifier(line, sizeName.c_str())) {
             return true;
         }
     }
@@ -271,11 +280,16 @@ std::string NormalizeUserGlsl(const std::string& src,
     normalized += kPreamble;
     // Append per-alias sampler declarations after the canonical
     // preamble so they share the schema's strip / re-inject contract.
-    // Names come from the .glslp `aliasN` keys via the chain, in
+    // Names come from the .glslp `aliasN` keys (plus any
+    // `textures = "..."` external-texture names) via the chain, in
     // declaration order — slot binding (2 + i) follows the same
     // ordering, so the transpiler can match without an out-of-band
-    // sync. `<alias>Size` is intentionally NOT declared; see the
-    // limitation comment on IsAliasDeclarationLine.
+    // sync. The matching `<alias>Size` vec2 is emitted alongside the
+    // sampler so shaders that read filtered dimensions (libretro
+    // multipass / lookup-texture shaders) see real values; the
+    // transpiler appends the same names to the UBO block, and the
+    // backends populate them from PostProcessExtraBinding::{width,
+    // height} each frame.
     for (const std::string& alias : aliasNames) {
         if (alias.empty()) {
             continue;
@@ -283,6 +297,9 @@ std::string NormalizeUserGlsl(const std::string& src,
         normalized += "uniform sampler2D ";
         normalized += alias;
         normalized += ";\n";
+        normalized += "uniform vec2 ";
+        normalized += alias;
+        normalized += "Size;\n";
     }
     for (const auto& l : out) {
         normalized += l;

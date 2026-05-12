@@ -1706,6 +1706,7 @@ int GfxRenderingAPIDX11::CreatePostProcessProgram(const PostProcessSource& src) 
         return -1;
     }
     slot.name = src.name;
+    slot.aliasCount = static_cast<uint32_t>(src.aliasNames.size());
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
         if (mPostProcessPrograms[i].vertex_shader.Get() == nullptr) {
@@ -1802,17 +1803,22 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
         return;
     }
 
-    // Lazily allocate the uniform constant buffer. Samplers are looked
-    // up per-call from the (filter, wrap) cache below.
-    if (mPostProcessCb.Get() == nullptr) {
+    // Required cbuffer size: 40-byte prefix + 8 bytes per alias /
+    // external-texture `vec2 <name>Size` slot, padded to a multiple of
+    // 16 for D3D11 alignment. Grow mPostProcessCb on demand if the
+    // current shader needs a larger buffer than the last one.
+    const size_t aliasBytes = (size_t)slot.aliasCount * kPostProcessUniformsAliasStride;
+    const size_t neededBytes =
+        (kPostProcessUniformsPrefixBytes + aliasBytes + 15) & ~15u;
+    if (mPostProcessCb.Get() == nullptr || mPostProcessCbBytes < neededBytes) {
+        mPostProcessCb.Reset();
         D3D11_BUFFER_DESC bd = {};
         bd.Usage = D3D11_USAGE_DYNAMIC;
-        bd.ByteWidth = sizeof(PostProcessUniformsD3D11);
-        // Round up to a 16-byte multiple.
-        bd.ByteWidth = (bd.ByteWidth + 15) & ~15u;
+        bd.ByteWidth = (UINT)neededBytes;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         ThrowIfFailed(mDevice->CreateBuffer(&bd, nullptr, mPostProcessCb.GetAddressOf()));
+        mPostProcessCbBytes = neededBytes;
     }
 
     PostProcessUniformsD3D11 uni{};
@@ -1828,7 +1834,27 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     uni.FrameDirection = 1.0f;
     D3D11_MAPPED_SUBRESOURCE ms{};
     ThrowIfFailed(mContext->Map(mPostProcessCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
-    memcpy(ms.pData, &uni, sizeof(uni));
+    auto* dst = static_cast<uint8_t*>(ms.pData);
+    std::memset(dst, 0, neededBytes);
+    std::memcpy(dst, &uni, sizeof(uni));
+    // Append each alias / external-texture `<name>Size` at the std140
+    // offset matching the transpiled cbuffer's tail. extraBindings[i]
+    // shares the same i-th order the transpiler used; if extraBindings
+    // is missing an entry for any reason, leave that slot at 1x1
+    // (already memset to 0; bump to 1 below so divisions don't NaN).
+    for (uint32_t i = 0; i < slot.aliasCount; ++i) {
+        float w = 1.0f;
+        float h = 1.0f;
+        if (i < params.extraBindingsCount) {
+            const auto& eb = params.extraBindings[i];
+            w = (float)eb.width;
+            h = (float)eb.height;
+        }
+        float* slotPtr = reinterpret_cast<float*>(
+            dst + kPostProcessUniformsPrefixBytes + (size_t)i * kPostProcessUniformsAliasStride);
+        slotPtr[0] = w;
+        slotPtr[1] = h;
+    }
     mContext->Unmap(mPostProcessCb.Get(), 0);
 
     // Bind destination as the sole render target, no depth.

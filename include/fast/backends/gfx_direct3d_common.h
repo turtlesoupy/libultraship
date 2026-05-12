@@ -77,16 +77,27 @@ struct PostProcessProgramD3D11 {
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
     std::string name;
+    // Number of trailing alias / external-texture `vec2 <name>Size`
+    // members the transpiled cbuffer reserves for this program (same
+    // as PostProcessSource::aliasNames.size()). The runtime cbuffer
+    // upload writes the prefix struct then `aliasCount` vec2s, then
+    // pads to a multiple of 16 for D3D11 buffer alignment.
+    uint32_t aliasCount = 0;
 };
 
-// Layout mirrors `cbuffer PostProcessUniforms` emitted by the
-// transpiler from the normalizer's injected schema declaration.
-// Members are arranged so the natural HLSL packing (each row is 16
-// bytes) matches without explicit padding. The bundled hand-written
-// HLSL companions (scanlines.hlsl / crt-lottes.hlsl) declare a
-// shorter cbuffer (no OriginalSize) — D3D11 ignores the extra bytes
-// written by the runtime, so the two layouts coexist as long as
-// hand-written shaders only read the prefix they declared.
+// Layout mirrors the fixed prefix of `cbuffer PostProcessUniforms`
+// emitted by the transpiler. The bundled hand-written HLSL
+// companions (scanlines.hlsl / crt-lottes.hlsl) declare a shorter
+// cbuffer (no OriginalSize) — D3D11 ignores the extra bytes written
+// by the runtime, so the two layouts coexist as long as hand-written
+// shaders only read the prefix they declared.
+//
+// Phase 2.1 adds a variable-length tail: each alias / external-
+// texture name appends a `float2 <name>Size` slot starting at offset
+// `kPostProcessUniformsPrefixBytes`, in std140-derived layout (each
+// vec2 is 8 bytes, naturally aligned). The fixed prefix size is 40;
+// the cbuffer total is rounded up to a multiple of 16 at allocation
+// time. See gfx_direct3d11.cpp::RunPostProcess for the writer.
 struct PostProcessUniformsD3D11 {
     float SourceSize[2];     // row 0.xy
     float OutputSize[2];     // row 0.zw
@@ -95,6 +106,8 @@ struct PostProcessUniformsD3D11 {
     int FrameCount;          // row 2.x
     float FrameDirection;    // row 2.y
 };
+static constexpr size_t kPostProcessUniformsPrefixBytes = 40;
+static constexpr size_t kPostProcessUniformsAliasStride = 8; // vec2 in std140
 
 class GfxWindowBackendDXGI;
 
@@ -241,6 +254,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         mPostProcessSamplers;
     // Constant buffer for PostProcessUniformsD3D11; created lazily.
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessCb;
+    // Current allocation size of mPostProcessCb. Resized when a
+    // program with more alias slots than the previous one runs (see
+    // gfx_direct3d11.cpp::RunPostProcess for the growth path).
+    size_t mPostProcessCbBytes = 0;
 
     // Static textures uploaded for libretro `.glslp` external
     // `textures = "..."` entries. Index returned by

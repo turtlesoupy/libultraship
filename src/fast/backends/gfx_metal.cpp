@@ -1776,14 +1776,37 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         enc->setFragmentSamplerState(s, slot);
     }
 
-    PostProcessUniformsMetal uni{};
-    uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
-    uni.outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
-    uni.inputSize = simd::float2{ (float)params.inputWidth, (float)params.inputHeight };
-    uni.originalSize = simd::float2{ (float)params.originalWidth, (float)params.originalHeight };
-    uni.frameCount = (int)params.frameCount;
-    uni.frameDirection = 1.0f;
-    enc->setFragmentBytes(&uni, sizeof(uni), 0);
+    // Pack the per-frame uniforms followed by the per-pass alias /
+    // external-texture `vec2 <name>Size` slots. The shader's MSL
+    // `PostProcessUniforms` struct (transpiled by SPIRV-Cross from
+    // the GLSL UBO block) lays the trailing vec2s at offsets
+    // 40, 48, 56, ... matching std140; we push exactly those bytes
+    // into Metal's argument buffer via setFragmentBytes. Total size
+    // is padded to a multiple of 16 to match the D3D11 cbuffer rule
+    // — Metal accepts any size, but the alignment keeps the layout
+    // identical across backends.
+    constexpr size_t kPrefixBytes = sizeof(PostProcessUniformsMetal);
+    static_assert(kPrefixBytes == 40, "PostProcessUniformsMetal must stay 40 bytes");
+    constexpr size_t kAliasStrideBytes = sizeof(simd::float2);
+    static_assert(kAliasStrideBytes == 8, "simd::float2 must be 8 bytes for the alias UBO tail");
+    const size_t aliasBytes = params.extraBindingsCount * kAliasStrideBytes;
+    const size_t totalBytes = (kPrefixBytes + aliasBytes + 15) & ~15u;
+
+    std::vector<uint8_t> uboBytes(totalBytes, 0);
+    PostProcessUniformsMetal* uni = reinterpret_cast<PostProcessUniformsMetal*>(uboBytes.data());
+    uni->sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
+    uni->outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
+    uni->inputSize = simd::float2{ (float)params.inputWidth, (float)params.inputHeight };
+    uni->originalSize = simd::float2{ (float)params.originalWidth, (float)params.originalHeight };
+    uni->frameCount = (int)params.frameCount;
+    uni->frameDirection = 1.0f;
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        simd::float2* slotPtr = reinterpret_cast<simd::float2*>(
+            uboBytes.data() + kPrefixBytes + i * kAliasStrideBytes);
+        *slotPtr = simd::float2{ (float)eb.width, (float)eb.height };
+    }
+    enc->setFragmentBytes(uboBytes.data(), totalBytes, 0);
 
     enc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
     enc->endEncoding();

@@ -255,6 +255,79 @@ void main() {
     EXPECT_NE(src.msl.find("[[texture(2)]]"), std::string::npos);
 }
 
+// Phase 2.1: every alias gets a matching `vec2 <name>Size` uniform
+// declaration in the normalized GLSL, AND a corresponding member at
+// the tail of the transpiled UBO. The runtime backends populate
+// these from PostProcessExtraBinding::{width,height} per frame.
+TEST(PostProcessTranspiler, EmitsAliasSizeUniforms) {
+    constexpr const char* kSrc = R"(#version 330 core
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D Source;
+uniform sampler2D LinearizePass;
+void main() {
+    // Reference the alias's size so the optimizer can't strip it.
+    vec3 a = texture(Source, vTexCoord).rgb;
+    vec3 b = texture(LinearizePass, vTexCoord / LinearizePassSize).rgb;
+    fragColor = vec4(a + b, 1.0);
+}
+)";
+    const std::string normalized =
+        Fast::NormalizeUserGlsl(kSrc, { "LinearizePass" });
+    // The normalizer must declare both the sampler AND the matching
+    // Size vec2 in the preamble.
+    EXPECT_NE(normalized.find("uniform sampler2D LinearizePass;"),
+              std::string::npos);
+    EXPECT_NE(normalized.find("uniform vec2 LinearizePassSize;"),
+              std::string::npos);
+
+    Fast::PostProcessSource src;
+    src.name = "alias-size-test";
+    src.glsl = normalized;
+    src.aliasNames = { "LinearizePass" };
+    std::string err;
+    ASSERT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
+    EXPECT_FALSE(src.hlsl.empty());
+    EXPECT_FALSE(src.msl.empty());
+    // The trailing UBO member appears as `LinearizePassSize` in both
+    // backends' output (SPIRV-Cross preserves the source identifier).
+    EXPECT_NE(src.hlsl.find("LinearizePassSize"), std::string::npos)
+        << "HLSL transpile dropped the alias-size UBO member";
+    EXPECT_NE(src.msl.find("LinearizePassSize"), std::string::npos)
+        << "MSL transpile dropped the alias-size UBO member";
+}
+
+// User-declared `uniform vec2 <alias>Size;` must be stripped — the
+// preamble + transpiler re-inject canonical, binding-explicit
+// declarations and a duplicate would either shadow the schema slot
+// or land at an unexpected binding number.
+TEST(PostProcessTranspiler, StripsUserDeclaredAliasSize) {
+    constexpr const char* kSrc = R"(#version 330 core
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D Source;
+uniform sampler2D BloomPass;
+uniform vec2 BloomPassSize;
+void main() {
+    vec3 b = texture(BloomPass, vTexCoord / BloomPassSize).rgb;
+    fragColor = vec4(b, 1.0);
+}
+)";
+    const std::string normalized =
+        Fast::NormalizeUserGlsl(kSrc, { "BloomPass" });
+    // Exactly one `BloomPassSize` declaration should survive — the
+    // one the normalizer's preamble emits. The user's redundant
+    // declaration is dropped along with the alias-sampler line.
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = normalized.find("uniform vec2 BloomPassSize", pos)) !=
+           std::string::npos) {
+        ++count;
+        pos += 1;
+    }
+    EXPECT_EQ(count, 1u) << "preamble + user declarations should not duplicate";
+}
+
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {
     Fast::PostProcessSource src;
     src.name = "empty";

@@ -1056,8 +1056,11 @@ int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
     slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
     slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
     slot.aliasLocations.reserve(src.aliasNames.size());
+    slot.aliasSizeLocations.reserve(src.aliasNames.size());
     for (const std::string& alias : src.aliasNames) {
         slot.aliasLocations.push_back(glGetUniformLocation(prog, alias.c_str()));
+        const std::string sizeName = alias + "Size";
+        slot.aliasSizeLocations.push_back(glGetUniformLocation(prog, sizeName.c_str()));
     }
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
@@ -1308,6 +1311,19 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
         if (slot.aliasLocations[i] >= 0) {
             glUniform1i(slot.aliasLocations[i], (GLint)(2 + i));
         }
+    }
+    for (size_t i = 0; i < slot.aliasSizeLocations.size(); ++i) {
+        if (slot.aliasSizeLocations[i] < 0) {
+            continue;
+        }
+        float w = 1.0f;
+        float h = 1.0f;
+        if (i < params.extraBindingsCount) {
+            const auto& eb = params.extraBindings[i];
+            w = (float)eb.width;
+            h = (float)eb.height;
+        }
+        glUniform2f(slot.aliasSizeLocations[i], w, h);
     }
     if (slot.originalSizeLocation >= 0) {
         glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,

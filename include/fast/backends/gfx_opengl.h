@@ -80,6 +80,12 @@ struct PostProcessProgramOGL {
     // because the shader doesn't sample it); the binding loop skips
     // those.
     std::vector<GLint> aliasLocations;
+    // Per-alias `uniform vec2 <name>Size` locations, same indexing as
+    // aliasLocations. Populated from PostProcessExtraBinding::
+    // {width,height} each frame so multipass shaders that read filtered
+    // sampler dimensions (libretro `<alias>Size`) see real values.
+    // -1 if the driver optimised the uniform out.
+    std::vector<GLint> aliasSizeLocations;
     std::string name;
 };
 
