@@ -6447,14 +6447,29 @@ void Interpreter::UpdatePostProcessFromCVars() {
     const bool nameChanged = name != mPostProcessName;
     const bool enabledChanged = enabled != mPostProcessEnabled;
 
+    // Clear the latch on any user-visible state change so the new
+    // (name, enabled) pair gets a fresh attempt — otherwise tweaking
+    // either cvar after a failed load would be a no-op.
+    if (nameChanged || enabledChanged) {
+        mPostProcessLoadFailed = false;
+    }
+
     if (!wantActive) {
         if (mPostProcessChain.IsActive()) {
             mPostProcessChain.UnloadShader(mRapi);
         }
-    } else if (nameChanged || enabledChanged || !mPostProcessChain.IsActive()) {
+    } else if (nameChanged || enabledChanged ||
+               (!mPostProcessChain.IsActive() && !mPostProcessLoadFailed)) {
+        // Either the user changed something, or the chain isn't active
+        // and we haven't already established that this combo can't
+        // load. Without the mPostProcessLoadFailed gate, a broken
+        // preset would retry once per frame (60 Hz) and spam the log.
         PostProcessShaderBundle bundle;
+        bool loadedOk = false;
         if (LoadPostProcessShader(name, bundle)) {
-            if (!mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs)) {
+            if (mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs)) {
+                loadedOk = true;
+            } else {
                 SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
             }
         } else if (mPostProcessChain.IsActive()) {
@@ -6462,6 +6477,7 @@ void Interpreter::UpdatePostProcessFromCVars() {
             // rather than silently keeping a stale program live.
             mPostProcessChain.UnloadShader(mRapi);
         }
+        mPostProcessLoadFailed = !loadedOk;
     }
 
     mPostProcessEnabled = enabled;

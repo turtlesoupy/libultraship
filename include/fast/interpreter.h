@@ -598,6 +598,11 @@ class Interpreter {
     uint32_t mFrameCounter{};      // Monotonic, wraps. Fed to shader uniforms.
     bool mPostProcessEnabled{};    // Last-seen CVAR_POSTPROCESS_ENABLED.
     std::string mPostProcessName;  // Last-seen CVAR_POSTPROCESS_SHADER.
+    // Latches when the current (name, enabled) combo failed to load,
+    // so the per-frame UpdatePostProcessFromCVars doesn't retry the
+    // same broken preset 60× per second. Cleared on cvar change or
+    // when an attempted load succeeds.
+    bool mPostProcessLoadFailed{};
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
