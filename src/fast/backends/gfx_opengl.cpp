@@ -1062,6 +1062,10 @@ int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
         const std::string sizeName = alias + "Size";
         slot.aliasSizeLocations.push_back(glGetUniformLocation(prog, sizeName.c_str()));
     }
+    slot.parameterLocations.reserve(src.parameters.size());
+    for (const auto& p : src.parameters) {
+        slot.parameterLocations.push_back(glGetUniformLocation(prog, p.name.c_str()));
+    }
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
         if (mPostProcessPrograms[i].program == 0) {
@@ -1365,6 +1369,17 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
             h = (float)eb.height;
         }
         glUniform2f(slot.aliasSizeLocations[i], w, h);
+    }
+    // Phase 2.3: push each live `#pragma parameter` value at the
+    // matching loose-uniform location. Driver-optimized-out
+    // parameters (location -1) are skipped — the shader can't see
+    // their value either way.
+    for (size_t i = 0; i < slot.parameterLocations.size(); ++i) {
+        if (slot.parameterLocations[i] < 0) {
+            continue;
+        }
+        const float v = (i < params.parametersCount) ? params.parameters[i] : 0.0f;
+        glUniform1f(slot.parameterLocations[i], v);
     }
     if (slot.originalSizeLocation >= 0) {
         glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,

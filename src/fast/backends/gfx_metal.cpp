@@ -1851,20 +1851,21 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
     }
 
     // Pack the per-frame uniforms followed by the per-pass alias /
-    // external-texture `vec2 <name>Size` slots. The shader's MSL
-    // `PostProcessUniforms` struct (transpiled by SPIRV-Cross from
-    // the GLSL UBO block) lays the trailing vec2s at offsets
-    // 40, 48, 56, ... matching std140; we push exactly those bytes
-    // into Metal's argument buffer via setFragmentBytes. Total size
-    // is padded to a multiple of 16 to match the D3D11 cbuffer rule
-    // — Metal accepts any size, but the alignment keeps the layout
-    // identical across backends.
+    // external-texture `vec2 <name>Size` slots and the per-`#pragma
+    // parameter` `float <name>` slots. SPIRV-Cross emits the MSL
+    // PostProcessUniforms struct with std140 layout (vec2 at offsets
+    // multiples of 8, float at multiples of 4); we mirror those byte
+    // offsets here. Total size is padded to a multiple of 16 so the
+    // layout matches the D3D11 cbuffer rule.
     constexpr size_t kPrefixBytes = sizeof(PostProcessUniformsMetal);
     static_assert(kPrefixBytes == 40, "PostProcessUniformsMetal must stay 40 bytes");
     constexpr size_t kAliasStrideBytes = sizeof(simd::float2);
     static_assert(kAliasStrideBytes == 8, "simd::float2 must be 8 bytes for the alias UBO tail");
+    constexpr size_t kParamStrideBytes = sizeof(float);
+    static_assert(kParamStrideBytes == 4, "float must be 4 bytes for the parameter UBO tail");
     const size_t aliasBytes = params.extraBindingsCount * kAliasStrideBytes;
-    const size_t totalBytes = (kPrefixBytes + aliasBytes + 15) & ~15u;
+    const size_t paramBytes = params.parametersCount * kParamStrideBytes;
+    const size_t totalBytes = (kPrefixBytes + aliasBytes + paramBytes + 15) & ~15u;
 
     std::vector<uint8_t> uboBytes(totalBytes, 0);
     PostProcessUniformsMetal* uni = reinterpret_cast<PostProcessUniformsMetal*>(uboBytes.data());
@@ -1879,6 +1880,12 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         simd::float2* slotPtr = reinterpret_cast<simd::float2*>(
             uboBytes.data() + kPrefixBytes + i * kAliasStrideBytes);
         *slotPtr = simd::float2{ (float)eb.width, (float)eb.height };
+    }
+    const size_t paramBase = kPrefixBytes + aliasBytes;
+    for (size_t i = 0; i < params.parametersCount; ++i) {
+        float* slotPtr = reinterpret_cast<float*>(
+            uboBytes.data() + paramBase + i * kParamStrideBytes);
+        *slotPtr = params.parameters[i];
     }
     enc->setFragmentBytes(uboBytes.data(), totalBytes, 0);
 

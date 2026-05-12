@@ -92,6 +92,12 @@ struct PostProcessProgramOGL {
     // sampler dimensions (libretro `<alias>Size`) see real values.
     // -1 if the driver optimised the uniform out.
     std::vector<GLint> aliasSizeLocations;
+    // Phase 2.3: per-`#pragma parameter` uniform locations, same
+    // indexing as PostProcessSource::parameters and the chain's
+    // PostProcessParams.parameters[]. Locations may be -1 (driver
+    // optimised the uniform out because the shader doesn't sample
+    // the parameter); the push loop skips those.
+    std::vector<GLint> parameterLocations;
     std::string name;
 };
 

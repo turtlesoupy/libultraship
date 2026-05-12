@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "PostProcessGlslNormalizer.h"
 #include "PostProcessPreset.h"
 
 namespace Fast {
@@ -100,6 +101,16 @@ struct PostProcessParams {
     // from PostProcessSource::aliasNames at compile time.
     const struct PostProcessExtraBinding* extraBindings = nullptr;
     size_t extraBindingsCount = 0;
+
+    // Phase 2.3: live values for each `#pragma parameter` declared on
+    // this pass's shader, in the same order PostProcessSource::
+    // parameters lists them. Backends push the i-th value into the
+    // shader's `<name>` uniform slot (loose `glUniform1f` on OpenGL,
+    // a `float` tail member in the transpiled UBO on D3D11/Metal).
+    // Stable storage owned by the chain; lifetime is one
+    // RunPostProcess call.
+    const float* parameters = nullptr;
+    size_t       parametersCount = 0;
 };
 
 // One named-sampler binding flowed through PostProcessParams. Backends
@@ -153,6 +164,13 @@ struct PostProcessSource {
     // later phases, external `textures = "..."` declarations). Empty
     // for single-pass shaders or .glslp presets without any aliases.
     std::vector<std::string> aliasNames;
+
+    // Phase 2.3: `#pragma parameter` declarations parsed from the
+    // user GLSL. Each entry corresponds to a `uniform float <name>;`
+    // slot the normalizer emitted in the preamble and the transpiler
+    // appended to the UBO block. The chain keeps a live value per
+    // entry and pushes the array via PostProcessParams.parameters.
+    std::vector<PostProcessShaderParameter> parameters;
 };
 
 } // namespace Fast

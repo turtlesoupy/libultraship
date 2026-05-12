@@ -1718,6 +1718,7 @@ int GfxRenderingAPIDX11::CreatePostProcessProgram(const PostProcessSource& src) 
     }
     slot.name = src.name;
     slot.aliasCount = static_cast<uint32_t>(src.aliasNames.size());
+    slot.parameterCount = static_cast<uint32_t>(src.parameters.size());
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
         if (mPostProcessPrograms[i].vertex_shader.Get() == nullptr) {
@@ -1845,12 +1846,13 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     }
 
     // Required cbuffer size: 40-byte prefix + 8 bytes per alias /
-    // external-texture `vec2 <name>Size` slot, padded to a multiple of
-    // 16 for D3D11 alignment. Grow mPostProcessCb on demand if the
-    // current shader needs a larger buffer than the last one.
+    // external-texture `vec2 <name>Size` slot + 4 bytes per
+    // `#pragma parameter` float, padded to a multiple of 16 for
+    // D3D11 alignment. Grow mPostProcessCb on demand.
     const size_t aliasBytes = (size_t)slot.aliasCount * kPostProcessUniformsAliasStride;
+    const size_t paramBytes = (size_t)slot.parameterCount * sizeof(float);
     const size_t neededBytes =
-        (kPostProcessUniformsPrefixBytes + aliasBytes + 15) & ~15u;
+        (kPostProcessUniformsPrefixBytes + aliasBytes + paramBytes + 15) & ~15u;
     if (mPostProcessCb.Get() == nullptr || mPostProcessCbBytes < neededBytes) {
         mPostProcessCb.Reset();
         D3D11_BUFFER_DESC bd = {};
@@ -1895,6 +1897,16 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
             dst + kPostProcessUniformsPrefixBytes + (size_t)i * kPostProcessUniformsAliasStride);
         slotPtr[0] = w;
         slotPtr[1] = h;
+    }
+    // Phase 2.3: parameter floats follow the alias-size block. The
+    // chain's parameterValues[] is keyed in the same order; if an
+    // extraBindings-style mismatch ever occurs the missing slots
+    // stay zero (memset above).
+    const size_t paramBase = kPostProcessUniformsPrefixBytes +
+                             (size_t)slot.aliasCount * kPostProcessUniformsAliasStride;
+    for (uint32_t i = 0; i < slot.parameterCount; ++i) {
+        const float v = (i < params.parametersCount) ? params.parameters[i] : 0.0f;
+        *reinterpret_cast<float*>(dst + paramBase + i * sizeof(float)) = v;
     }
     mContext->Unmap(mPostProcessCb.Get(), 0);
 

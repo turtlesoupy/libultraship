@@ -328,6 +328,66 @@ void main() {
     EXPECT_EQ(count, 1u) << "preamble + user declarations should not duplicate";
 }
 
+// Phase 2.3: `#pragma parameter <name> "<label>" <default> <min> <max> [<step>]`
+// declarations should be parsed out and the matching `#define <name>
+// <value>` fallback stripped, so the runtime can drive the value via
+// the preamble's `uniform float <name>;` instead of compile-time bake.
+TEST(PostProcessTranspiler, ParsesPragmaParameterAndStripsDefine) {
+    constexpr const char* kSrc = R"(#version 330 core
+#pragma parameter SCAN_DARK "Scanline Darkness" 0.50 0.00 1.00 0.05
+#define SCAN_DARK 0.50
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D Source;
+void main() {
+    vec3 c = texture(Source, vTexCoord).rgb;
+    c *= mix(1.0 - SCAN_DARK, 1.0, vTexCoord.y);
+    fragColor = vec4(c, 1.0);
+}
+)";
+    const auto params = Fast::ParseShaderParameters(kSrc);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(params[0].name, "SCAN_DARK");
+    EXPECT_EQ(params[0].label, "Scanline Darkness");
+    EXPECT_FLOAT_EQ(params[0].defaultValue, 0.50f);
+    EXPECT_FLOAT_EQ(params[0].minValue, 0.00f);
+    EXPECT_FLOAT_EQ(params[0].maxValue, 1.00f);
+    EXPECT_FLOAT_EQ(params[0].step, 0.05f);
+
+    const std::string normalized = Fast::NormalizeUserGlsl(kSrc, {}, params);
+    // The preamble must declare the parameter as a real uniform...
+    EXPECT_NE(normalized.find("uniform float SCAN_DARK;"), std::string::npos);
+    // ...and the `#define SCAN_DARK 0.50` fallback must be gone, else
+    // the preprocessor would textually substitute the literal into our
+    // uniform decl (`uniform float 0.50;` — invalid GLSL).
+    EXPECT_EQ(normalized.find("#define SCAN_DARK"), std::string::npos);
+
+    // Transpiles cleanly with the parameter member on the UBO tail.
+    Fast::PostProcessSource src;
+    src.name = "param-test";
+    src.glsl = normalized;
+    src.parameters = params;
+    std::string err;
+    ASSERT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
+    EXPECT_NE(src.hlsl.find("SCAN_DARK"), std::string::npos)
+        << "HLSL UBO did not preserve the parameter member";
+    EXPECT_NE(src.msl.find("SCAN_DARK"), std::string::npos)
+        << "MSL UBO did not preserve the parameter member";
+}
+
+// Optional step is omitted in many wild shaders. The parser should
+// derive a reasonable default ((max-min)/100) so sliders aren't
+// jittery.
+TEST(PostProcessTranspiler, DerivesParameterStepWhenOmitted) {
+    constexpr const char* kSrc = R"(#version 330 core
+#pragma parameter MASK_STRENGTH "Mask Strength" 0.5 0.0 1.0
+void main() {}
+)";
+    const auto params = Fast::ParseShaderParameters(kSrc);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_FLOAT_EQ(params[0].step, 0.01f); // (1.0 - 0.0) / 100
+}
+
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {
     Fast::PostProcessSource src;
     src.name = "empty";

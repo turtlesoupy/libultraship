@@ -72,14 +72,16 @@ constexpr const char* kInjectedFooter =
     "layout(location=0) in vec2 vTexCoord;\n"
     "layout(location=0) out vec4 fragColor;\n";
 
-// Build the Vulkan-flavored preamble. The injected UBO block is closed
-// after appending one `vec2 <alias>Size` member per alias name, so the
-// transpiled HLSL / MSL output reserves the matching trailing bytes
-// at the same std140-derived offsets the backends write.
-std::string BuildInjectedDeclarations(const std::vector<std::string>& aliasNames) {
+// Build the Vulkan-flavored preamble. The injected UBO block closes
+// after appending one `vec2 <alias>Size` member per alias name and
+// one `float <param>` per `#pragma parameter` declaration. The
+// std140 alignment rules naturally place vec2s at multiples of 8 and
+// floats at multiples of 4; backends write the byte layout to match.
+std::string BuildInjectedDeclarations(const std::vector<std::string>& aliasNames,
+                                      const std::vector<PostProcessShaderParameter>& parameters) {
     std::string out;
     out.reserve(std::strlen(kInjectedHeader) + std::strlen(kInjectedFooter) +
-                aliasNames.size() * 24);
+                aliasNames.size() * 24 + parameters.size() * 24);
     out += kInjectedHeader;
     for (const std::string& alias : aliasNames) {
         if (alias.empty()) {
@@ -88,6 +90,14 @@ std::string BuildInjectedDeclarations(const std::vector<std::string>& aliasNames
         out += "    vec2 ";
         out += alias;
         out += "Size;\n";
+    }
+    for (const auto& p : parameters) {
+        if (p.name.empty()) {
+            continue;
+        }
+        out += "    float ";
+        out += p.name;
+        out += ";\n";
     }
     out += kInjectedFooter;
     return out;
@@ -169,10 +179,44 @@ bool LineStartMatchesAlias(const std::string& trimmed,
     return false;
 }
 
+// Same shape as LineStartMatchesAlias but for `#pragma parameter`
+// declarations: strip any `uniform float <param_name>;` so the UBO
+// block's `float <param_name>` member is the canonical declaration.
+bool LineStartMatchesParameter(const std::string& trimmed,
+                               const std::vector<PostProcessShaderParameter>& parameters) {
+    if (parameters.empty()) {
+        return false;
+    }
+    constexpr const char* kPrefix = "uniform float ";
+    constexpr size_t kPrefixLen = 14; // strlen("uniform float ")
+    if (trimmed.size() <= kPrefixLen ||
+        trimmed.compare(0, kPrefixLen, kPrefix) != 0) {
+        return false;
+    }
+    for (const auto& p : parameters) {
+        if (p.name.empty() || trimmed.size() < kPrefixLen + p.name.size()) {
+            continue;
+        }
+        if (trimmed.compare(kPrefixLen, p.name.size(), p.name) != 0) {
+            continue;
+        }
+        const size_t end = kPrefixLen + p.name.size();
+        if (end == trimmed.size()) {
+            return true;
+        }
+        const char c = trimmed[end];
+        if (c == ' ' || c == '\t' || c == ';' || c == '=') {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rewrite the user GLSL into a Vulkan-targeted form: strip user
 // `#version` / schema declarations, prepend binding-explicit replacements.
 std::string PreprocessForVulkan(const std::string& src,
-                                const std::vector<std::string>& aliasNames) {
+                                const std::vector<std::string>& aliasNames,
+                                const std::vector<PostProcessShaderParameter>& parameters) {
     std::istringstream in(src);
     std::string line;
     std::vector<std::string> body;
@@ -191,12 +235,15 @@ std::string PreprocessForVulkan(const std::string& src,
         if (LineStartMatchesAlias(trimmed, aliasNames)) {
             continue;
         }
+        if (LineStartMatchesParameter(trimmed, parameters)) {
+            continue;
+        }
         body.push_back(line);
     }
     std::string out;
     out.reserve(src.size() + 512);
     out += "#version 450\n";
-    out += BuildInjectedDeclarations(aliasNames);
+    out += BuildInjectedDeclarations(aliasNames, parameters);
     // Per-alias binding-explicit sampler declarations at slots 3, 4, ...
     // (Source=0, Original=1, PostProcessUniforms=2, aliases=3+).
     for (size_t i = 0; i < aliasNames.size(); ++i) {
@@ -457,7 +504,7 @@ bool PostProcessTranspiler::SynthesizeMissing(PostProcessSource& inout, std::str
         return true;
     }
 
-    const std::string vulkanSrc = PreprocessForVulkan(inout.glsl, inout.aliasNames);
+    const std::string vulkanSrc = PreprocessForVulkan(inout.glsl, inout.aliasNames, inout.parameters);
     std::vector<unsigned int> spirv;
     if (!CompileFragmentToSpirv(vulkanSrc, spirv, errOut)) {
         return false;

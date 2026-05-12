@@ -89,9 +89,13 @@ struct PostProcessProgramD3D11 {
     // Number of trailing alias / external-texture `vec2 <name>Size`
     // members the transpiled cbuffer reserves for this program (same
     // as PostProcessSource::aliasNames.size()). The runtime cbuffer
-    // upload writes the prefix struct then `aliasCount` vec2s, then
-    // pads to a multiple of 16 for D3D11 buffer alignment.
+    // upload writes the prefix struct then `aliasCount` vec2s.
     uint32_t aliasCount = 0;
+    // Phase 2.3: number of trailing `float <name>` members appended
+    // after the alias-size block (one per PostProcessSource::
+    // parameters entry). Each occupies 4 bytes in std140; the cbuffer
+    // total is rounded up to a multiple of 16.
+    uint32_t parameterCount = 0;
 };
 
 // Layout mirrors the fixed prefix of `cbuffer PostProcessUniforms`
