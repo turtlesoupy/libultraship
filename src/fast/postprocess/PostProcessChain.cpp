@@ -140,6 +140,14 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         return srcFb;
     }
 
+    // The chain's "original" FB stays pinned to the game FB across
+    // every pass — that's the sampler 1 binding (`Original`) libretro
+    // multipass shaders use to combine the post-bloom buffer with the
+    // pre-bloom source. Source rotates pass-to-pass; Original does not.
+    const int originalFb = srcFb;
+    const uint32_t originalWidth = params.srcWidth;
+    const uint32_t originalHeight = params.srcHeight;
+
     int curIn = srcFb;
     uint32_t curW = params.srcWidth;
     uint32_t curH = params.srcHeight;
@@ -176,9 +184,11 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         PostProcessParams pp = params;
         pp.srcWidth = curW;
         pp.srcHeight = curH;
+        pp.originalWidth = originalWidth;
+        pp.originalHeight = originalHeight;
         pp.dstWidth = outW;
         pp.dstHeight = outH;
-        rapi->RunPostProcess(p.programId, curIn, outFb, pp);
+        rapi->RunPostProcess(p.programId, curIn, outFb, originalFb, pp);
 
         curIn = outFb;
         curW = outW;

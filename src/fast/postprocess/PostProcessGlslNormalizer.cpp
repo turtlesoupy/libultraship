@@ -84,6 +84,8 @@ bool LineStartsWithKeyword(const std::string& line, const char* keyword) {
 constexpr const char* kSchemaIdentifiers[] = {
     "Source", "SourceSize", "OutputSize", "InputSize", "FrameCount",
     "FrameDirection", "MVPMatrix", "vTexCoord", "fragColor",
+    // Phase 2D: libretro multipass-shader bindings.
+    "Original", "OriginalSize",
 };
 
 bool IsSchemaDeclarationLine(const std::string& line) {
@@ -135,9 +137,11 @@ constexpr const char* kPreamble =
     // already-empty macro, which the GLSL preprocessor permits.
     "#define PRECISION\n"
     "uniform sampler2D Source;\n"
+    "uniform sampler2D Original;\n"
     "uniform vec2 SourceSize;\n"
     "uniform vec2 OutputSize;\n"
     "uniform vec2 InputSize;\n"
+    "uniform vec2 OriginalSize;\n"
     "uniform int FrameCount;\n"
     "uniform float FrameDirection;\n"
     "in vec2 vTexCoord;\n"
@@ -153,6 +157,13 @@ std::string NormalizeUserGlsl(const std::string& src) {
     std::string body = src;
     // Sampler aliases. `s_p` is the older libretro variable name still
     // used by Hyllian's CRT shaders; `Texture` is the modern one.
+    // OrigTexture is libretro's pre-2018 spelling for the game-FB
+    // sampler now standardized as Original. Order matters: the longer
+    // identifier ("OrigTexture") must be rewritten before its prefix
+    // pattern ("Texture") so the whole-word match grabs the longer
+    // form first.
+    RewriteIdentifier(body, "OrigTexture", "Original");
+    RewriteIdentifier(body, "OrigInputSize", "OriginalSize");
     RewriteIdentifier(body, "Texture", "Source");
     RewriteIdentifier(body, "s_p", "Source");
     // `Source` reads against a `SourceSize` query — but if the file used

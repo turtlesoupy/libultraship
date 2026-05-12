@@ -191,6 +191,40 @@ void main() {
     EXPECT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
 }
 
+// Phase 2D: a fragment shader referencing both Source and Original
+// (libretro multipass halation-style) should transpile cleanly, and
+// the emitted HLSL/MSL should bind Original to the second sampler
+// slot — t1/s1 in HLSL, texture(1)/sampler(1) in MSL.
+TEST(PostProcessTranspiler, BindsOriginalToSecondSlot) {
+    constexpr const char* kSrc = R"(#version 330 core
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D Source;
+uniform sampler2D Original;
+uniform vec2 SourceSize;
+uniform vec2 OriginalSize;
+void main() {
+    vec3 bloom = texture(Source, vTexCoord).rgb;
+    vec3 base = texture(Original, vTexCoord).rgb;
+    fragColor = vec4(base + bloom * 0.5, 1.0);
+}
+)";
+    Fast::PostProcessSource src;
+    src.name = "halation-test";
+    src.glsl = kSrc;
+    std::string err;
+    ASSERT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
+    EXPECT_FALSE(src.hlsl.empty());
+    EXPECT_FALSE(src.msl.empty());
+    // HLSL register convention: Source at t0/s0, Original at t1/s1.
+    // SPIRV-Cross emits the SamplerState companion as `_<name>_sampler`.
+    EXPECT_NE(src.hlsl.find("Source : register(t0)"), std::string::npos);
+    EXPECT_NE(src.hlsl.find("Original : register(t1)"), std::string::npos);
+    // MSL: explicit slot attributes from the resource-binding overrides.
+    EXPECT_NE(src.msl.find("[[texture(0)]]"), std::string::npos);
+    EXPECT_NE(src.msl.find("[[texture(1)]]"), std::string::npos);
+}
+
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {
     Fast::PostProcessSource src;
     src.name = "empty";

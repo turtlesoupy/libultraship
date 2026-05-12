@@ -1458,7 +1458,8 @@ void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
     slot = PostProcessProgramMetal{};
 }
 
-void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                          const PostProcessParams& params) {
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
         return;
     }
@@ -1535,10 +1536,27 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, cons
     enc->setFragmentTexture(srcTexture, 0);
     enc->setFragmentSamplerState(slot.sampler, 0);
 
+    // Original (game FB) on slot 1 for multipass shaders that combine
+    // post-bloom Source with the pre-bloom Original. Falls back to the
+    // source texture for pass 0 — caller passes srcFb == originalFb.
+    MTL::Texture* originalTexture = srcTexture;
+    if (originalFb >= 0 && (size_t)originalFb < mFramebuffers.size()) {
+        FramebufferMetal& origFbInfo = mFramebuffers[originalFb];
+        if (origFbInfo.mTextureId != UINT32_MAX) {
+            MTL::Texture* t = mTextures[origFbInfo.mTextureId].texture;
+            if (t != nullptr) {
+                originalTexture = t;
+            }
+        }
+    }
+    enc->setFragmentTexture(originalTexture, 1);
+    enc->setFragmentSamplerState(slot.sampler, 1);
+
     PostProcessUniformsMetal uni{};
     uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
     uni.outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
     uni.inputSize = simd::float2{ (float)params.inputWidth, (float)params.inputHeight };
+    uni.originalSize = simd::float2{ (float)params.originalWidth, (float)params.originalHeight };
     uni.frameCount = (int)params.frameCount;
     uni.frameDirection = 1.0f;
     enc->setFragmentBytes(&uni, sizeof(uni), 0);

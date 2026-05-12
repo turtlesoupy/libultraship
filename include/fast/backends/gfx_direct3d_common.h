@@ -71,16 +71,21 @@ struct PostProcessProgramD3D11 {
     std::string name;
 };
 
-// Layout mirrors `cbuffer PostProcessUniforms` in the bundled HLSL.
+// Layout mirrors `cbuffer PostProcessUniforms` emitted by the
+// transpiler from the normalizer's injected schema declaration.
 // Members are arranged so the natural HLSL packing (each row is 16
-// bytes) matches without explicit padding; if you reorder, also reorder
-// the cbuffer declaration in shaders/postprocess/*.hlsl.
+// bytes) matches without explicit padding. The bundled hand-written
+// HLSL companions (scanlines.hlsl / crt-lottes.hlsl) declare a
+// shorter cbuffer (no OriginalSize) — D3D11 ignores the extra bytes
+// written by the runtime, so the two layouts coexist as long as
+// hand-written shaders only read the prefix they declared.
 struct PostProcessUniformsD3D11 {
-    float SourceSize[2];
-    float OutputSize[2];
-    float InputSize[2];
-    int FrameCount;
-    float FrameDirection;
+    float SourceSize[2];     // row 0.xy
+    float OutputSize[2];     // row 0.zw
+    float InputSize[2];      // row 1.xy
+    float OriginalSize[2];   // row 1.zw  (Phase 2D: game-FB dimensions)
+    int FrameCount;          // row 2.x
+    float FrameDirection;    // row 2.y
 };
 
 class GfxWindowBackendDXGI;
@@ -137,7 +142,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     bool SupportsPostProcess() override;
     int CreatePostProcessProgram(const PostProcessSource& src) override;
     void DestroyPostProcessProgram(int progId) override;
-    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                        const PostProcessParams& params) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;

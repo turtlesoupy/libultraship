@@ -29,10 +29,15 @@ namespace Fast {
 // the scanline period to one output pixel and aliases against the LCD
 // subpixel grid as a moire pattern.
 struct PostProcessParams {
-    uint32_t srcWidth;          // Game framebuffer pixel dimensions
-    uint32_t srcHeight;         //   (the texture the pass samples from).
+    uint32_t srcWidth;          // Source texture pixel dimensions (the
+    uint32_t srcHeight;         //   current pass's input sampler 0).
     uint32_t inputWidth;        // Original video-signal dimensions —
     uint32_t inputHeight;       //   N64 native 320x240 for SSB64.
+    uint32_t originalWidth;     // Game-FB pixel dimensions (the
+    uint32_t originalHeight;    //   sampler 1 / "Original" texture). Same
+                                //   as src{Width,Height} on pass 0; for
+                                //   later passes Source is the prior pass
+                                //   output, Original stays the game FB.
     uint32_t dstWidth;          // Output framebuffer dimensions (the
     uint32_t dstHeight;         //   surface the pass renders into).
     uint32_t frameCount;        // Monotonic frame counter, wraps.

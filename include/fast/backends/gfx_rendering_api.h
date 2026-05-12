@@ -124,10 +124,17 @@ class GfxRenderingAPI {
     virtual void DestroyPostProcessProgram(int progId) {
         (void)progId;
     }
-    virtual void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+    // `originalFb` is the un-modified game framebuffer the chain
+    // started from — same fb id for every pass in a multi-pass chain.
+    // Pass 0 callers should pass srcFb == originalFb. Backends bind it
+    // to a second texture slot so shaders can reference it as
+    // `Original` alongside the previous-pass `Source` at slot 0.
+    virtual void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                const PostProcessParams& params) {
         (void)progId;
         (void)srcFb;
         (void)dstFb;
+        (void)originalFb;
         (void)params;
     }
 

@@ -60,6 +60,8 @@ struct PostProcessProgramOGL {
     GLint sourceSizeLocation = -1;
     GLint outputSizeLocation = -1;
     GLint inputSizeLocation = -1;
+    GLint originalLocation = -1;     // sampler2D Original (game FB, slot 1)
+    GLint originalSizeLocation = -1; // vec2 OriginalSize
     GLint frameCountLocation = -1;
     GLint frameDirectionLocation = -1;
     std::string name;
@@ -122,7 +124,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     bool SupportsPostProcess() override;
     int CreatePostProcessProgram(const PostProcessSource& src) override;
     void DestroyPostProcessProgram(int progId) override;
-    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                        const PostProcessParams& params) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;

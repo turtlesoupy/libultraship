@@ -1026,6 +1026,8 @@ int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
     slot.sourceSizeLocation = glGetUniformLocation(prog, "SourceSize");
     slot.outputSizeLocation = glGetUniformLocation(prog, "OutputSize");
     slot.inputSizeLocation = glGetUniformLocation(prog, "InputSize");
+    slot.originalLocation = glGetUniformLocation(prog, "Original");
+    slot.originalSizeLocation = glGetUniformLocation(prog, "OriginalSize");
     slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
     slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
 
@@ -1070,7 +1072,8 @@ GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
     return mPostProcessVao;
 }
 
-void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                        const PostProcessParams& params) {
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
         return;
     }
@@ -1122,12 +1125,39 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, const 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     mLastBoundTextures[0] = srcFbInfo.clrbuf;
+
+    // Original (game FB) on TU1 for multipass shaders that combine
+    // post-bloom Source with the pre-bloom Original. We bind it
+    // unconditionally; shaders that don't reference Original simply
+    // ignore the binding.
+    GLuint originalTex = srcFbInfo.clrbuf;
+    if (originalFb >= 0 && (size_t)originalFb < mFrameBuffers.size() &&
+        mFrameBuffers[originalFb].clrbuf != 0) {
+        originalTex = mFrameBuffers[originalFb].clrbuf;
+    }
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, originalTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    mLastBoundTextures[1] = originalTex;
+    // Leave the active texture on TU0 so the next regular draw's
+    // glActiveTexture call doesn't have to undo us.
+    glActiveTexture(GL_TEXTURE0);
     mLastActiveTexture = 0;
 
     glUseProgram(slot.program);
     mLastLoadedShader = nullptr; // Force LoadShader to re-glUseProgram next frame.
     if (slot.sourceLocation >= 0) {
         glUniform1i(slot.sourceLocation, 0);
+    }
+    if (slot.originalLocation >= 0) {
+        glUniform1i(slot.originalLocation, 1);
+    }
+    if (slot.originalSizeLocation >= 0) {
+        glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,
+                    (float)params.originalHeight);
     }
     if (slot.sourceSizeLocation >= 0) {
         glUniform2f(slot.sourceSizeLocation, (float)params.srcWidth, (float)params.srcHeight);

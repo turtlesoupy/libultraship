@@ -1710,7 +1710,8 @@ void GfxRenderingAPIDX11::DestroyPostProcessProgram(int progId) {
     mPostProcessPrograms[progId] = PostProcessProgramD3D11{};
 }
 
-void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) {
+void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                         const PostProcessParams& params) {
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
         return;
     }
@@ -1767,6 +1768,8 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, const
     uni.OutputSize[1] = (float)params.dstHeight;
     uni.InputSize[0] = (float)params.inputWidth;
     uni.InputSize[1] = (float)params.inputHeight;
+    uni.OriginalSize[0] = (float)params.originalWidth;
+    uni.OriginalSize[1] = (float)params.originalHeight;
     uni.FrameCount = (int)params.frameCount;
     uni.FrameDirection = 1.0f;
     D3D11_MAPPED_SUBRESOURCE ms{};
@@ -1803,10 +1806,25 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, const
     mContext->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
     // No depth/stencil state needed (no DSV bound).
 
-    ID3D11ShaderResourceView* srv = srcTex.resource_view.Get();
-    mContext->PSSetShaderResources(0, 1, &srv);
+    // Source (this pass's input) at t0, Original (game FB) at t1.
+    // Shaders that don't reference Original simply ignore the binding;
+    // pass 0 callers pass srcFb == originalFb so it's a no-op there.
+    ID3D11ShaderResourceView* originalSrv = srcTex.resource_view.Get();
+    if (originalFb >= 0 && (size_t)originalFb < mFrameBuffers.size()) {
+        FramebufferDX11& origFbInfo = mFrameBuffers[originalFb];
+        if (origFbInfo.texture_id < mTextures.size()) {
+            ID3D11ShaderResourceView* maybe =
+                mTextures[origFbInfo.texture_id].resource_view.Get();
+            if (maybe != nullptr) {
+                originalSrv = maybe;
+            }
+        }
+    }
+    ID3D11ShaderResourceView* srvs[2] = { srcTex.resource_view.Get(), originalSrv };
+    mContext->PSSetShaderResources(0, 2, srvs);
     ID3D11SamplerState* samp = mPostProcessSampler.Get();
-    mContext->PSSetSamplers(0, 1, &samp);
+    ID3D11SamplerState* samps[2] = { samp, samp };
+    mContext->PSSetSamplers(0, 2, samps);
     ID3D11Buffer* cb = mPostProcessCb.Get();
     mContext->VSSetConstantBuffers(0, 1, &cb);
     mContext->PSSetConstantBuffers(0, 1, &cb);

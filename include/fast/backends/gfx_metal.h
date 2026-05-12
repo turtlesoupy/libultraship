@@ -80,12 +80,17 @@ struct PostProcessProgramMetal {
     std::string name;
 };
 
-// Layout must match the `PostProcessUniforms` struct in
-// libultraship/src/fast/shaders/postprocess/*.msl.
+// Layout must match the `PostProcessUniforms` struct emitted by the
+// transpiler. The bundled hand-written MSL companions
+// (scanlines.msl / crt-lottes.msl) declare a shorter struct (no
+// originalSize) — MSL ignores the trailing bytes the runtime writes,
+// so the two layouts coexist as long as hand-written shaders only
+// read the prefix they declared.
 struct PostProcessUniformsMetal {
     simd::float2 sourceSize;
     simd::float2 outputSize;
     simd::float2 inputSize;
+    simd::float2 originalSize;   // Phase 2D: game-FB dimensions.
     simd::int1 frameCount;
     simd::float1 frameDirection;
 };
@@ -191,7 +196,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     bool SupportsPostProcess() override;
     int CreatePostProcessProgram(const PostProcessSource& src) override;
     void DestroyPostProcessProgram(int progId) override;
-    void RunPostProcess(int progId, int srcFb, int dstFb, const PostProcessParams& params) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                        const PostProcessParams& params) override;
 
     void NewFrame();
     void SetupFloatingFrame();

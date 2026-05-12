@@ -33,18 +33,29 @@ namespace {
 // source, so SPIRV-Cross emits a clean UBO + separate-sampler graph
 // matching what the D3D11/Metal backends expect at runtime.
 constexpr const char* kSchemaLineStarts[] = {
-    "uniform sampler2D Source",  "uniform vec2 SourceSize",
-    "uniform vec2 OutputSize",   "uniform vec2 InputSize",
-    "uniform int FrameCount",    "uniform float FrameDirection",
-    "in vec2 vTexCoord",         "out vec4 fragColor",
+    "uniform sampler2D Source", "uniform sampler2D Original",
+    "uniform vec2 SourceSize",  "uniform vec2 OutputSize",
+    "uniform vec2 InputSize",   "uniform vec2 OriginalSize",
+    "uniform int FrameCount",   "uniform float FrameDirection",
+    "in vec2 vTexCoord",        "out vec4 fragColor",
 };
 
+// Resource bindings:
+//   set=0, binding=0 — sampler2D Source   (previous-pass output)
+//   set=0, binding=1 — sampler2D Original (game FB, multipass-only)
+//   set=0, binding=2 — PostProcessUniforms UBO
+// Sampler bindings 0/1 map directly to t0/s0 + t1/s1 (HLSL) and
+// texture(0)/sampler(0) + texture(1)/sampler(1) (MSL); the UBO maps
+// to b0 / buffer(0) after explicit remapping in the per-language
+// compile steps below.
 constexpr const char* kInjectedDeclarations =
     "layout(set=0, binding=0) uniform sampler2D Source;\n"
-    "layout(set=0, binding=1, std140) uniform PostProcessUniforms {\n"
+    "layout(set=0, binding=1) uniform sampler2D Original;\n"
+    "layout(set=0, binding=2, std140) uniform PostProcessUniforms {\n"
     "    vec2 SourceSize;\n"
     "    vec2 OutputSize;\n"
     "    vec2 InputSize;\n"
+    "    vec2 OriginalSize;\n"
     "    int  FrameCount;\n"
     "    float FrameDirection;\n"
     "};\n"
@@ -191,15 +202,30 @@ bool TranspileHlsl(const std::vector<unsigned int>& spirv, std::string& outHlsl,
         compiler.set_hlsl_options(opts);
         auto resources = compiler.get_shader_resources();
         for (auto& ubo : resources.uniform_buffers) {
-            // PostProcessUniforms lands at register b0.
+            // PostProcessUniforms lands at register b0. Force the
+            // binding regardless of what the preamble declared so
+            // adding more buffer bindings later doesn't shift this one.
             compiler.set_decoration(ubo.id, spv::DecorationDescriptorSet, 0);
             compiler.set_decoration(ubo.id, spv::DecorationBinding, 0);
             compiler.set_name(ubo.id, "PostProcessUniforms");
         }
         for (auto& img : resources.sampled_images) {
-            // sampler2D Source -> Texture2D Source (t0) + SamplerState (s0).
+            // Per-sampler register assignment. SPIRV-Cross splits each
+            // combined sampler into Texture2D + SamplerState; both
+            // take the same numeric register index in their respective
+            // t* / s* spaces.
+            //
+            // Identification by name: the normalizer's preamble names
+            // them `Source` and `Original`. Anything else (unlikely —
+            // shaders that declare their own samplers would do so
+            // outside the schema list) defaults to slot 0.
+            const std::string& name = compiler.get_name(img.id);
+            uint32_t slot = 0;
+            if (name == "Original") {
+                slot = 1;
+            }
             compiler.set_decoration(img.id, spv::DecorationDescriptorSet, 0);
-            compiler.set_decoration(img.id, spv::DecorationBinding, 0);
+            compiler.set_decoration(img.id, spv::DecorationBinding, slot);
         }
         compiler.rename_entry_point("main", "PSMain", spv::ExecutionModelFragment);
         outHlsl = compiler.compile();
@@ -251,22 +277,31 @@ bool TranspileMsl(const std::vector<unsigned int>& spirv, std::string& outMsl,
         opts.argument_buffers = false;
         compiler.set_msl_options(opts);
 
-        // Force Metal-backend bindings: combined sampler at texture(0) +
-        // sampler(0); UBO at buffer(0). The Metal RunPostProcess code
-        // hard-codes the same indices.
-        spirv_cross::MSLResourceBinding combined{};
-        combined.stage = spv::ExecutionModelFragment;
-        combined.desc_set = 0;
-        combined.binding = 0;
-        combined.msl_texture = 0;
-        combined.msl_sampler = 0;
-        combined.msl_buffer = 0;
-        compiler.add_msl_resource_binding(combined);
+        // Force Metal-backend bindings: Source at texture(0)+sampler(0),
+        // Original at texture(1)+sampler(1), UBO at buffer(0). The
+        // Metal RunPostProcess code hard-codes the same indices.
+        spirv_cross::MSLResourceBinding sourceBind{};
+        sourceBind.stage = spv::ExecutionModelFragment;
+        sourceBind.desc_set = 0;
+        sourceBind.binding = 0;
+        sourceBind.msl_texture = 0;
+        sourceBind.msl_sampler = 0;
+        sourceBind.msl_buffer = 0;
+        compiler.add_msl_resource_binding(sourceBind);
+
+        spirv_cross::MSLResourceBinding originalBind{};
+        originalBind.stage = spv::ExecutionModelFragment;
+        originalBind.desc_set = 0;
+        originalBind.binding = 1;
+        originalBind.msl_texture = 1;
+        originalBind.msl_sampler = 1;
+        originalBind.msl_buffer = 0;
+        compiler.add_msl_resource_binding(originalBind);
 
         spirv_cross::MSLResourceBinding ubo{};
         ubo.stage = spv::ExecutionModelFragment;
         ubo.desc_set = 0;
-        ubo.binding = 1;
+        ubo.binding = 2;
         ubo.msl_buffer = 0;
         ubo.msl_texture = 0;
         ubo.msl_sampler = 0;
