@@ -149,7 +149,7 @@ struct CoordUniforms {
 
 class GfxRenderingAPIMetal final : public GfxRenderingAPI {
   public:
-    ~GfxRenderingAPIMetal() override = default;
+    ~GfxRenderingAPIMetal() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;

@@ -1444,6 +1444,23 @@ int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src)
     return (int)mPostProcessPrograms.size() - 1;
 }
 
+GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    // The post-process sampler cache is keyed on (filter, wrap) — bounded
+    // to 8 entries by design — but `newSamplerState` returns a retained
+    // MTL::SamplerState that the backend owns. Release each on shutdown
+    // so the singleton teardown doesn't leak the cache.
+    //
+    // MTL ref-counts survive any in-flight GPU work because command
+    // buffers retain the samplers they bound, so this is safe even if a
+    // frame is still on the GPU when the backend is destroyed.
+    for (auto& kv : mPostProcessSamplers) {
+        if (kv.second != nullptr) {
+            kv.second->release();
+        }
+    }
+    mPostProcessSamplers.clear();
+}
+
 void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
         return;
