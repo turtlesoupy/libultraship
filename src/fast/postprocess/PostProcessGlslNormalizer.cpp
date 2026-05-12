@@ -105,7 +105,14 @@ bool IsSchemaDeclarationLine(const std::string& line) {
     // the declaration unconditionally we side-step the macro-chain.
     if (LineStartsWithKeyword(line, "in") || LineStartsWithKeyword(line, "varying") ||
         LineStartsWithKeyword(line, "IN") || LineStartsWithKeyword(line, "attribute") ||
-        LineStartsWithKeyword(line, "out") || LineStartsWithKeyword(line, "OUT")) {
+        LineStartsWithKeyword(line, "out") || LineStartsWithKeyword(line, "OUT") ||
+        // libretro's GLSL-version-portability macros. Both expand to
+        // varying/in/out/attribute depending on __VERSION__; stripping the
+        // line at the macro-prefix avoids a chain `COMPAT_VARYING vec4
+        // TEX0;` -> `varying vec4 vTexCoord;` -> collision with the
+        // preamble after our TEX0 -> vTexCoord rewrite.
+        LineStartsWithKeyword(line, "COMPAT_VARYING") ||
+        LineStartsWithKeyword(line, "COMPAT_ATTRIBUTE")) {
         return true;
     }
     // Uniforms: only strip the schema-aliased ones — the user is
