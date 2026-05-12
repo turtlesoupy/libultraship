@@ -901,17 +901,22 @@ void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
 }
 
 bool GfxRenderingAPIOGL::FbNeedsSampleVFlip(int fb_id) {
-    // The interpreter's vertex Y negation for invertY=true FBs makes the
-    // rendered "game top" land at the GL pixel-bottom of storage, but
-    // sampling the same FB as a GL_TEXTURE_2D returns rows in the opposite
-    // direction (V=0 reading from the rendered display top). The
-    // FB-as-texture passthrough path needs to V-flip its UV transform so a
-    // consumer UV authored against game-top stays at game-top across all
-    // backends. D3D11 and Metal don't need this — see their default false.
+    // Empirically: on Linux/NVIDIA OpenGL (driver 595.x), sampling an
+    // invertY=true FBO as a GL_TEXTURE_2D returns rows in the SAME
+    // direction as the rendered Y-negated storage — V=0 already reads
+    // "game top". No flip is needed; applying one renders the
+    // FB-passthrough wallpaper / VS photo-wipe upside-down. D3D11 and
+    // Metal also use the default-false (no Y negation on the render side,
+    // sampling matches storage). Issue #157's original "OpenGL needs a
+    // V-flip" diagnosis turned out platform-specific to a different
+    // driver/OS and didn't hold on Linux NVIDIA. The safer default is no
+    // flip on any backend until a future report identifies one that
+    // genuinely needs it; the fb_id bounds check is kept so the method
+    // remains a safe per-FB hook for that future case.
     if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
         return false;
     }
-    return mFrameBuffers[fb_id].invertY;
+    return false;
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
