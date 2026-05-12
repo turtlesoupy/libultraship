@@ -87,12 +87,29 @@ constexpr const char* kSchemaIdentifiers[] = {
 };
 
 bool IsSchemaDeclarationLine(const std::string& line) {
-    const bool isUniform = LineStartsWithKeyword(line, "uniform");
-    const bool isIn =
-        LineStartsWithKeyword(line, "in") || LineStartsWithKeyword(line, "varying") ||
-        LineStartsWithKeyword(line, "attribute") || LineStartsWithKeyword(line, "IN");
-    const bool isOut = LineStartsWithKeyword(line, "out") || LineStartsWithKeyword(line, "OUT");
-    if (!isUniform && !isIn && !isOut) {
+    // Strip every top-level `in` / `varying` / `IN` / `attribute` / `out`
+    // / `OUT` declaration. A fragment-shader post-process pass only has
+    // one varying input (vTexCoord) and one output (fragColor) — both
+    // are provided by the runtime preamble. Anything else the user
+    // declared either matches that role (and would duplicate our
+    // declaration) or is wired to a vertex stage that doesn't exist in
+    // our fixed stock VS. Either way, dropping the user line and
+    // letting the preamble win is the correct outcome.
+    //
+    // This catches edge cases like `IN vec2 Coord;` paired with
+    // `#define Coord TEX0` — after the text-rewrite stage above
+    // `TEX0 → vTexCoord` would make the user's declaration expand to
+    // `in vec2 vTexCoord;` and collide with our preamble. By stripping
+    // the declaration unconditionally we side-step the macro-chain.
+    if (LineStartsWithKeyword(line, "in") || LineStartsWithKeyword(line, "varying") ||
+        LineStartsWithKeyword(line, "IN") || LineStartsWithKeyword(line, "attribute") ||
+        LineStartsWithKeyword(line, "out") || LineStartsWithKeyword(line, "OUT")) {
+        return true;
+    }
+    // Uniforms: only strip the schema-aliased ones — the user is
+    // allowed to keep their own custom uniforms (shader parameters
+    // etc.) so the preamble doesn't have to enumerate them.
+    if (!LineStartsWithKeyword(line, "uniform")) {
         return false;
     }
     for (const char* id : kSchemaIdentifiers) {

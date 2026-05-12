@@ -154,6 +154,43 @@ TEST(PostProcessTranspiler, AcceptsUserSuppliedShaderFromEnv) {
     EXPECT_FALSE(src.msl.empty());
 }
 
+// Regression: libretro single-file shaders sometimes alias the
+// varying via `#define <local> TEX0` then redeclare the local name
+// (`IN vec2 <local>;`). After the normalizer's text-rewrite of
+// `TEX0 -> vTexCoord`, the user's redeclaration would expand to
+// `in vec2 vTexCoord;` and collide with the preamble's. Stripping
+// all user `in/varying/out` declarations sidesteps the macro chain.
+TEST(PostProcessTranspiler, AcceptsTexCoordAliasIndirection) {
+    constexpr const char* kSrc = R"(
+#version 120
+#if defined(VERTEX)
+attribute vec2 TexCoord;
+varying vec2 Coord;
+void main() {
+    gl_Position = vec4(0.0);
+    Coord = TexCoord;
+}
+#elif defined(FRAGMENT)
+#define Coord TEX0
+varying vec2 Coord;
+uniform sampler2D Texture;
+uniform vec2 TextureSize;
+void main() {
+    vec3 c = texture2D(Texture, Coord).rgb;
+    float r = Coord.y * TextureSize.y;
+    c *= 0.5 + 0.5 * cos(r);
+    gl_FragColor = vec4(c, 1.0);
+}
+#endif
+)";
+    const std::string normalized = Fast::NormalizeUserGlsl(kSrc);
+    Fast::PostProcessSource src;
+    src.name = "alias-indirection";
+    src.glsl = normalized;
+    std::string err;
+    EXPECT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
+}
+
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {
     Fast::PostProcessSource src;
     src.name = "empty";
