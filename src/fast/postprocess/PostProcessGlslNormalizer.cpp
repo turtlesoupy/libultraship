@@ -188,13 +188,18 @@ std::string NormalizeUserGlsl(const std::string& src,
     // strip decisions see canonical names regardless of which alias the
     // author used.
     std::string body = src;
-    // Sampler aliases. `s_p` is the older libretro variable name still
-    // used by Hyllian's CRT shaders; `Texture` is the modern one.
-    // OrigTexture is libretro's pre-2018 spelling for the game-FB
-    // sampler now standardized as Original. Order matters: the longer
-    // identifier ("OrigTexture") must be rewritten before its prefix
-    // pattern ("Texture") so the whole-word match grabs the longer
-    // form first.
+    // Sampler-name aliases drawn from the public libretro shader-format
+    // portability conventions (libretro/glsl-shaders README + the
+    // libretro shader-spec doc pages). `Texture` and `OrigTexture` are
+    // the documented legacy spellings of what later became `Source` and
+    // `Original`. `s_p` is an older alternate spelling for the source
+    // sampler that some shaders still ship. Listed here for portability;
+    // every rewrite is identifier-by-identifier and not derived from
+    // reading any specific shader's source.
+    //
+    // Order matters: the longer identifier (`OrigTexture`) must be
+    // rewritten before its prefix pattern (`Texture`) so the whole-word
+    // match grabs the longer form first.
     RewriteIdentifier(body, "OrigTexture", "Original");
     RewriteIdentifier(body, "OrigInputSize", "OriginalSize");
     RewriteIdentifier(body, "Texture", "Source");

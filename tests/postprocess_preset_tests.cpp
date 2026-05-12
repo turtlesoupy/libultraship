@@ -1,15 +1,16 @@
-// Implemented against the libretro `.glslp` examples in
-// libretro/glsl-shaders. No code copied from RetroArch or any
+// Implemented against the public libretro `.glslp` format
+// documentation. Tests use synthetic preset inputs — no shader-corpus
+// file contents are reproduced. No code copied from RetroArch or any
 // GPL-licensed shader runtime.
 
 #include <gtest/gtest.h>
 
 #include "fast/postprocess/PostProcessPreset.h"
 
-TEST(PostProcessPreset, ParsesSinglePassAperture) {
+TEST(PostProcessPreset, ParsesSinglePass) {
     constexpr const char* kSrc = R"(shaders = 1
 
-shader0 = shaders/crt-aperture.glsl
+shader0 = demo/single.glsl
 filter_linear0 = false
 )";
     Fast::PostProcessPreset preset;
@@ -17,16 +18,21 @@ filter_linear0 = false
     ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "/tmp/presets", preset, err)) << err;
     EXPECT_EQ(preset.baseDir, "/tmp/presets");
     ASSERT_EQ(preset.passes.size(), 1u);
-    EXPECT_EQ(preset.passes[0].shaderPath, "shaders/crt-aperture.glsl");
+    EXPECT_EQ(preset.passes[0].shaderPath, "demo/single.glsl");
     EXPECT_FALSE(preset.passes[0].filterLinear);
     EXPECT_EQ(preset.passes[0].scaleX, 1.0f);
     EXPECT_EQ(preset.passes[0].scaleY, 1.0f);
 }
 
-TEST(PostProcessPreset, ParsesFivePassEasymodeHalation) {
+// Synthetic five-pass preset that exercises the parser's quoted-value
+// handling, sRGB / scale flags on consecutive passes, and the default
+// behaviour for a final pass with no explicit scale/axis keys. Pass
+// names are deliberately abstract (`stage0..stage4`) so we don't
+// depend on any specific shader corpus.
+TEST(PostProcessPreset, ParsesFivePassWithQuotedAttributes) {
     constexpr const char* kSrc = R"(shaders = "5"
 
-shader0 = "shaders/crt-easymode-halation/linearize.glsl"
+shader0 = "demo/stage0.glsl"
 filter_linear0 = "false"
 srgb_framebuffer0 = "true"
 scale_type_x0 = "source"
@@ -34,7 +40,7 @@ scale_x0 = "1.000000"
 scale_type_y0 = "source"
 scale_y0 = "1.000000"
 
-shader1 = "shaders/crt-easymode-halation/blur_horiz.glsl"
+shader1 = "demo/stage1.glsl"
 filter_linear1 = "false"
 srgb_framebuffer1 = "true"
 scale_type_x1 = "source"
@@ -42,7 +48,7 @@ scale_x1 = "1.000000"
 scale_type_y1 = "source"
 scale_y1 = "1.000000"
 
-shader2 = "shaders/crt-easymode-halation/blur_vert.glsl"
+shader2 = "demo/stage2.glsl"
 filter_linear2 = "false"
 srgb_framebuffer2 = "true"
 scale_type_x2 = "source"
@@ -50,7 +56,7 @@ scale_x2 = "1.000000"
 scale_type_y2 = "source"
 scale_y2 = "1.000000"
 
-shader3 = "shaders/crt-easymode-halation/threshold.glsl"
+shader3 = "demo/stage3.glsl"
 filter_linear3 = "false"
 srgb_framebuffer3 = "true"
 scale_type_x3 = "source"
@@ -58,7 +64,7 @@ scale_x3 = "1.000000"
 scale_type_y3 = "source"
 scale_y3 = "1.000000"
 
-shader4 = "shaders/crt-easymode-halation/crt-easymode-halation.glsl"
+shader4 = "demo/stage4.glsl"
 filter_linear4 = "true"
 )";
 
@@ -80,9 +86,8 @@ filter_linear4 = "true"
     EXPECT_EQ(preset.passes[4].scaleTypeX, Fast::PostProcessScaleType::Source);
     EXPECT_FLOAT_EQ(preset.passes[4].scaleX, 1.0f);
 
-    EXPECT_EQ(preset.passes[0].shaderPath, "shaders/crt-easymode-halation/linearize.glsl");
-    EXPECT_EQ(preset.passes[4].shaderPath,
-              "shaders/crt-easymode-halation/crt-easymode-halation.glsl");
+    EXPECT_EQ(preset.passes[0].shaderPath, "demo/stage0.glsl");
+    EXPECT_EQ(preset.passes[4].shaderPath, "demo/stage4.glsl");
 }
 
 TEST(PostProcessPreset, AcceptsCombinedScaleTypeAndAxisOverride) {
