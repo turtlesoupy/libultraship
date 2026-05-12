@@ -6452,9 +6452,9 @@ void Interpreter::UpdatePostProcessFromCVars() {
             mPostProcessChain.UnloadShader(mRapi);
         }
     } else if (nameChanged || enabledChanged || !mPostProcessChain.IsActive()) {
-        PostProcessSource src;
-        if (LoadPostProcessShader(name, src)) {
-            if (!mPostProcessChain.LoadShader(mRapi, src)) {
+        PostProcessShaderBundle bundle;
+        if (LoadPostProcessShader(name, bundle)) {
+            if (!mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs)) {
                 SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
             }
         } else if (mPostProcessChain.IsActive()) {

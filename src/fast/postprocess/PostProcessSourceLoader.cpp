@@ -1,4 +1,5 @@
-// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §3.4.
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §3.4
+// and the libretro `.glslp` format documented at libretro/glsl-shaders.
 // No code copied from RetroArch or any GPL-licensed shader runtime.
 #include "fast/postprocess/PostProcessSourceLoader.h"
 
@@ -9,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include "fast/postprocess/PostProcessGlslNormalizer.h"
+#include "fast/postprocess/PostProcessPreset.h"
 #include "fast/postprocess/PostProcessTranspiler.h"
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
@@ -50,68 +52,141 @@ bool ReadArchiveFile(const std::string& path, std::string& outText) {
     return true;
 }
 
-} // namespace
-
-namespace {
-
-// Populate one language slot in `out`. Looks first on the filesystem (where a
-// user drops a sibling file next to the `.glsl` they authored), then in
-// f3d.o2r for the bundled builtins. Silently no-ops if no file is found —
-// the SPIRV-Cross transpiler will fill the gap once it lands, and backends
-// that need a non-GLSL source check for emptiness and bail with a clear log.
-void TryLoadLanguage(const std::string& name, const std::string& extension, std::string& outText) {
-    if (ReadFilesystemFile("shaders/" + name + "." + extension, outText)) {
-        return;
+// Read a file from filesystem `<fsBase>/<rel>` first, then archive
+// `<arBase>/<rel>`. Returns true and populates outText on the first
+// success.
+bool ReadShaderFile(const std::string& fsBase, const std::string& arBase,
+                    const std::string& rel, std::string& outText) {
+    std::string fsPath = fsBase;
+    if (!fsPath.empty() && fsPath.back() != '/') {
+        fsPath += '/';
     }
-    ReadArchiveFile("shaders/postprocess/" + name + "." + extension, outText);
+    fsPath += rel;
+    if (ReadFilesystemFile(fsPath, outText)) {
+        return true;
+    }
+    std::string arPath = arBase;
+    if (!arPath.empty() && arPath.back() != '/') {
+        arPath += '/';
+    }
+    arPath += rel;
+    return ReadArchiveFile(arPath, outText);
 }
 
-} // namespace
+// Build the diagnostic display name for an individual pass. Strips
+// any leading directory components and trailing extension so log
+// messages stay readable for shaders like
+// "shaders/crt-easymode-halation/blur_horiz.glsl".
+std::string ShortenPassName(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    const size_t begin = (slash == std::string::npos) ? 0 : slash + 1;
+    const size_t dot = path.find_last_of('.');
+    const size_t end = (dot != std::string::npos && dot > begin) ? dot : path.size();
+    return path.substr(begin, end - begin);
+}
 
-bool LoadPostProcessShader(const std::string& name, PostProcessSource& out) {
-    if (name.empty()) {
+// Run the user-shader pipeline on a raw GLSL string: normalize ->
+// transpile to HLSL/MSL via SPIRV-Cross. Returns a fully-populated
+// PostProcessSource ready for PostProcessChain::LoadPasses.
+PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl) {
+    PostProcessSource src;
+    src.name = displayName;
+    src.glsl = NormalizeUserGlsl(rawGlsl);
+    std::string err;
+    if (!PostProcessTranspiler::SynthesizeMissing(src, err)) {
+        SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", displayName, err);
+    }
+    return src;
+}
+
+bool LoadSinglePassBundle(const std::string& name, const std::string& fsBase,
+                          const std::string& arBase, PostProcessShaderBundle& out) {
+    std::string raw;
+    if (!ReadShaderFile(fsBase, arBase, name + ".glsl", raw)) {
         return false;
     }
-    std::string glsl;
-    const std::string fsPath = "shaders/" + name + ".glsl";
-    if (!ReadFilesystemFile(fsPath, glsl)) {
-        const std::string arPath = "shaders/postprocess/" + name + ".glsl";
-        if (!ReadArchiveFile(arPath, glsl)) {
-            SPDLOG_ERROR("Post-process shader '{}' not found (tried '{}' and archive '{}')", name, fsPath, arPath);
+    out.name = name;
+    out.sources.clear();
+    out.configs.clear();
+    out.sources.push_back(MakeSource(name, std::move(raw)));
+    out.configs.emplace_back(); // Default scale_type=source, scale=1.0.
+    return true;
+}
+
+// Parse a .glslp at `<fsBase>/<name>.glslp` or `<arBase>/<name>.glslp`,
+// load each referenced pass shader through the normalize+transpile
+// pipeline, and stuff everything into `out`. The pass shader paths in
+// the preset are resolved relative to the preset's own location.
+bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
+                      const std::string& arBase, PostProcessShaderBundle& out) {
+    std::string presetText;
+    if (!ReadShaderFile(fsBase, arBase, name + ".glslp", presetText)) {
+        return false;
+    }
+    PostProcessPreset preset;
+    std::string err;
+    // baseDir is informational; the actual lookup happens against
+    // fsBase / arBase below. We pass empty so the preset record
+    // doesn't carry stale absolute paths.
+    if (!ParsePostProcessPreset(presetText, std::string(), preset, err)) {
+        SPDLOG_ERROR("Post-process preset '{}': {}", name, err);
+        return false;
+    }
+
+    out.name = name;
+    out.sources.clear();
+    out.configs.clear();
+    out.sources.reserve(preset.passes.size());
+    out.configs.reserve(preset.passes.size());
+
+    for (size_t i = 0; i < preset.passes.size(); ++i) {
+        const PostProcessPresetPass& passCfg = preset.passes[i];
+        std::string raw;
+        if (!ReadShaderFile(fsBase, arBase, passCfg.shaderPath, raw)) {
+            SPDLOG_ERROR("Post-process preset '{}' pass {}: shader '{}' not found "
+                         "(searched filesystem '{}' and archive '{}')",
+                         name, i, passCfg.shaderPath, fsBase, arBase);
             return false;
         }
-    }
-    out.name = name;
-    // Run the canonical-form normalizer so libretro single-file shaders
-    // (Texture / TextureSize / TEX0 / FragColor, combined VS+FS) load
-    // without manual adaptation. LUS-schema shaders pass through with
-    // only the `#version` line reset.
-    out.glsl = NormalizeUserGlsl(glsl);
-    // Hand-tuned backend-specific siblings, if present, win over the
-    // transpiler output. Authors who want tighter control over the HLSL
-    // or MSL emit (precision, sampler semantics, etc.) drop a `<name>.hlsl`
-    // / `<name>.msl` next to the `.glsl`; missing slots fall through to
-    // PostProcessTranspiler::SynthesizeMissing below.
-    TryLoadLanguage(name, "msl", out.msl);
-    TryLoadLanguage(name, "hlsl", out.hlsl);
-    if (out.hlsl.empty() || out.msl.empty()) {
-        std::string err;
-        if (!PostProcessTranspiler::SynthesizeMissing(out, err)) {
-            // Non-fatal: backends that need the missing slot will log a
-            // clearer error of their own at compile time. The OpenGL
-            // backend only consumes `out.glsl` so it stays unaffected.
-            SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", name, err);
-        }
+        const std::string displayName =
+            name + "[" + std::to_string(i) + "/" + ShortenPassName(passCfg.shaderPath) + "]";
+        out.sources.push_back(MakeSource(displayName, std::move(raw)));
+        out.configs.push_back(passCfg);
     }
     return true;
 }
 
+} // namespace
+
+bool LoadPostProcessShader(const std::string& name, PostProcessShaderBundle& out) {
+    if (name.empty()) {
+        return false;
+    }
+    constexpr const char* kFsBase = "shaders";
+    constexpr const char* kArBase = "shaders/postprocess";
+
+    // Multi-pass presets take priority — a directory containing both a
+    // `<name>.glslp` and a `<name>.glsl` is unusual (the .glsl would
+    // typically be one of the passes), and if both exist the preset
+    // is the more-explicit intent.
+    if (LoadPresetBundle(name, kFsBase, kArBase, out)) {
+        return true;
+    }
+    if (LoadSinglePassBundle(name, kFsBase, kArBase, out)) {
+        return true;
+    }
+    SPDLOG_ERROR("Post-process shader '{}' not found "
+                 "(tried '{}/{}.{{glslp,glsl}}' and archive '{}/{}.{{glslp,glsl}}')",
+                 name, kFsBase, name, kArBase, name);
+    return false;
+}
+
 std::vector<std::string> ListBuiltinPostProcessShaders() {
-    // The list mirrors what GenerateF3DO2R packages from
-    // libultraship/src/fast/shaders/postprocess/. Hardcoded rather than
-    // enumerated at runtime so the menu picker stays stable across
-    // archive contents and so a port that ships a stripped f3d.o2r still
-    // gets a usable default selection.
+    // Mirrors what GenerateF3DO2R packages from
+    // libultraship/src/fast/shaders/postprocess/. Hardcoded rather
+    // than enumerated at runtime so the menu picker stays stable
+    // across archive contents and so a port that ships a stripped
+    // f3d.o2r still gets a usable default selection.
     return { "scanlines", "crt-lottes" };
 }
 
