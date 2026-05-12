@@ -96,7 +96,20 @@ class PostProcessChain {
         PostProcessPresetPass config;
     };
 
+    // libretro `aliasN` produces a named binding sampleable by any
+    // later pass. Stored in declaration order so binding-slot indices
+    // (2 + i) stay stable from compile time through every Run call.
+    // `producerPassIdx` is the index in mPasses whose output the
+    // alias names — if a later alias name shadows an earlier one,
+    // libretro's spec leaves the result undefined; we keep first-
+    // declared wins.
+    struct Alias {
+        std::string name;
+        size_t      producerPassIdx;
+    };
+
     std::vector<Pass> mPasses;
+    std::vector<Alias> mAliases;
     int mDstFb = -1;
     uint32_t mDstWidth = 0;
     uint32_t mDstHeight = 0;

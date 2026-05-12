@@ -88,10 +88,18 @@ std::string ShortenPassName(const std::string& path) {
 // Run the user-shader pipeline on a raw GLSL string: normalize ->
 // transpile to HLSL/MSL via SPIRV-Cross. Returns a fully-populated
 // PostProcessSource ready for PostProcessChain::LoadPasses.
-PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl) {
+//
+// `aliasNames` carries the .glslp `aliasN` declarations from earlier
+// passes (or this pass and later — the chain leaves slot bindings
+// stable per preset). The normalizer and transpiler use them to
+// declare matching `uniform sampler2D <name>` bindings in each
+// language. Single-pass `.glsl` files pass an empty vector.
+PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl,
+                             const std::vector<std::string>& aliasNames) {
     PostProcessSource src;
     src.name = displayName;
-    src.glsl = NormalizeUserGlsl(rawGlsl);
+    src.aliasNames = aliasNames;
+    src.glsl = NormalizeUserGlsl(rawGlsl, aliasNames);
     std::string err;
     if (!PostProcessTranspiler::SynthesizeMissing(src, err)) {
         SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", displayName, err);
@@ -108,7 +116,7 @@ bool LoadSinglePassBundle(const std::string& name, const std::string& fsBase,
     out.name = name;
     out.sources.clear();
     out.configs.clear();
-    out.sources.push_back(MakeSource(name, std::move(raw)));
+    out.sources.push_back(MakeSource(name, std::move(raw), {}));
     out.configs.emplace_back(); // Default scale_type=source, scale=1.0.
     return true;
 }
@@ -133,6 +141,28 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
         return false;
     }
 
+    // Collect the preset's alias names in declaration order. Each
+    // pass's compile sees the same alias list so the binding slots
+    // (2 + alias_index) stay stable across the chain — pass 0 binds
+    // slot 2 to the same alias name pass 4 does.
+    std::vector<std::string> aliasNames;
+    aliasNames.reserve(preset.passes.size());
+    for (const auto& passCfg : preset.passes) {
+        if (passCfg.alias.empty()) {
+            continue;
+        }
+        bool dup = false;
+        for (const std::string& existing : aliasNames) {
+            if (existing == passCfg.alias) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            aliasNames.push_back(passCfg.alias);
+        }
+    }
+
     out.name = name;
     out.sources.clear();
     out.configs.clear();
@@ -150,7 +180,7 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
         }
         const std::string displayName =
             name + "[" + std::to_string(i) + "/" + ShortenPassName(passCfg.shaderPath) + "]";
-        out.sources.push_back(MakeSource(displayName, std::move(raw)));
+        out.sources.push_back(MakeSource(displayName, std::move(raw), aliasNames));
         out.configs.push_back(passCfg);
     }
     return true;

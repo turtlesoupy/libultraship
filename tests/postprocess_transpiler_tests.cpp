@@ -225,6 +225,36 @@ void main() {
     EXPECT_NE(src.msl.find("[[texture(1)]]"), std::string::npos);
 }
 
+TEST(PostProcessTranspiler, BindsAliasSamplersToHigherSlots) {
+    // A pass that samples both Source and an alias-bound earlier-pass
+    // output via the libretro `aliasN` convention. The runtime
+    // populates PostProcessSource::aliasNames so the normalizer and
+    // transpiler reserve slot 2 (= 2 + 0) for the first alias.
+    constexpr const char* kSrc = R"(#version 330 core
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D Source;
+uniform sampler2D LinearizePass;
+void main() {
+    vec3 a = texture(Source, vTexCoord).rgb;
+    vec3 b = texture(LinearizePass, vTexCoord).rgb;
+    fragColor = vec4(a + b, 1.0);
+}
+)";
+    Fast::PostProcessSource src;
+    src.name = "alias-test";
+    src.glsl = Fast::NormalizeUserGlsl(kSrc, { "LinearizePass" });
+    src.aliasNames = { "LinearizePass" };
+    std::string err;
+    ASSERT_TRUE(Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) << err;
+    EXPECT_FALSE(src.hlsl.empty());
+    EXPECT_FALSE(src.msl.empty());
+    // HLSL: alias lands at t2/s2 (Source=0, Original=1, alias=2+idx).
+    EXPECT_NE(src.hlsl.find("LinearizePass : register(t2)"), std::string::npos);
+    // MSL: texture(2) attribute via add_msl_resource_binding.
+    EXPECT_NE(src.msl.find("[[texture(2)]]"), std::string::npos);
+}
+
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {
     Fast::PostProcessSource src;
     src.name = "empty";

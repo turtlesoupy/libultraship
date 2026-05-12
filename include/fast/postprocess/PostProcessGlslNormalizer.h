@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace Fast {
 
@@ -38,5 +39,15 @@ namespace Fast {
 // see a duplicate-declaration error at GLSL compile time; renaming the
 // local is the workaround.
 std::string NormalizeUserGlsl(const std::string& src);
+
+// Overload accepting an ordered alias list. Each alias `<name>` is
+// declared in the preamble as `uniform sampler2D <name>` and
+// `uniform vec2 <name>Size`, matching libretro `.glslp` alias
+// conventions. User declarations of those names are stripped before
+// re-injection (same treatment as Source / Original). `aliasNames`
+// can be empty — the function then behaves identically to the single-
+// argument overload.
+std::string NormalizeUserGlsl(const std::string& src,
+                              const std::vector<std::string>& aliasNames);
 
 } // namespace Fast

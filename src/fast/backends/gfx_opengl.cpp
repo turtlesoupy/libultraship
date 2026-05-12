@@ -1055,6 +1055,10 @@ int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
     slot.originalSizeLocation = glGetUniformLocation(prog, "OriginalSize");
     slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
     slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
+    slot.aliasLocations.reserve(src.aliasNames.size());
+    for (const std::string& alias : src.aliasNames) {
+        slot.aliasLocations.push_back(glGetUniformLocation(prog, alias.c_str()));
+    }
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
         if (mPostProcessPrograms[i].program == 0) {
@@ -1205,6 +1209,47 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     mLastBoundTextures[1] = originalTex;
+
+    // Alias / external-texture bindings at TUs 2+. Each entry's
+    // sampler state comes from the producer pass's libretro
+    // filter_linearN / wrap_modeN. sourceFb == -1 means "producer
+    // pass hasn't run yet at this point in the chain" — bind the
+    // game FB (Original) as a defensive fallback so the shader's
+    // texture() reads something sane rather than a stale slot.
+    auto glWrap = [](PostProcessWrapMode m) -> GLint {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return GL_CLAMP_TO_EDGE;
+            case PostProcessWrapMode::ClampToBorder:
+#ifdef USE_OPENGLES
+                return GL_CLAMP_TO_EDGE;
+#else
+                return GL_CLAMP_TO_BORDER;
+#endif
+            case PostProcessWrapMode::Repeat:         return GL_REPEAT;
+            case PostProcessWrapMode::MirroredRepeat: return GL_MIRRORED_REPEAT;
+        }
+        return GL_CLAMP_TO_EDGE;
+    };
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        GLuint tex = originalTex;
+        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size() &&
+            mFrameBuffers[eb.sourceFb].clrbuf != 0) {
+            tex = mFrameBuffers[eb.sourceFb].clrbuf;
+        }
+        const GLenum unit = GL_TEXTURE2 + (GLenum)i;
+        glActiveTexture(unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        const GLint flt = eb.filterLinear ? GL_LINEAR : GL_NEAREST;
+        const GLint wrp = glWrap(eb.wrapMode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, flt);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, flt);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrp);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrp);
+        if (i < (size_t)SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[i] = tex;
+        }
+    }
     // Leave the active texture on TU0 so the next regular draw's
     // glActiveTexture call doesn't have to undo us.
     glActiveTexture(GL_TEXTURE0);
@@ -1217,6 +1262,11 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     }
     if (slot.originalLocation >= 0) {
         glUniform1i(slot.originalLocation, 1);
+    }
+    for (size_t i = 0; i < slot.aliasLocations.size(); ++i) {
+        if (slot.aliasLocations[i] >= 0) {
+            glUniform1i(slot.aliasLocations[i], (GLint)(2 + i));
+        }
     }
     if (slot.originalSizeLocation >= 0) {
         glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,

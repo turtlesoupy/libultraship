@@ -127,8 +127,33 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
         staged.push_back(std::move(p));
     }
 
+    // Build the ordered alias list. Each pass with a non-empty
+    // cfg.alias declares a binding name that any later pass can sample
+    // via `uniform sampler2D <name>` at slot 2 + alias_index. First-
+    // declared wins on name collision (libretro spec leaves the
+    // collision undefined; we pick the deterministic option).
+    std::vector<Alias> stagedAliases;
+    stagedAliases.reserve(configs.size());
+    for (size_t i = 0; i < configs.size(); ++i) {
+        const std::string& a = configs[i].alias;
+        if (a.empty()) {
+            continue;
+        }
+        bool dup = false;
+        for (const Alias& existing : stagedAliases) {
+            if (existing.name == a) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            stagedAliases.push_back({ a, i });
+        }
+    }
+
     UnloadShader(rapi);
     mPasses = std::move(staged);
+    mAliases = std::move(stagedAliases);
     mLoadedName = sources.front().name; // Preset / shader display name.
     return true;
 }
@@ -146,6 +171,7 @@ void PostProcessChain::UnloadShader(GfxRenderingAPI* rapi) {
         }
     }
     mPasses.clear();
+    mAliases.clear();
     mLoadedName.clear();
 }
 
@@ -167,6 +193,16 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
     uint32_t curH = params.srcHeight;
     const size_t lastIdx = mPasses.size() - 1;
 
+    // Per-pass extraBindings buffer. Stable storage across the call so
+    // each pass can hand the backend a pointer that outlives the
+    // RunPostProcess body. Sized once at the alias count, indexed by
+    // alias slot; entries with sourceFb == -1 signal "not yet produced
+    // at this pass index" so backends can fall back safely.
+    std::vector<PostProcessExtraBinding> extraBindings(mAliases.size());
+    for (size_t i = 0; i < mAliases.size(); ++i) {
+        extraBindings[i].name = mAliases[i].name;
+    }
+
     // libretro semantics: `filter_linearN` and `wrap_modeN` apply to
     // pass N's OUTPUT when later passes sample it. So pass i's `Source`
     // sampler comes from pass[i-1].config. Pass 0 reads from the game
@@ -178,6 +214,26 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
     for (size_t i = 0; i < mPasses.size(); ++i) {
         Pass& p = mPasses[i];
         const bool isLast = (i == lastIdx);
+
+        // Refresh alias bindings for any alias produced by a pass we
+        // already ran (producerPassIdx < i). The producer's outputFb is
+        // its chain-managed intermediate (or mDstFb if the producer is
+        // the last pass — but the last pass has no later consumers, so
+        // that branch only matters for malformed presets and falls back
+        // to the producer's own input).
+        for (size_t a = 0; a < mAliases.size(); ++a) {
+            const Alias& al = mAliases[a];
+            if (al.producerPassIdx < i) {
+                const Pass& prod = mPasses[al.producerPassIdx];
+                extraBindings[a].sourceFb = (al.producerPassIdx == lastIdx) ? mDstFb : prod.outputFb;
+                extraBindings[a].width = prod.lastWidth;
+                extraBindings[a].height = prod.lastHeight;
+                extraBindings[a].filterLinear = prod.config.filterLinear;
+                extraBindings[a].wrapMode = prod.config.wrapMode;
+            }
+            // else: alias's producer is this pass or a later one —
+            // leave sourceFb = -1 so the backend falls back to black.
+        }
 
         uint32_t outW, outH;
         int outFb;
@@ -221,6 +277,8 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
             pp.frameCount = params.frameCount %
                             static_cast<uint32_t>(p.config.frameCountMod);
         }
+        pp.extraBindings = extraBindings.empty() ? nullptr : extraBindings.data();
+        pp.extraBindingsCount = extraBindings.size();
         rapi->RunPostProcess(p.programId, curIn, outFb, originalFb, pp);
 
         curIn = outFb;

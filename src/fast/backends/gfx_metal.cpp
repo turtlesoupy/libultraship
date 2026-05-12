@@ -1697,6 +1697,29 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
     enc->setFragmentTexture(originalTexture, 1);
     enc->setFragmentSamplerState(origSampler, 1);
 
+    // Alias / external-texture bindings at slots 2..N+1. Each entry's
+    // sampler comes from the per-pass (filter, wrap) cache. sourceFb
+    // == -1 (producer pass hasn't run yet in this chain pass index)
+    // falls back to the Original texture so the shader's texture()
+    // call reads a sensible value rather than the stale slot.
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        MTL::Texture* texToBind = originalTexture;
+        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[eb.sourceFb];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    texToBind = t;
+                }
+            }
+        }
+        const NS::UInteger slot = (NS::UInteger)(2 + i);
+        enc->setFragmentTexture(texToBind, slot);
+        MTL::SamplerState* s = getSampler(eb.filterLinear, eb.wrapMode);
+        enc->setFragmentSamplerState(s, slot);
+    }
+
     PostProcessUniformsMetal uni{};
     uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
     uni.outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };

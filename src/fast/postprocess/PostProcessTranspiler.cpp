@@ -82,9 +82,45 @@ bool LineStartMatchesSchema(const std::string& trimmed) {
     return false;
 }
 
+// Strip the user's `uniform sampler2D <alias>` declaration — the
+// Vulkan-flavored preamble injects a binding-explicit version. Only
+// looks at lines starting with `uniform`; ignores `<alias>Size` (not
+// in scope for Phase 2H).
+bool LineStartMatchesAlias(const std::string& trimmed,
+                           const std::vector<std::string>& aliasNames) {
+    if (aliasNames.empty()) {
+        return false;
+    }
+    static constexpr const char* kPrefix = "uniform sampler2D ";
+    constexpr size_t kPrefixLen = 18; // strlen("uniform sampler2D ")
+    if (trimmed.size() <= kPrefixLen || trimmed.compare(0, kPrefixLen, kPrefix) != 0) {
+        return false;
+    }
+    // After the prefix, expect the alias name as the next identifier
+    // followed by ` ` / `;` / `=`.
+    for (const std::string& alias : aliasNames) {
+        if (alias.empty() || trimmed.size() < kPrefixLen + alias.size()) {
+            continue;
+        }
+        if (trimmed.compare(kPrefixLen, alias.size(), alias) != 0) {
+            continue;
+        }
+        const size_t end = kPrefixLen + alias.size();
+        if (end == trimmed.size()) {
+            return true;
+        }
+        const char c = trimmed[end];
+        if (c == ' ' || c == '\t' || c == ';' || c == '=') {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Rewrite the user GLSL into a Vulkan-targeted form: strip user
 // `#version` / schema declarations, prepend binding-explicit replacements.
-std::string PreprocessForVulkan(const std::string& src) {
+std::string PreprocessForVulkan(const std::string& src,
+                                const std::vector<std::string>& aliasNames) {
     std::istringstream in(src);
     std::string line;
     std::vector<std::string> body;
@@ -100,12 +136,28 @@ std::string PreprocessForVulkan(const std::string& src) {
         if (LineStartMatchesSchema(trimmed)) {
             continue;
         }
+        if (LineStartMatchesAlias(trimmed, aliasNames)) {
+            continue;
+        }
         body.push_back(line);
     }
     std::string out;
     out.reserve(src.size() + 512);
     out += "#version 450\n";
     out += kInjectedDeclarations;
+    // Per-alias binding-explicit sampler declarations at slots 3, 4, ...
+    // (Source=0, Original=1, PostProcessUniforms=2, aliases=3+).
+    for (size_t i = 0; i < aliasNames.size(); ++i) {
+        const std::string& alias = aliasNames[i];
+        if (alias.empty()) {
+            continue;
+        }
+        out += "layout(set=0, binding=";
+        out += std::to_string(3 + i);
+        out += ") uniform sampler2D ";
+        out += alias;
+        out += ";\n";
+    }
     for (const auto& l : body) {
         out += l;
         out += '\n';
@@ -189,8 +241,9 @@ constexpr const char* kStockHlslVertex =
     "    return o;\n"
     "}\n\n";
 
-bool TranspileHlsl(const std::vector<unsigned int>& spirv, std::string& outHlsl,
-                   std::string& errOut) {
+bool TranspileHlsl(const std::vector<unsigned int>& spirv,
+                   const std::vector<std::string>& aliasNames,
+                   std::string& outHlsl, std::string& errOut) {
     try {
         spirv_cross::CompilerHLSL compiler(spirv);
         spirv_cross::CompilerHLSL::Options opts;
@@ -213,16 +266,20 @@ bool TranspileHlsl(const std::vector<unsigned int>& spirv, std::string& outHlsl,
             // Per-sampler register assignment. SPIRV-Cross splits each
             // combined sampler into Texture2D + SamplerState; both
             // take the same numeric register index in their respective
-            // t* / s* spaces.
-            //
-            // Identification by name: the normalizer's preamble names
-            // them `Source` and `Original`. Anything else (unlikely —
-            // shaders that declare their own samplers would do so
-            // outside the schema list) defaults to slot 0.
+            // t* / s* spaces. Schema bindings: Source=0, Original=1.
+            // Aliases land at 2 + alias_index, matching the order the
+            // chain populates extraBindings[] at run time.
             const std::string& name = compiler.get_name(img.id);
             uint32_t slot = 0;
             if (name == "Original") {
                 slot = 1;
+            } else {
+                for (size_t i = 0; i < aliasNames.size(); ++i) {
+                    if (name == aliasNames[i]) {
+                        slot = static_cast<uint32_t>(2 + i);
+                        break;
+                    }
+                }
             }
             compiler.set_decoration(img.id, spv::DecorationDescriptorSet, 0);
             compiler.set_decoration(img.id, spv::DecorationBinding, slot);
@@ -267,8 +324,9 @@ constexpr const char* kStockMslVertex =
     "    return o;\n"
     "}\n\n";
 
-bool TranspileMsl(const std::vector<unsigned int>& spirv, std::string& outMsl,
-                  std::string& errOut) {
+bool TranspileMsl(const std::vector<unsigned int>& spirv,
+                  const std::vector<std::string>& aliasNames,
+                  std::string& outMsl, std::string& errOut) {
     try {
         spirv_cross::CompilerMSL compiler(spirv);
         spirv_cross::CompilerMSL::Options opts;
@@ -307,6 +365,20 @@ bool TranspileMsl(const std::vector<unsigned int>& spirv, std::string& outMsl,
         ubo.msl_sampler = 0;
         compiler.add_msl_resource_binding(ubo);
 
+        // Aliases at binding=3+i (Vulkan) → texture(2+i)+sampler(2+i)
+        // (MSL flat slot space). The Metal RunPostProcess loop binds
+        // extraBindings[i] to the same slot order.
+        for (size_t i = 0; i < aliasNames.size(); ++i) {
+            spirv_cross::MSLResourceBinding aliasBind{};
+            aliasBind.stage = spv::ExecutionModelFragment;
+            aliasBind.desc_set = 0;
+            aliasBind.binding = static_cast<uint32_t>(3 + i);
+            aliasBind.msl_texture = static_cast<uint32_t>(2 + i);
+            aliasBind.msl_sampler = static_cast<uint32_t>(2 + i);
+            aliasBind.msl_buffer = 0;
+            compiler.add_msl_resource_binding(aliasBind);
+        }
+
         auto resources = compiler.get_shader_resources();
         for (auto& uboRes : resources.uniform_buffers) {
             compiler.set_name(uboRes.id, "PostProcessUniforms");
@@ -333,7 +405,7 @@ bool PostProcessTranspiler::SynthesizeMissing(PostProcessSource& inout, std::str
         return true;
     }
 
-    const std::string vulkanSrc = PreprocessForVulkan(inout.glsl);
+    const std::string vulkanSrc = PreprocessForVulkan(inout.glsl, inout.aliasNames);
     std::vector<unsigned int> spirv;
     if (!CompileFragmentToSpirv(vulkanSrc, spirv, errOut)) {
         return false;
@@ -341,7 +413,7 @@ bool PostProcessTranspiler::SynthesizeMissing(PostProcessSource& inout, std::str
 
     if (wantHlsl) {
         std::string hlslFs;
-        if (!TranspileHlsl(spirv, hlslFs, errOut)) {
+        if (!TranspileHlsl(spirv, inout.aliasNames, hlslFs, errOut)) {
             return false;
         }
         inout.hlsl.clear();
@@ -350,7 +422,7 @@ bool PostProcessTranspiler::SynthesizeMissing(PostProcessSource& inout, std::str
     }
     if (wantMsl) {
         std::string mslFs;
-        if (!TranspileMsl(spirv, mslFs, errOut)) {
+        if (!TranspileMsl(spirv, inout.aliasNames, mslFs, errOut)) {
             return false;
         }
         inout.msl.clear();

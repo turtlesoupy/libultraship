@@ -1831,9 +1831,6 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
             }
         }
     }
-    ID3D11ShaderResourceView* srvs[2] = { srcTex.resource_view.Get(), originalSrv };
-    mContext->PSSetShaderResources(0, 2, srvs);
-
     // Slot 0 (Source) sampler comes from the producer pass's
     // libretro filter_linearN / wrap_modeN, encoded as a small cache
     // key. Slot 1 (Original) stays at the default linear / clamp-to-edge
@@ -1874,8 +1871,36 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     };
     ID3D11SamplerState* srcSamp = getSampler(params.srcFilterLinear, params.srcWrapMode);
     ID3D11SamplerState* origSamp = getSampler(true, PostProcessWrapMode::ClampToEdge);
-    ID3D11SamplerState* samps[2] = { srcSamp, origSamp };
-    mContext->PSSetSamplers(0, 2, samps);
+
+    // Alias / external-texture bindings at slots 2..N+1. Cap at 8
+    // total PS resource slots so we stay well under the D3D11 input
+    // resource limit (128) and don't need a dynamic buffer.
+    constexpr size_t kMaxPostProcessSlots = 8;
+    ID3D11ShaderResourceView* extraSrvs[kMaxPostProcessSlots] = {};
+    ID3D11SamplerState* extraSamps[kMaxPostProcessSlots] = {};
+    extraSrvs[0] = srcTex.resource_view.Get();
+    extraSrvs[1] = originalSrv;
+    extraSamps[0] = srcSamp;
+    extraSamps[1] = origSamp;
+    size_t totalSlots = 2;
+    for (size_t i = 0; i < params.extraBindingsCount && totalSlots < kMaxPostProcessSlots; ++i) {
+        const auto& eb = params.extraBindings[i];
+        ID3D11ShaderResourceView* srv = originalSrv; // defensive fallback
+        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size()) {
+            const FramebufferDX11& f = mFrameBuffers[eb.sourceFb];
+            if (f.texture_id < mTextures.size()) {
+                ID3D11ShaderResourceView* maybe = mTextures[f.texture_id].resource_view.Get();
+                if (maybe != nullptr) {
+                    srv = maybe;
+                }
+            }
+        }
+        extraSrvs[totalSlots] = srv;
+        extraSamps[totalSlots] = getSampler(eb.filterLinear, eb.wrapMode);
+        ++totalSlots;
+    }
+    mContext->PSSetShaderResources(0, (UINT)totalSlots, extraSrvs);
+    mContext->PSSetSamplers(0, (UINT)totalSlots, extraSamps);
     ID3D11Buffer* cb = mPostProcessCb.Get();
     mContext->VSSetConstantBuffers(0, 1, &cb);
     mContext->PSSetConstantBuffers(0, 1, &cb);
@@ -1894,10 +1919,13 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     mLastVertexBufferStride = 0;
 
-    // Detach the SRV so the next pass that wants to render into srcFb
-    // (some other game frame) doesn't trip the "RTV-and-SRV-bound" warning.
-    ID3D11ShaderResourceView* nullSrv = nullptr;
-    mContext->PSSetShaderResources(0, 1, &nullSrv);
+    // Detach the SRVs so a subsequent pass that wants to render into
+    // any of these textures doesn't trip the RTV-and-SRV-bound warning.
+    // Includes the alias slots since they may bind earlier-pass FBOs
+    // that a later pass writes into via a re-resolve (rare, but the
+    // chain doesn't guarantee otherwise).
+    ID3D11ShaderResourceView* nullSrvs[kMaxPostProcessSlots] = {};
+    mContext->PSSetShaderResources(0, (UINT)totalSlots, nullSrvs);
 }
 
 } // namespace Fast

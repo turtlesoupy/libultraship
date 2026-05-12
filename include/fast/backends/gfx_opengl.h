@@ -73,6 +73,13 @@ struct PostProcessProgramOGL {
     GLint originalSizeLocation = -1; // vec2 OriginalSize
     GLint frameCountLocation = -1;
     GLint frameDirectionLocation = -1;
+    // Per-alias `uniform sampler2D <name>` locations. Index i in this
+    // vector is the alias bound at texture slot (2 + i) — matches
+    // PostProcessSource::aliasNames and the chain's extraBindings
+    // ordering. Locations may be -1 (driver optimised the uniform out
+    // because the shader doesn't sample it); the binding loop skips
+    // those.
+    std::vector<GLint> aliasLocations;
     std::string name;
 };
 

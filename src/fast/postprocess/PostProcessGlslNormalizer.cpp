@@ -88,6 +88,27 @@ constexpr const char* kSchemaIdentifiers[] = {
     "Original", "OriginalSize",
 };
 
+// Per-alias check: strip the user's `uniform sampler2D <alias>`
+// declarations so the preamble's canonical, binding-explicit version
+// doesn't collide. `<alias>Size` uniforms are NOT in scope for Phase
+// 2H — shaders that reference them currently see zero on HLSL/MSL.
+// Use `textureSize(<alias>, 0)` instead until a later phase plumbs
+// alias-size members through the runtime UBO.
+bool IsAliasDeclarationLine(const std::string& line, const std::vector<std::string>& aliases) {
+    if (!LineStartsWithKeyword(line, "uniform")) {
+        return false;
+    }
+    for (const std::string& a : aliases) {
+        if (a.empty()) {
+            continue;
+        }
+        if (LineHasIdentifier(line, a.c_str())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool IsSchemaDeclarationLine(const std::string& line) {
     // Strip every top-level `in` / `varying` / `IN` / `attribute` / `out`
     // / `OUT` declaration. A fragment-shader post-process pass only has
@@ -157,6 +178,11 @@ constexpr const char* kPreamble =
 } // namespace
 
 std::string NormalizeUserGlsl(const std::string& src) {
+    return NormalizeUserGlsl(src, {});
+}
+
+std::string NormalizeUserGlsl(const std::string& src,
+                              const std::vector<std::string>& aliasNames) {
     // Step 1 — rewrite libretro / legacy identifier names to our schema.
     // Done as a whole-buffer pass before line-walking so that downstream
     // strip decisions see canonical names regardless of which alias the
@@ -229,12 +255,30 @@ std::string NormalizeUserGlsl(const std::string& src) {
         if (IsSchemaDeclarationLine(line)) {
             continue;
         }
+        if (!aliasNames.empty() && IsAliasDeclarationLine(line, aliasNames)) {
+            continue;
+        }
         out.push_back(line);
     }
 
     std::string normalized;
     normalized.reserve(body.size() + 512);
     normalized += kPreamble;
+    // Append per-alias sampler declarations after the canonical
+    // preamble so they share the schema's strip / re-inject contract.
+    // Names come from the .glslp `aliasN` keys via the chain, in
+    // declaration order — slot binding (2 + i) follows the same
+    // ordering, so the transpiler can match without an out-of-band
+    // sync. `<alias>Size` is intentionally NOT declared; see the
+    // limitation comment on IsAliasDeclarationLine.
+    for (const std::string& alias : aliasNames) {
+        if (alias.empty()) {
+            continue;
+        }
+        normalized += "uniform sampler2D ";
+        normalized += alias;
+        normalized += ";\n";
+    }
     for (const auto& l : out) {
         normalized += l;
         normalized += '\n';

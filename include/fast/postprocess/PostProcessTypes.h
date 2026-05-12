@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 #include "PostProcessPreset.h"
 
@@ -79,6 +80,33 @@ struct PostProcessParams {
     // no per-pass control over the original FB sampler.
     bool                srcFilterLinear = true;
     PostProcessWrapMode srcWrapMode     = PostProcessWrapMode::ClampToEdge;
+
+    // Optional named bindings for libretro `aliasN` and (later phases)
+    // external `textures = "..."`. Backends bind these at sampler /
+    // texture slots starting at 2 (slots 0/1 are Source/Original); the
+    // i-th entry binds to slot 2 + i. Order matches the slot order the
+    // transpiler reserved in the HLSL/MSL emit, which in turn comes
+    // from PostProcessSource::aliasNames at compile time.
+    const struct PostProcessExtraBinding* extraBindings = nullptr;
+    size_t extraBindingsCount = 0;
+};
+
+// One named-sampler binding flowed through PostProcessParams. Backends
+// look up the FBO color texture at `sourceFb` and bind it + a sampler
+// matching `filterLinear` / `wrapMode` at slot 2 + bindingIndex.
+//
+// `sourceFb = -1` means "alias's producer pass hasn't run yet at this
+// point in the chain" — backends should bind a 1x1 black texture (or
+// the Original FB as a defensive fallback) so the shader's
+// `texture(<alias>, ...)` reads black rather than reading whatever was
+// last in the slot, which would visually leak prior frame state.
+struct PostProcessExtraBinding {
+    std::string         name;          // Diagnostic / matches transpiler slot
+    int                 sourceFb = -1; // FBO id whose color texture we sample
+    uint32_t            width    = 1;
+    uint32_t            height   = 1;
+    bool                filterLinear = true;
+    PostProcessWrapMode wrapMode = PostProcessWrapMode::ClampToEdge;
 };
 
 // Per-backend source text for a single fragment-shader pass.
@@ -94,6 +122,17 @@ struct PostProcessSource {
     std::string glsl; // GLSL 330 core fragment-shader source.
     std::string hlsl; // HLSL SM 5.0 fragment-shader source.
     std::string msl;  // MSL 2.2 fragment-shader source.
+
+    // Ordered list of named-sampler bindings the transpiler reserved
+    // slots for, starting at slot 2 (Source=0, Original=1). The
+    // normalizer pre-declares these as `uniform sampler2D <name>` and
+    // `uniform vec2 <name>Size` in the GLSL preamble; HLSL/MSL emit
+    // map them to register t2+/s2+ and texture(2+)/sampler(2+).
+    //
+    // Populated by the loader from the preset's alias list (and, in
+    // later phases, external `textures = "..."` declarations). Empty
+    // for single-pass shaders or .glslp presets without any aliases.
+    std::vector<std::string> aliasNames;
 };
 
 } // namespace Fast
