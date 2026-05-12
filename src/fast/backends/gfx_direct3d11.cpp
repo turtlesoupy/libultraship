@@ -1738,18 +1738,8 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
         return;
     }
 
-    // Lazily allocate the shared sampler and uniform constant buffer.
-    if (mPostProcessSampler.Get() == nullptr) {
-        D3D11_SAMPLER_DESC sd = {};
-        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-        sd.MinLOD = 0;
-        sd.MaxLOD = D3D11_FLOAT32_MAX;
-        ThrowIfFailed(mDevice->CreateSamplerState(&sd, mPostProcessSampler.GetAddressOf()));
-    }
+    // Lazily allocate the uniform constant buffer. Samplers are looked
+    // up per-call from the (filter, wrap) cache below.
     if (mPostProcessCb.Get() == nullptr) {
         D3D11_BUFFER_DESC bd = {};
         bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -1822,8 +1812,48 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     }
     ID3D11ShaderResourceView* srvs[2] = { srcTex.resource_view.Get(), originalSrv };
     mContext->PSSetShaderResources(0, 2, srvs);
-    ID3D11SamplerState* samp = mPostProcessSampler.Get();
-    ID3D11SamplerState* samps[2] = { samp, samp };
+
+    // Slot 0 (Source) sampler comes from the producer pass's
+    // libretro filter_linearN / wrap_modeN, encoded as a small cache
+    // key. Slot 1 (Original) stays at the default linear / clamp-to-edge
+    // because .glslp has no per-pass override for it.
+    auto wrapModeToD3D = [](PostProcessWrapMode m) -> D3D11_TEXTURE_ADDRESS_MODE {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return D3D11_TEXTURE_ADDRESS_CLAMP;
+            case PostProcessWrapMode::ClampToBorder:  return D3D11_TEXTURE_ADDRESS_BORDER;
+            case PostProcessWrapMode::Repeat:         return D3D11_TEXTURE_ADDRESS_WRAP;
+            case PostProcessWrapMode::MirroredRepeat: return D3D11_TEXTURE_ADDRESS_MIRROR;
+        }
+        return D3D11_TEXTURE_ADDRESS_CLAMP;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> ID3D11SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second.Get();
+        }
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                           : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        const D3D11_TEXTURE_ADDRESS_MODE addr = wrapModeToD3D(wrap);
+        sd.AddressU = addr;
+        sd.AddressV = addr;
+        sd.AddressW = addr;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        // Border color stays at zeroed RGBA (matches GL's transparent-
+        // black default for CLAMP_TO_BORDER).
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sd, sampler.GetAddressOf()));
+        ID3D11SamplerState* raw = sampler.Get();
+        mPostProcessSamplers.emplace(key, std::move(sampler));
+        return raw;
+    };
+    ID3D11SamplerState* srcSamp = getSampler(params.srcFilterLinear, params.srcWrapMode);
+    ID3D11SamplerState* origSamp = getSampler(true, PostProcessWrapMode::ClampToEdge);
+    ID3D11SamplerState* samps[2] = { srcSamp, origSamp };
     mContext->PSSetSamplers(0, 2, samps);
     ID3D11Buffer* cb = mPostProcessCb.Get();
     mContext->VSSetConstantBuffers(0, 1, &cb);

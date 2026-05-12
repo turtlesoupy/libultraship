@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <string>
 
+#include "PostProcessPreset.h"
+
 namespace Fast {
 
 // Per-frame inputs the runtime supplies to each post-process pass.
@@ -42,6 +44,20 @@ struct PostProcessParams {
     uint32_t dstHeight;         //   surface the pass renders into).
     uint32_t frameCount;        // Monotonic frame counter, wraps.
     float    frameDeltaSeconds; // Wall-clock delta since previous frame.
+
+    // Sampler state for the `Source` binding (slot 0). The chain
+    // populates these from the producer pass's libretro filter_linear /
+    // wrap_mode keys — i.e. pass i's Source sampler is set from
+    // pass[i-1].config. Pass 0 reads from the game FB, which has no
+    // producer; the chain leaves the defaults (linear, clamp-to-edge)
+    // and that input is rendered into by the regular game pipeline at
+    // its own filtering settings anyway.
+    //
+    // The `Original` binding (slot 1) is intentionally pinned to the
+    // backend default (linear, clamp-to-edge) — libretro's `.glslp` has
+    // no per-pass control over the original FB sampler.
+    bool                srcFilterLinear = true;
+    PostProcessWrapMode srcWrapMode     = PostProcessWrapMode::ClampToEdge;
 };
 
 // Per-backend source text for a single fragment-shader pass.

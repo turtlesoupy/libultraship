@@ -153,6 +153,14 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
     uint32_t curH = params.srcHeight;
     const size_t lastIdx = mPasses.size() - 1;
 
+    // libretro semantics: `filter_linearN` and `wrap_modeN` apply to
+    // pass N's OUTPUT when later passes sample it. So pass i's `Source`
+    // sampler comes from pass[i-1].config. Pass 0 reads from the game
+    // FB, which has no producer pass in the chain; fall back to the
+    // backend default the params already carry (linear, clamp-to-edge).
+    bool                srcFilter = params.srcFilterLinear;
+    PostProcessWrapMode srcWrap   = params.srcWrapMode;
+
     for (size_t i = 0; i < mPasses.size(); ++i) {
         Pass& p = mPasses[i];
         const bool isLast = (i == lastIdx);
@@ -188,11 +196,17 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         pp.originalHeight = originalHeight;
         pp.dstWidth = outW;
         pp.dstHeight = outH;
+        pp.srcFilterLinear = srcFilter;
+        pp.srcWrapMode     = srcWrap;
         rapi->RunPostProcess(p.programId, curIn, outFb, originalFb, pp);
 
         curIn = outFb;
         curW = outW;
         curH = outH;
+        // The pass we just ran becomes the producer for the next pass's
+        // Source sampler.
+        srcFilter = p.config.filterLinear;
+        srcWrap   = p.config.wrapMode;
     }
     return mDstFb;
 }

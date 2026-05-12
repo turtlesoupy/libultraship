@@ -73,10 +73,11 @@ struct ShaderProgramMetal {
 //   - fragment function: "postprocess_fragment"
 //   - fragment binding texture(0)=Source, sampler(0)=SourceSampler,
 //     buffer(0) = PostProcessUniformsMetal
-// The sampler is owned alongside so DestroyPostProcessProgram is one call.
+// Samplers are pulled from the backend-wide (filter, wrap) cache in
+// RunPostProcess so per-pass libretro filter_linearN / wrap_modeN
+// settings take effect; this struct no longer owns one.
 struct PostProcessProgramMetal {
     MTL::RenderPipelineState* pipeline;
-    MTL::SamplerState* sampler;
     std::string name;
 };
 
@@ -260,6 +261,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     // with pipeline==nullptr are empty (returned to the free list when
     // DestroyPostProcessProgram clears them).
     std::vector<PostProcessProgramMetal> mPostProcessPrograms;
+
+    // Sampler cache shared by all post-process programs, keyed by an
+    // encoded (filter, wrap) pair. Lookup happens per pass so libretro
+    // filter_linearN / wrap_modeN translate into a small bounded set of
+    // MTL::SamplerState objects.
+    std::unordered_map<uint32_t, MTL::SamplerState*> mPostProcessSamplers;
 };
 
 } // namespace Fast

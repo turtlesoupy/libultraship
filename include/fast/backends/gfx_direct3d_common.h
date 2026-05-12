@@ -6,6 +6,7 @@
 #include "../interpreter.h"
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include "gfx_rendering_api.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
@@ -221,9 +222,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Post-process programs. Empty slots have null vertex_shader and are
     // returned to the free list when DestroyPostProcessProgram clears them.
     std::vector<PostProcessProgramD3D11> mPostProcessPrograms;
-    // Shared sampler used by every post-process pass (linear, clamp-to-edge).
-    // Created lazily on first RunPostProcess.
-    Microsoft::WRL::ComPtr<ID3D11SamplerState> mPostProcessSampler;
+    // Sampler cache keyed by (filter, wrap) so per-pass libretro
+    // `filter_linearN` / `wrap_modeN` settings translate into a small
+    // bounded set of D3D11 sampler objects. Default linear/clamp-to-edge
+    // is used for the `Original` (slot 1) binding on every call.
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D11SamplerState>>
+        mPostProcessSamplers;
     // Constant buffer for PostProcessUniformsD3D11; created lazily.
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessCb;
 };

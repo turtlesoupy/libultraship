@@ -110,13 +110,48 @@ shaders = 1
 shader0 = "x.glsl"   # trailing comment after value
 filter_linear0 = true
 parameters = "FOO;BAR"
-wrap_mode0 = clamp_to_border
 )";
     Fast::PostProcessPreset preset;
     std::string err;
     ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "", preset, err)) << err;
     ASSERT_EQ(preset.passes.size(), 1u);
     EXPECT_TRUE(preset.passes[0].filterLinear);
+}
+
+TEST(PostProcessPreset, ParsesWrapModePerPass) {
+    constexpr const char* kSrc = R"(shaders = 4
+shader0 = a.glsl
+wrap_mode0 = clamp_to_border
+shader1 = b.glsl
+wrap_mode1 = repeat
+shader2 = c.glsl
+wrap_mode2 = mirrored_repeat
+shader3 = d.glsl
+)";
+    Fast::PostProcessPreset preset;
+    std::string err;
+    ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "", preset, err)) << err;
+    ASSERT_EQ(preset.passes.size(), 4u);
+    EXPECT_EQ(preset.passes[0].wrapMode, Fast::PostProcessWrapMode::ClampToBorder);
+    EXPECT_EQ(preset.passes[1].wrapMode, Fast::PostProcessWrapMode::Repeat);
+    EXPECT_EQ(preset.passes[2].wrapMode, Fast::PostProcessWrapMode::MirroredRepeat);
+    // Pass 3 has no wrap_mode3 → default ClampToEdge.
+    EXPECT_EQ(preset.passes[3].wrapMode, Fast::PostProcessWrapMode::ClampToEdge);
+}
+
+TEST(PostProcessPreset, AcceptsCaseAndQuotedWrapModeValues) {
+    constexpr const char* kSrc = R"(shaders = 2
+shader0 = a.glsl
+wrap_mode0 = "Clamp_To_Border"
+shader1 = b.glsl
+wrap_mode1 = MIRROR
+)";
+    Fast::PostProcessPreset preset;
+    std::string err;
+    ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "", preset, err)) << err;
+    ASSERT_EQ(preset.passes.size(), 2u);
+    EXPECT_EQ(preset.passes[0].wrapMode, Fast::PostProcessWrapMode::ClampToBorder);
+    EXPECT_EQ(preset.passes[1].wrapMode, Fast::PostProcessWrapMode::MirroredRepeat);
 }
 
 // Libretro spec treats `shaders=N` as informational; if a preset over-

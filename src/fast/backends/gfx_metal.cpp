@@ -1428,17 +1428,8 @@ int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src)
         return -1;
     }
 
-    MTL::SamplerDescriptor* sdesc = MTL::SamplerDescriptor::alloc()->init();
-    sdesc->setMinFilter(MTL::SamplerMinMagFilterLinear);
-    sdesc->setMagFilter(MTL::SamplerMinMagFilterLinear);
-    sdesc->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
-    sdesc->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
-    MTL::SamplerState* sampler = mDevice->newSamplerState(sdesc);
-    sdesc->release();
-
     PostProcessProgramMetal slot{};
     slot.pipeline = pipeline;
-    slot.sampler = sampler;
     slot.name = src.name;
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
@@ -1460,9 +1451,6 @@ void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
     auto& slot = mPostProcessPrograms[progId];
     if (slot.pipeline != nullptr) {
         slot.pipeline->release();
-    }
-    if (slot.sampler != nullptr) {
-        slot.sampler->release();
     }
     slot = PostProcessProgramMetal{};
 }
@@ -1542,8 +1530,48 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
     MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
     enc->setViewport(vp);
     enc->setRenderPipelineState(slot.pipeline);
+
+    // Slot 0 (Source) sampler comes from the producer pass's libretro
+    // filter_linearN / wrap_modeN, encoded as a small cache key. Slot 1
+    // (Original) always uses the default linear / clamp-to-edge sampler
+    // because .glslp has no per-pass override for Original.
+    auto wrapModeToMetal = [](PostProcessWrapMode m) -> MTL::SamplerAddressMode {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return MTL::SamplerAddressModeClampToEdge;
+            case PostProcessWrapMode::ClampToBorder:  return MTL::SamplerAddressModeClampToBorderColor;
+            case PostProcessWrapMode::Repeat:         return MTL::SamplerAddressModeRepeat;
+            case PostProcessWrapMode::MirroredRepeat: return MTL::SamplerAddressModeMirrorRepeat;
+        }
+        return MTL::SamplerAddressModeClampToEdge;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> MTL::SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second;
+        }
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        const MTL::SamplerMinMagFilter f =
+            linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+        sd->setMinFilter(f);
+        sd->setMagFilter(f);
+        const MTL::SamplerAddressMode addr = wrapModeToMetal(wrap);
+        sd->setSAddressMode(addr);
+        sd->setTAddressMode(addr);
+        if (wrap == PostProcessWrapMode::ClampToBorder) {
+            sd->setBorderColor(MTL::SamplerBorderColorTransparentBlack);
+        }
+        MTL::SamplerState* sampler = mDevice->newSamplerState(sd);
+        sd->release();
+        mPostProcessSamplers.emplace(key, sampler);
+        return sampler;
+    };
+    MTL::SamplerState* srcSampler = getSampler(params.srcFilterLinear, params.srcWrapMode);
+    MTL::SamplerState* origSampler = getSampler(true, PostProcessWrapMode::ClampToEdge);
+
     enc->setFragmentTexture(srcTexture, 0);
-    enc->setFragmentSamplerState(slot.sampler, 0);
+    enc->setFragmentSamplerState(srcSampler, 0);
 
     // Original (game FB) on slot 1 for multipass shaders that combine
     // post-bloom Source with the pre-bloom Original. Falls back to the
@@ -1559,7 +1587,7 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         }
     }
     enc->setFragmentTexture(originalTexture, 1);
-    enc->setFragmentSamplerState(slot.sampler, 1);
+    enc->setFragmentSamplerState(origSampler, 1);
 
     PostProcessUniformsMetal uni{};
     uni.sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };

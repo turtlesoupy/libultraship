@@ -63,6 +63,28 @@ bool ParseScaleType(const std::string& v, PostProcessScaleType& out) {
     return false;
 }
 
+// Lower-cased libretro tokens. Unrecognized values leave `out` untouched
+// so the caller's pre-populated default sticks.
+bool ParseWrapMode(const std::string& v, PostProcessWrapMode& out) {
+    if (v == "clamp_to_edge" || v == "clamp" || v == "edge") {
+        out = PostProcessWrapMode::ClampToEdge;
+        return true;
+    }
+    if (v == "clamp_to_border" || v == "border") {
+        out = PostProcessWrapMode::ClampToBorder;
+        return true;
+    }
+    if (v == "repeat" || v == "wrap") {
+        out = PostProcessWrapMode::Repeat;
+        return true;
+    }
+    if (v == "mirrored_repeat" || v == "mirror") {
+        out = PostProcessWrapMode::MirroredRepeat;
+        return true;
+    }
+    return false;
+}
+
 // Split "shader42" -> ("shader", 42). Returns false if the key has no
 // numeric suffix (= it's a global key like "shaders" or "textures").
 bool SplitIndexed(const std::string& key, std::string& baseOut, int& indexOut) {
@@ -156,6 +178,13 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
             pass.shaderPath = val;
         } else if (base == "filter_linear") {
             pass.filterLinear = ParseBool(val, pass.filterLinear);
+        } else if (base == "wrap_mode") {
+            std::string lower;
+            lower.reserve(val.size());
+            for (char c : val) {
+                lower.push_back(std::tolower(static_cast<unsigned char>(c)));
+            }
+            ParseWrapMode(lower, pass.wrapMode);
         } else if (base == "srgb_framebuffer") {
             pass.srgbFramebuffer = ParseBool(val, pass.srgbFramebuffer);
         } else if (base == "float_framebuffer") {
@@ -188,10 +217,8 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
         } else if (base == "scale_y") {
             pass.scaleY = static_cast<float>(std::atof(val.c_str()));
         }
-        // Anything else (`wrap_mode<N>`, `parameters`, etc.) silently
-        // ignored — v1 doesn't bind wrap modes or expose preset
-        // parameters yet. Adding them later doesn't reshape this
-        // function.
+        // Anything else (`parameters`, preset overrides, etc.) silently
+        // ignored — adding them later doesn't reshape this function.
     }
 
     if (out.passes.empty()) {

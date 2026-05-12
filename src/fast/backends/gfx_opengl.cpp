@@ -1115,15 +1115,34 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Sample source FB's color texture on TU0 with edge-clamped linear
-    // filtering. Edge-clamp matters for CRT shaders that read beyond
-    // [0,1] for sub-pixel/scanline math.
+    // Sample source FB's color texture on TU0. Filter + wrap mode come
+    // from the producer pass's libretro `filter_linearN` / `wrap_modeN`
+    // — passed through PostProcessParams by the chain. Pass 0 sees the
+    // chain's defaults (linear / clamp-to-edge).
+    const GLint srcFilter = params.srcFilterLinear ? GL_LINEAR : GL_NEAREST;
+    GLint srcWrap = GL_CLAMP_TO_EDGE;
+    switch (params.srcWrapMode) {
+        case PostProcessWrapMode::ClampToEdge:    srcWrap = GL_CLAMP_TO_EDGE; break;
+        case PostProcessWrapMode::ClampToBorder:
+#ifdef USE_OPENGLES
+            // GLES core has no CLAMP_TO_BORDER (3.2 added it as an ext but
+            // we can't assume coverage). Fall back to edge clamp — shaders
+            // that depend on the transparent-black border behaviour will
+            // see edge-sampling artifacts but the pass still renders.
+            srcWrap = GL_CLAMP_TO_EDGE;
+#else
+            srcWrap = GL_CLAMP_TO_BORDER;
+#endif
+            break;
+        case PostProcessWrapMode::Repeat:         srcWrap = GL_REPEAT; break;
+        case PostProcessWrapMode::MirroredRepeat: srcWrap = GL_MIRRORED_REPEAT; break;
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcFbInfo.clrbuf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, srcFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, srcFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, srcWrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, srcWrap);
     mLastBoundTextures[0] = srcFbInfo.clrbuf;
 
     // Original (game FB) on TU1 for multipass shaders that combine

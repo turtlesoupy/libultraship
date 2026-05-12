@@ -15,10 +15,21 @@ enum class PostProcessScaleType {
     Absolute, // Next FBO size = scale, rounded to int pixels.
 };
 
+// libretro `wrap_modeN` values. Applied to the producer pass's output
+// when a later pass samples it as `Source`. Same mode is used for both
+// the S and T axes (libretro never splits them).
+enum class PostProcessWrapMode {
+    ClampToEdge,     // libretro: clamp_to_edge (default).
+    ClampToBorder,   // libretro: clamp_to_border (transparent-black outside).
+    Repeat,          // libretro: repeat.
+    MirroredRepeat,  // libretro: mirrored_repeat.
+};
+
 struct PostProcessPresetPass {
     std::string shaderPath;          // Path as written in the .glslp,
                                      //   relative to the preset's baseDir.
     bool        filterLinear   = false; // GL_NEAREST default mirrors libretro.
+    PostProcessWrapMode wrapMode = PostProcessWrapMode::ClampToEdge;
     PostProcessScaleType scaleTypeX = PostProcessScaleType::Source;
     PostProcessScaleType scaleTypeY = PostProcessScaleType::Source;
     float       scaleX = 1.0f;
