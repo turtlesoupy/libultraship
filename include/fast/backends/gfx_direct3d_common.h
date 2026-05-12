@@ -55,6 +55,15 @@ struct FramebufferDX11 {
     // force a re-allocation when the chain switches a slot's format.
     PostProcessFboFormat postProcessFormat = PostProcessFboFormat::Default;
     PostProcessFboFormat lastPostProcessFormat = PostProcessFboFormat::Default;
+    // Phase 2.2: chain marks this FBO when a downstream
+    // mipmap_input pass needs to sample it through a mip chain.
+    // D3D11 mip allocation is immutable so the texture must be
+    // recreated with MipLevels > 1 and
+    // D3D11_RESOURCE_MISC_GENERATE_MIPS at the next
+    // UpdateFramebufferParameters; `last` tracks the allocated state
+    // so we re-allocate when the flag changes.
+    bool postProcessMipmapped = false;
+    bool lastPostProcessMipmapped = false;
 };
 
 struct ShaderProgramD3D11 {
@@ -166,6 +175,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) override;
+    void GeneratePostProcessMipmaps(int fb_id) override;
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;

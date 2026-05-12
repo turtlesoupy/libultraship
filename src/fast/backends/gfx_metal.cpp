@@ -800,7 +800,9 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
     }
 
     const bool formatChanged = (fb.mPostProcessFormat != fb.mLastPostProcessFormat);
-    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level || formatChanged;
+    const bool mipmappedChanged = (fb.mPostProcessMipmapped != fb.mLastPostProcessMipmapped);
+    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level ||
+                formatChanged || mipmappedChanged;
 
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
@@ -818,12 +820,29 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
                 colorFormat = MTL::PixelFormatRGBA16Float;
                 break;
         }
+        // Phase 2.2: a chain-marked mipmap_input source needs its
+        // texture allocated with a populated mip chain so the
+        // GeneratePostProcessMipmaps blit encoder has somewhere to
+        // write. Metal textures cap mip count at creation, so the
+        // chain must mark before this call. MSAA + mips is not a
+        // viable combination on Metal — the chain only marks
+        // non-MSAA intermediates.
+        const bool mipmapped = fb.mPostProcessMipmapped && msaa_level <= 1;
+        NS::UInteger mipLevels = 1;
+        if (mipmapped) {
+            NS::UInteger maxDim = (width > height) ? width : height;
+            mipLevels = 1;
+            while (maxDim > 1) {
+                maxDim >>= 1;
+                ++mipLevels;
+            }
+        }
         MTL::TextureDescriptor* tex_descriptor = MTL::TextureDescriptor::alloc()->init();
         tex_descriptor->setTextureType(MTL::TextureType2D);
         tex_descriptor->setWidth(width);
         tex_descriptor->setHeight(height);
         tex_descriptor->setSampleCount(1);
-        tex_descriptor->setMipmapLevelCount(1);
+        tex_descriptor->setMipmapLevelCount(mipLevels);
         tex_descriptor->setPixelFormat(colorFormat);
         tex_descriptor->setUsage((render_target ? MTL::TextureUsageRenderTarget : 0) | MTL::TextureUsageShaderRead);
 
@@ -953,6 +972,7 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
     fb.mHasDepthBuffer = has_depth_buffer;
     fb.mMsaaLevel = msaa_level;
     fb.mLastPostProcessFormat = fb.mPostProcessFormat;
+    fb.mLastPostProcessMipmapped = fb.mPostProcessMipmapped;
 
     autorelease_pool->release();
 }
@@ -1563,6 +1583,49 @@ void GfxRenderingAPIMetal::DestroyPostProcessStaticTexture(int textureId) {
     }
 }
 
+void GfxRenderingAPIMetal::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    mFramebuffers[fb_id].mPostProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIMetal::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& fb = mFramebuffers[fb_id];
+    if (!fb.mPostProcessMipmapped || fb.mTextureId == UINT32_MAX) {
+        return;
+    }
+    MTL::Texture* tex = mTextures[fb.mTextureId].texture;
+    if (tex == nullptr || tex->mipmapLevelCount() <= 1) {
+        return;
+    }
+    // Ensure any pending host encoder on this FB has finished — the
+    // blit pass writes into the texture's mip 1..N and races a still-
+    // live render-target encoder writing mip 0. Each pass's RunPost-
+    // Process is invoked on a host command buffer that already has
+    // its prior encoder ended (the chain runs sequentially), so this
+    // is mostly defensive.
+    if (!fb.mHasEndedEncoding && fb.mCommandEncoder != nullptr) {
+        fb.mCommandEncoder->endEncoding();
+        fb.mHasEndedEncoding = true;
+    }
+    MTL::CommandBuffer* cb = (fb.mCommandBuffer != nullptr) ? fb.mCommandBuffer
+                                                            : mCommandQueue->commandBuffer();
+    MTL::BlitCommandEncoder* enc = cb->blitCommandEncoder();
+    enc->generateMipmaps(tex);
+    enc->endEncoding();
+    if (fb.mCommandBuffer == nullptr) {
+        // We created a one-shot cb because no host cb was attached
+        // (rare; only on the very first pass when the chain runs
+        // before any draw). Commit it so the mip data is live before
+        // the next encoder samples the texture.
+        cb->commit();
+    }
+}
+
 void GfxRenderingAPIMetal::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
     if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
         return;
@@ -1704,8 +1767,12 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         }
         return MTL::SamplerAddressModeClampToEdge;
     };
-    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> MTL::SamplerState* {
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap, bool mipmap) -> MTL::SamplerState* {
+        // Cache key folds the (linear, wrap, mipmap) tuple into a small
+        // int. Mipmap occupies a single bit above the existing
+        // (wrap << 1 | linear) layout so the prior keys keep working.
         const uint32_t key =
+            (mipmap ? (1u << 8) : 0u) |
             (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
         auto it = mPostProcessSamplers.find(key);
         if (it != mPostProcessSamplers.end()) {
@@ -1716,6 +1783,12 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
             linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
         sd->setMinFilter(f);
         sd->setMagFilter(f);
+        if (mipmap) {
+            sd->setMipFilter(linear ? MTL::SamplerMipFilterLinear
+                                    : MTL::SamplerMipFilterNearest);
+        } else {
+            sd->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        }
         const MTL::SamplerAddressMode addr = wrapModeToMetal(wrap);
         sd->setSAddressMode(addr);
         sd->setTAddressMode(addr);
@@ -1727,8 +1800,9 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         mPostProcessSamplers.emplace(key, sampler);
         return sampler;
     };
-    MTL::SamplerState* srcSampler = getSampler(params.srcFilterLinear, params.srcWrapMode);
-    MTL::SamplerState* origSampler = getSampler(true, PostProcessWrapMode::ClampToEdge);
+    MTL::SamplerState* srcSampler =
+        getSampler(params.srcFilterLinear, params.srcWrapMode, params.srcUseMipmap);
+    MTL::SamplerState* origSampler = getSampler(true, PostProcessWrapMode::ClampToEdge, false);
 
     enc->setFragmentTexture(srcTexture, 0);
     enc->setFragmentSamplerState(srcSampler, 0);
@@ -1772,7 +1846,7 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
         }
         const NS::UInteger slot = (NS::UInteger)(2 + i);
         enc->setFragmentTexture(texToBind, slot);
-        MTL::SamplerState* s = getSampler(eb.filterLinear, eb.wrapMode);
+        MTL::SamplerState* s = getSampler(eb.filterLinear, eb.wrapMode, false);
         enc->setFragmentSamplerState(s, slot);
     }
 

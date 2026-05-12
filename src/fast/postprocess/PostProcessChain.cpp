@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <spdlog/spdlog.h>
+
 #include "fast/backends/gfx_rendering_api.h"
 
 namespace Fast {
@@ -106,12 +108,23 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
         Pass p;
         p.programId = prog;
         p.config = configs[i];
+        // Phase 2.2: mark this pass's output as mip-allocated if the
+        // next pass has `mipmap_input = true`. Pass i's mipmapInput
+        // means pass i samples its Source (pass i-1's output) with
+        // mip filtering; we set the producer's flag here so the
+        // backend reserves mip storage before the FBO is sized.
+        if (i + 1 < configs.size() && configs[i + 1].mipmapInput) {
+            p.outputMipmapped = true;
+        }
         // Intermediate passes (not the last) own a chain-managed FBO.
         // The last pass writes into mDstFb so the GUI can sample it —
         // mDstFb always stays Default-format because ImGui::Image
         // consumes it as an LDR RGBA8 texture.
         if (i + 1 < sources.size()) {
             p.outputFb = rapi->CreateFramebuffer();
+            if (p.outputMipmapped) {
+                rapi->SetPostProcessFramebufferMipmapped(p.outputFb, true);
+            }
             // libretro `srgb_framebufferN` / `float_framebufferN`. v1
             // treats them as mutually exclusive (the spec doesn't
             // define behavior when both are set); float wins so HDR
@@ -280,6 +293,27 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         Pass& p = mPasses[i];
         const bool isLast = (i == lastIdx);
 
+        // Phase 2.2: if this pass requested mipmap sampling on its
+        // input, refresh the producer's mip chain. The producer is
+        // pass[i-1] (or the chain-managed final-output FBO if pass
+        // i-1 == lastIdx, but pass 0 is the only pass with no
+        // chain-owned input; we can't mip the game FB so log once
+        // and fall through with srcUseMipmap=false).
+        bool useMipmap = false;
+        if (p.config.mipmapInput) {
+            if (i == 0) {
+                static bool warned = false;
+                if (!warned) {
+                    SPDLOG_WARN("Post-process: mipmap_input on pass 0 is not supported "
+                                "(game FB has no mip storage); sampling level 0 only.");
+                    warned = true;
+                }
+            } else {
+                rapi->GeneratePostProcessMipmaps(curIn);
+                useMipmap = true;
+            }
+        }
+
         // Refresh alias bindings for any alias produced by a pass we
         // already ran (producerPassIdx < i). The producer's outputFb is
         // its chain-managed intermediate (or mDstFb if the producer is
@@ -333,6 +367,7 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         pp.dstHeight = outH;
         pp.srcFilterLinear = srcFilter;
         pp.srcWrapMode     = srcWrap;
+        pp.srcUseMipmap    = useMipmap;
         // libretro `frame_count_modN`: clamps FrameCount to a bounded
         // period so scanline-crawl / bayer-dither shaders that index into
         // a fixed-length pattern see the counter cycle 0..mod-1 forever

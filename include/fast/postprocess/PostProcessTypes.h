@@ -81,6 +81,17 @@ struct PostProcessParams {
     bool                srcFilterLinear = true;
     PostProcessWrapMode srcWrapMode     = PostProcessWrapMode::ClampToEdge;
 
+    // libretro `mipmap_inputN`: the source sampler for this pass should
+    // pick from a mip chain on the input texture. The chain populates
+    // the mip chain (via GfxRenderingAPI::GeneratePostProcessMipmaps)
+    // before calling RunPostProcess; this flag tells the backend to
+    // pair the producer texture with a mip-aware min filter
+    // (LINEAR_MIPMAP_LINEAR) rather than plain LINEAR. Sampling a
+    // texture without a populated mip chain with a mipmap filter is
+    // legal but falls back to the base level — the chain only sets
+    // this when it has actually generated mipmaps.
+    bool                srcUseMipmap   = false;
+
     // Optional named bindings for libretro `aliasN` and (later phases)
     // external `textures = "..."`. Backends bind these at sampler /
     // texture slots starting at 2 (slots 0/1 are Source/Original); the

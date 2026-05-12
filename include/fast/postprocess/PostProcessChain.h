@@ -101,6 +101,15 @@ class PostProcessChain {
         // UpdateFramebufferParameters when the size hasn't changed.
         uint32_t lastWidth = 0;
         uint32_t lastHeight = 0;
+        // Phase 2.2: true when this pass's output is consumed by a
+        // downstream pass that has `mipmap_input = true` and therefore
+        // needs the producer texture allocated with mip storage. Set
+        // during LoadPasses by walking the config list. The chain calls
+        // SetPostProcessFramebufferMipmapped on the producer's outputFb
+        // so backends that allocate immutable mip levels (D3D11 /
+        // Metal) reserve storage before the first
+        // UpdateFramebufferParameters.
+        bool outputMipmapped = false;
         PostProcessPresetPass config;
     };
 

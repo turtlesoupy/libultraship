@@ -881,7 +881,9 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
     }
 
     const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
-    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level || formatChanged;
+    const bool mipmappedChanged = (fb.postProcessMipmapped != fb.lastPostProcessMipmapped);
+    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level ||
+                formatChanged || mipmappedChanged;
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
@@ -897,6 +899,14 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                     colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
                     break;
             }
+            // Phase 2.2: when a downstream mipmap_input pass will
+            // sample this texture, allocate the full mip chain and
+            // tag with GENERATE_MIPS so ID3D11DeviceContext::
+            // GenerateMips fills it later. MSAA + mips is illegal
+            // in D3D11, so the mipmap flag implicitly forces
+            // msaa_level=1 — the chain only marks post-process
+            // intermediates anyway, which are already non-MSAA.
+            const bool mipmapped = fb.postProcessMipmapped && msaa_level <= 1;
             D3D11_TEXTURE2D_DESC texture_desc;
             texture_desc.Width = width;
             texture_desc.Height = height;
@@ -905,9 +915,9 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                 (msaa_level <= 1 ? D3D11_BIND_SHADER_RESOURCE : 0) | (render_target ? D3D11_BIND_RENDER_TARGET : 0);
             texture_desc.Format = colorFormat;
             texture_desc.CPUAccessFlags = 0;
-            texture_desc.MiscFlags = 0;
+            texture_desc.MiscFlags = mipmapped ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
             texture_desc.ArraySize = 1;
-            texture_desc.MipLevels = 1;
+            texture_desc.MipLevels = mipmapped ? 0 : 1; // 0 = full chain
             texture_desc.SampleDesc.Count = msaa_level;
             texture_desc.SampleDesc.Quality = 0;
 
@@ -937,6 +947,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
         tex.width = width;
         tex.height = height;
         fb.lastPostProcessFormat = fb.postProcessFormat;
+        fb.lastPostProcessMipmapped = fb.postProcessMipmapped;
     }
 
     if (has_depth_buffer &&
@@ -1766,6 +1777,36 @@ void GfxRenderingAPIDX11::DestroyPostProcessStaticTexture(int textureId) {
         return;
     }
     mPostProcessStaticTextures[textureId] = StaticTextureD3D11{};
+}
+
+void GfxRenderingAPIDX11::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIDX11::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferDX11& fb = mFrameBuffers[fb_id];
+    if (fb.texture_id >= mTextures.size()) {
+        return;
+    }
+    ID3D11ShaderResourceView* srv = mTextures[fb.texture_id].resource_view.Get();
+    if (srv == nullptr) {
+        return;
+    }
+    // D3D11 requires the SRV's underlying texture to have been
+    // created with D3D11_RESOURCE_MISC_GENERATE_MIPS. The chain
+    // arranges that via SetPostProcessFramebufferMipmapped before
+    // UpdateFramebufferParameters; if the FBO wasn't tagged we
+    // silently no-op (matching the OpenGL behavior).
+    if (!fb.postProcessMipmapped) {
+        return;
+    }
+    mContext->GenerateMips(srv);
 }
 
 void GfxRenderingAPIDX11::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {

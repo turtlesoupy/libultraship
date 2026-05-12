@@ -1141,6 +1141,39 @@ void GfxRenderingAPIOGL::DestroyPostProcessStaticTexture(int textureId) {
     }
 }
 
+void GfxRenderingAPIOGL::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIOGL::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& fb = mFrameBuffers[fb_id];
+    if (fb.clrbuf == 0) {
+        return;
+    }
+    // OpenGL textures allocated via glTexImage2D are mutable; the
+    // first glGenerateMipmap call also reserves storage for levels
+    // 1..N, so the FBO does not need to be pre-allocated as
+    // mipmapped. Set the min filter to MIPMAP_LINEAR on the
+    // implicit texture object so the call is mipmap-complete; the
+    // per-call sampler override in RunPostProcess restores whatever
+    // filter the next bind needs.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    // Restore the cached binding so the next regular draw's
+    // texture-bind cache stays accurate. mLastBoundTextures[0] is
+    // whatever the chain or main pass set last; clearing it forces
+    // the next SelectTexture to re-bind.
+    mLastBoundTextures[0] = 0;
+}
+
 void GfxRenderingAPIOGL::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
     if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
         return;
@@ -1207,7 +1240,15 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     // from the producer pass's libretro `filter_linearN` / `wrap_modeN`
     // — passed through PostProcessParams by the chain. Pass 0 sees the
     // chain's defaults (linear / clamp-to-edge).
-    const GLint srcFilter = params.srcFilterLinear ? GL_LINEAR : GL_NEAREST;
+    // Phase 2.2: pick a mipmap-aware min filter when the chain has
+    // pre-populated this pass's input texture with a mip chain via
+    // GeneratePostProcessMipmaps. Mag is single-level by construction.
+    GLint srcMinFilter = params.srcFilterLinear ? GL_LINEAR : GL_NEAREST;
+    GLint srcMagFilter = srcMinFilter;
+    if (params.srcUseMipmap) {
+        srcMinFilter = params.srcFilterLinear ? GL_LINEAR_MIPMAP_LINEAR
+                                              : GL_NEAREST_MIPMAP_NEAREST;
+    }
     GLint srcWrap = GL_CLAMP_TO_EDGE;
     switch (params.srcWrapMode) {
         case PostProcessWrapMode::ClampToEdge:    srcWrap = GL_CLAMP_TO_EDGE; break;
@@ -1227,8 +1268,8 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcFbInfo.clrbuf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, srcFilter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, srcFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, srcMinFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, srcMagFilter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, srcWrap);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, srcWrap);
     mLastBoundTextures[0] = srcFbInfo.clrbuf;

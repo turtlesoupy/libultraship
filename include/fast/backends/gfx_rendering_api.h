@@ -138,6 +138,38 @@ class GfxRenderingAPI {
         (void)params;
     }
 
+    // Phase 2.2: declare that an FBO's color texture will be sampled
+    // as a mip chain. Must be called between CreateFramebuffer and
+    // the first UpdateFramebufferParameters that allocates the color
+    // texture (or before a re-allocation, if the flag is changing).
+    // The chain calls this on each intermediate FBO whose output is
+    // consumed by a downstream pass with `mipmap_input = true`. On
+    // backends that allocate mutable textures (OpenGL) this can be a
+    // hint or no-op since glGenerateMipmap auto-allocates the chain;
+    // backends with immutable mip storage (D3D11 / Metal) honor the
+    // flag at allocation time.
+    //
+    // Default no-op; backends without mipmap_input support leave the
+    // texture single-level and GeneratePostProcessMipmaps falls back
+    // to a no-op too. The chain still runs the pass; the shader just
+    // samples mip level 0.
+    virtual void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+        (void)fb_id;
+        (void)mipmapped;
+    }
+
+    // Phase 2.2: regenerate the mip chain for an FBO's color texture.
+    // Called by the chain right before running a pass with
+    // `mipmap_input = true` on the texture that pass samples as
+    // Source. The FBO must have been marked mipmapped via
+    // SetPostProcessFramebufferMipmapped first; if not, backends
+    // are expected to silently fall back (the call becomes a no-op
+    // and the shader samples mip 0 — same outcome as if the
+    // backend simply doesn't implement this method).
+    virtual void GeneratePostProcessMipmaps(int fb_id) {
+        (void)fb_id;
+    }
+
     // Set the color-attachment pixel format for a post-process
     // framebuffer. Must be called between CreateFramebuffer and the
     // first UpdateFramebufferParameters that allocates the color

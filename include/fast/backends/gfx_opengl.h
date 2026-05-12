@@ -58,6 +58,12 @@ struct FramebufferOGL {
     // mDstFb (which always carries the regular RGBA8 LDR contract).
     PostProcessFboFormat postProcessFormat = PostProcessFboFormat::Default;
     PostProcessFboFormat lastPostProcessFormat = PostProcessFboFormat::Default;
+    // Phase 2.2: chain marks this FBO as needing a mip chain for
+    // downstream mipmap_input passes. OpenGL textures created with
+    // glTexImage2D are mutable and glGenerateMipmap auto-allocates
+    // the chain on first call, so this flag is mostly informational
+    // for GL; it gates the LINEAR_MIPMAP_LINEAR sampler pick.
+    bool postProcessMipmapped = false;
 };
 
 // Post-process fragment program + its standard-uniform locations. The
@@ -149,6 +155,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) override;
+    void GeneratePostProcessMipmaps(int fb_id) override;
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;

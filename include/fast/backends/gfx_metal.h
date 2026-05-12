@@ -136,6 +136,13 @@ struct FramebufferMetal {
     // the chain switches formats.
     PostProcessFboFormat mPostProcessFormat = PostProcessFboFormat::Default;
     PostProcessFboFormat mLastPostProcessFormat = PostProcessFboFormat::Default;
+    // Phase 2.2: chain marks this FBO when a downstream
+    // mipmap_input pass needs to sample it through a mip chain.
+    // Metal texture mip count is fixed at creation, so the FBO's
+    // MTL::Texture must be re-allocated with mipmapLevelCount > 1
+    // at the next UpdateFramebufferParameters when this flag flips.
+    bool mPostProcessMipmapped = false;
+    bool mLastPostProcessMipmapped = false;
 
     // State
     bool mHasEndedEncoding;
@@ -219,6 +226,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) override;
+    void GeneratePostProcessMipmaps(int fb_id) override;
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;

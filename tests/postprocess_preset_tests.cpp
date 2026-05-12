@@ -144,6 +144,27 @@ shader3 = d.glsl
     EXPECT_EQ(preset.passes[3].wrapMode, Fast::PostProcessWrapMode::ClampToEdge);
 }
 
+// Phase 2.2: per-pass `mipmap_inputN = true` declarations should
+// flip the matching PostProcessPresetPass.mipmapInput flag. Defaults
+// to false, matching libretro's spec ("only declared passes are
+// mip-sampled"). Quoted and boolean-keyword values both parse.
+TEST(PostProcessPreset, ParsesMipmapInputPerPass) {
+    constexpr const char* kSrc = R"(shaders = 3
+shader0 = a.glsl
+shader1 = b.glsl
+mipmap_input1 = true
+shader2 = c.glsl
+mipmap_input2 = "True"
+)";
+    Fast::PostProcessPreset preset;
+    std::string err;
+    ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "", preset, err)) << err;
+    ASSERT_EQ(preset.passes.size(), 3u);
+    EXPECT_FALSE(preset.passes[0].mipmapInput);
+    EXPECT_TRUE(preset.passes[1].mipmapInput);
+    EXPECT_TRUE(preset.passes[2].mipmapInput);
+}
+
 TEST(PostProcessPreset, AcceptsCaseAndQuotedWrapModeValues) {
     constexpr const char* kSrc = R"(shaders = 2
 shader0 = a.glsl
