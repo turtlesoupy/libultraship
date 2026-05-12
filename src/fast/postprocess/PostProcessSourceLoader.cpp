@@ -3,9 +3,12 @@
 // No code copied from RetroArch or any GPL-licensed shader runtime.
 #include "fast/postprocess/PostProcessSourceLoader.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 
 #include <spdlog/spdlog.h>
 #include <stb_image.h>
@@ -32,6 +35,43 @@ bool ReadFilesystemFile(const std::string& path, std::string& outText) {
     return true;
 }
 
+// Filesystem candidate roots for user-supplied shaders, tried in order:
+//   1. <user-data>/shaders/      — the per-user writable location, where
+//      end users drop installed shaders. On NON_PORTABLE builds this
+//      resolves to the OS app-data dir (macOS ~/Library/Application
+//      Support/<app>/shaders, Linux $XDG_DATA_HOME/<app>/shaders, Windows
+//      %APPDATA%\<app>\shaders); on portable builds it collapses to
+//      "./shaders" which is the same as candidate 2.
+//   2. ./shaders/                — relative-to-CWD development fallback so
+//      contributors iterating from a source checkout don't have to copy
+//      every shader into Application Support between rebuilds.
+//
+// Empty / duplicate paths are dropped so we don't probe the same path twice
+// on portable builds.
+std::vector<std::string> UserShaderRoots() {
+    std::vector<std::string> roots;
+    try {
+        std::string userData = Ship::Context::GetPathRelativeToAppDirectory("shaders");
+        if (!userData.empty()) {
+            roots.push_back(std::move(userData));
+        }
+    } catch (...) {
+        // Context not yet alive — fall through to the cwd-relative root.
+    }
+    const std::string cwdRoot = "shaders";
+    bool dup = false;
+    for (const std::string& existing : roots) {
+        if (existing == cwdRoot || existing == "./shaders") {
+            dup = true;
+            break;
+        }
+    }
+    if (!dup) {
+        roots.push_back(cwdRoot);
+    }
+    return roots;
+}
+
 bool ReadArchiveFile(const std::string& path, std::string& outText) {
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
@@ -53,33 +93,45 @@ bool ReadArchiveFile(const std::string& path, std::string& outText) {
     return true;
 }
 
-// Read a binary file (no text-mode line conversion) for stb_image
-// consumption. Same filesystem-then-archive lookup as ReadShaderFile.
-bool ReadShaderBinaryFile(const std::string& fsBase, const std::string& arBase,
-                          const std::string& rel, std::vector<uint8_t>& outBytes) {
-    std::string fsPath = fsBase;
-    if (!fsPath.empty() && fsPath.back() != '/') {
-        fsPath += '/';
+std::string JoinPath(const std::string& base, const std::string& rel) {
+    if (base.empty()) {
+        return rel;
     }
-    fsPath += rel;
-    std::ifstream in(fsPath, std::ios::binary);
-    if (in.is_open()) {
-        in.seekg(0, std::ios::end);
-        const std::streamoff len = in.tellg();
-        in.seekg(0, std::ios::beg);
-        if (len > 0) {
-            outBytes.resize(static_cast<size_t>(len));
-            in.read(reinterpret_cast<char*>(outBytes.data()), len);
-            if (in.good() || in.eof()) {
-                return true;
-            }
+    std::string out = base;
+    if (out.back() != '/') {
+        out += '/';
+    }
+    out += rel;
+    return out;
+}
+
+bool ReadFilesystemBinary(const std::string& path, std::vector<uint8_t>& outBytes) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamoff len = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (len <= 0) {
+        return false;
+    }
+    outBytes.resize(static_cast<size_t>(len));
+    in.read(reinterpret_cast<char*>(outBytes.data()), len);
+    return in.good() || in.eof();
+}
+
+// Read a binary file (no text-mode line conversion) for stb_image
+// consumption. Same filesystem-then-archive lookup order as
+// ReadShaderFile.
+bool ReadShaderBinaryFile(const std::vector<std::string>& fsBases, const std::string& arBase,
+                          const std::string& rel, std::vector<uint8_t>& outBytes) {
+    for (const std::string& fsBase : fsBases) {
+        if (ReadFilesystemBinary(JoinPath(fsBase, rel), outBytes)) {
+            return true;
         }
     }
-    std::string arPath = arBase;
-    if (!arPath.empty() && arPath.back() != '/') {
-        arPath += '/';
-    }
-    arPath += rel;
+    const std::string arPath = JoinPath(arBase, rel);
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
         return false;
@@ -100,25 +152,32 @@ bool ReadShaderBinaryFile(const std::string& fsBase, const std::string& arBase,
     return true;
 }
 
-// Read a file from filesystem `<fsBase>/<rel>` first, then archive
-// `<arBase>/<rel>`. Returns true and populates outText on the first
-// success.
-bool ReadShaderFile(const std::string& fsBase, const std::string& arBase,
+// Read a file by trying `<fsBase>/<rel>` for each entry in `fsBases` in
+// order, then archive `<arBase>/<rel>`. Returns true and populates
+// outText on the first success.
+bool ReadShaderFile(const std::vector<std::string>& fsBases, const std::string& arBase,
                     const std::string& rel, std::string& outText) {
-    std::string fsPath = fsBase;
-    if (!fsPath.empty() && fsPath.back() != '/') {
-        fsPath += '/';
+    for (const std::string& fsBase : fsBases) {
+        if (ReadFilesystemFile(JoinPath(fsBase, rel), outText)) {
+            return true;
+        }
     }
-    fsPath += rel;
-    if (ReadFilesystemFile(fsPath, outText)) {
-        return true;
+    return ReadArchiveFile(JoinPath(arBase, rel), outText);
+}
+
+// Render a fsBases list for log messages: "'a','b'" — caller may
+// embed inline.
+std::string FormatFsBases(const std::vector<std::string>& fsBases) {
+    std::string out;
+    for (size_t i = 0; i < fsBases.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += "'";
+        out += fsBases[i];
+        out += "'";
     }
-    std::string arPath = arBase;
-    if (!arPath.empty() && arPath.back() != '/') {
-        arPath += '/';
-    }
-    arPath += rel;
-    return ReadArchiveFile(arPath, outText);
+    return out;
 }
 
 // Build the diagnostic display name for an individual pass. Strips
@@ -183,10 +242,10 @@ PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl
     return src;
 }
 
-bool LoadSinglePassBundle(const std::string& name, const std::string& fsBase,
+bool LoadSinglePassBundle(const std::string& name, const std::vector<std::string>& fsBases,
                           const std::string& arBase, PostProcessShaderBundle& out) {
     std::string raw;
-    if (!ReadShaderFile(fsBase, arBase, name + ".glsl", raw)) {
+    if (!ReadShaderFile(fsBases, arBase, name + ".glsl", raw)) {
         return false;
     }
     out.name = name;
@@ -197,14 +256,14 @@ bool LoadSinglePassBundle(const std::string& name, const std::string& fsBase,
     return true;
 }
 
-// Parse a .glslp at `<fsBase>/<name>.glslp` or `<arBase>/<name>.glslp`,
+// Parse a .glslp at one of `<fsBase>/<name>.glslp` or `<arBase>/<name>.glslp`,
 // load each referenced pass shader through the normalize+transpile
 // pipeline, and stuff everything into `out`. The pass shader paths in
 // the preset are resolved relative to the preset's own location.
-bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
+bool LoadPresetBundle(const std::string& name, const std::vector<std::string>& fsBases,
                       const std::string& arBase, PostProcessShaderBundle& out) {
     std::string presetText;
-    if (!ReadShaderFile(fsBase, arBase, name + ".glslp", presetText)) {
+    if (!ReadShaderFile(fsBases, arBase, name + ".glslp", presetText)) {
         return false;
     }
     PostProcessPreset preset;
@@ -271,10 +330,10 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
             return false;
         }
         std::vector<uint8_t> pngBytes;
-        if (!ReadShaderBinaryFile(fsBase, arBase, tex.path, pngBytes)) {
+        if (!ReadShaderBinaryFile(fsBases, arBase, tex.path, pngBytes)) {
             SPDLOG_ERROR("Post-process preset '{}' texture '{}': '{}' not found "
-                         "(searched filesystem '{}' and archive '{}')",
-                         name, tex.name, tex.path, fsBase, arBase);
+                         "(searched filesystem {} and archive '{}')",
+                         name, tex.name, tex.path, FormatFsBases(fsBases), arBase);
             return false;
         }
         PostProcessShaderExternalTexture loaded;
@@ -297,10 +356,10 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
     for (size_t i = 0; i < preset.passes.size(); ++i) {
         const PostProcessPresetPass& passCfg = preset.passes[i];
         std::string raw;
-        if (!ReadShaderFile(fsBase, arBase, passCfg.shaderPath, raw)) {
+        if (!ReadShaderFile(fsBases, arBase, passCfg.shaderPath, raw)) {
             SPDLOG_ERROR("Post-process preset '{}' pass {}: shader '{}' not found "
-                         "(searched filesystem '{}' and archive '{}')",
-                         name, i, passCfg.shaderPath, fsBase, arBase);
+                         "(searched filesystem {} and archive '{}')",
+                         name, i, passCfg.shaderPath, FormatFsBases(fsBases), arBase);
             return false;
         }
         const std::string displayName =
@@ -317,22 +376,22 @@ bool LoadPostProcessShader(const std::string& name, PostProcessShaderBundle& out
     if (name.empty()) {
         return false;
     }
-    constexpr const char* kFsBase = "shaders";
+    const std::vector<std::string> fsBases = UserShaderRoots();
     constexpr const char* kArBase = "shaders/postprocess";
 
     // Multi-pass presets take priority — a directory containing both a
     // `<name>.glslp` and a `<name>.glsl` is unusual (the .glsl would
     // typically be one of the passes), and if both exist the preset
     // is the more-explicit intent.
-    if (LoadPresetBundle(name, kFsBase, kArBase, out)) {
+    if (LoadPresetBundle(name, fsBases, kArBase, out)) {
         return true;
     }
-    if (LoadSinglePassBundle(name, kFsBase, kArBase, out)) {
+    if (LoadSinglePassBundle(name, fsBases, kArBase, out)) {
         return true;
     }
     SPDLOG_ERROR("Post-process shader '{}' not found "
-                 "(tried '{}/{}.{{glslp,glsl}}' and archive '{}/{}.{{glslp,glsl}}')",
-                 name, kFsBase, name, kArBase, name);
+                 "(tried filesystem {} and archive '{}/{}.{{glslp,glsl}}')",
+                 name, FormatFsBases(fsBases), kArBase, name);
     return false;
 }
 
@@ -343,6 +402,134 @@ std::vector<std::string> ListBuiltinPostProcessShaders() {
     // across archive contents and so a port that ships a stripped
     // f3d.o2r still gets a usable default selection.
     return { "scanlines", "crt-lottes" };
+}
+
+namespace {
+
+// Internal helper: walk `<root>` and append discovered shader short
+// names into `byFolder`. `relPrefix` is the folder name as the picker
+// should display it ("" for the loose entries directly in `root`,
+// "crt" for `<root>/crt/`, etc.); we only descend one level deep
+// because libretro's distribution layout (and the downloader's
+// extract layout from the UX plan §4) is one-deep, and a recursive
+// walk would surface internal "_blur/" helper directories that aren't
+// individually loadable.
+//
+// A shader appearing under two extensions (.glslp and .glsl) is
+// recorded once — the .glslp wins, matching LoadPostProcessShader's
+// priority — so the picker offers one entry per logical shader.
+void ScanShaderDir(const std::filesystem::path& root, const std::string& relPrefix,
+                   std::vector<UserPostProcessShaderFolder>& folders, bool recurse) {
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+        return;
+    }
+
+    UserPostProcessShaderFolder bucket;
+    bucket.displayName = relPrefix.empty() ? std::string("(loose)") : relPrefix;
+    std::vector<std::string> glslOnly;
+
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code stEc;
+        if (entry.is_directory(stEc)) {
+            if (!recurse) {
+                continue;
+            }
+            const std::string childRel = relPrefix.empty()
+                ? entry.path().filename().string()
+                : relPrefix + "/" + entry.path().filename().string();
+            ScanShaderDir(entry.path(), childRel, folders, /*recurse=*/false);
+            continue;
+        }
+        if (!entry.is_regular_file(stEc)) {
+            continue;
+        }
+        const std::string ext = entry.path().extension().string();
+        const std::string stem = entry.path().stem().string();
+        if (stem.empty()) {
+            continue;
+        }
+        const std::string shaderRef = relPrefix.empty() ? stem : (relPrefix + "/" + stem);
+        if (ext == ".glslp") {
+            bucket.shaderNames.push_back(shaderRef);
+        } else if (ext == ".glsl") {
+            glslOnly.push_back(shaderRef);
+        }
+    }
+
+    // Merge .glsl entries that don't have a sibling .glslp.
+    for (const std::string& gl : glslOnly) {
+        bool covered = false;
+        for (const std::string& existing : bucket.shaderNames) {
+            if (existing == gl) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) {
+            bucket.shaderNames.push_back(gl);
+        }
+    }
+
+    if (!bucket.shaderNames.empty()) {
+        std::sort(bucket.shaderNames.begin(), bucket.shaderNames.end());
+        folders.push_back(std::move(bucket));
+    }
+}
+
+} // namespace
+
+std::vector<UserPostProcessShaderFolder> ListUserPostProcessShaders() {
+    std::vector<UserPostProcessShaderFolder> folders;
+    const std::vector<std::string> roots = UserShaderRoots();
+
+    // Create the per-user shaders dir on first call so a fresh
+    // install has somewhere to drop files into. Best-effort: ignore
+    // mkdir failures — the picker still surfaces builtins and any
+    // CWD-relative fallback content.
+    if (!roots.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(roots.front(), ec);
+    }
+
+    // Dedup keyed on short name so a shader installed in both the
+    // user-data root and the cwd fallback shows once, with the
+    // user-data copy taking effect (matches the loader).
+    std::vector<UserPostProcessShaderFolder> raw;
+    for (const std::string& root : roots) {
+        ScanShaderDir(std::filesystem::path(root), std::string(), raw, /*recurse=*/true);
+    }
+
+    // Merge raw entries by displayName, deduping shader names.
+    for (auto& bucket : raw) {
+        bool merged = false;
+        for (auto& existing : folders) {
+            if (existing.displayName == bucket.displayName) {
+                for (const std::string& name : bucket.shaderNames) {
+                    bool dup = false;
+                    for (const std::string& have : existing.shaderNames) {
+                        if (have == name) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        existing.shaderNames.push_back(name);
+                    }
+                }
+                std::sort(existing.shaderNames.begin(), existing.shaderNames.end());
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            folders.push_back(std::move(bucket));
+        }
+    }
+    return folders;
 }
 
 } // namespace Fast

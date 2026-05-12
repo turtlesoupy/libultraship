@@ -44,15 +44,26 @@ struct PostProcessShaderBundle {
 
 // Resolve a post-process shader by short name and populate `out`.
 // Lookup order:
-//   1. Filesystem: `./shaders/<name>.glslp` then `<name>.glsl`,
-//      relative to the executable's working directory. This is where
-//      users drop their own shaders.
-//   2. Builtins: `shaders/postprocess/<name>.{glslp,glsl}` inside
+//   1. Filesystem: `<user-data>/shaders/<name>.{glslp,glsl}`, where
+//      `<user-data>` is the LUS per-user app-data directory
+//      (Ship::Context::GetPathRelativeToAppDirectory). On NON_PORTABLE
+//      builds this is the OS app-data location (macOS
+//      ~/Library/Application Support/<app>/shaders, Linux
+//      $XDG_DATA_HOME/<app>/shaders, Windows %APPDATA%\<app>\shaders);
+//      on portable builds it collapses to `./shaders` (same as 2).
+//   2. Filesystem: `./shaders/<name>.{glslp,glsl}` relative to the
+//      executable's working directory — kept as a development fallback
+//      so contributors iterating from a source checkout do not need
+//      to copy every shader into the per-user data dir each rebuild.
+//   3. Builtins: `shaders/postprocess/<name>.{glslp,glsl}` inside
 //      f3d.o2r.
 //
 // For `.glslp` presets, each per-pass shader path is resolved
 // relative to the directory the `.glslp` itself came from (or, in
-// the archive case, the archive subdir holding the `.glslp`).
+// the archive case, the archive subdir holding the `.glslp`). The
+// candidate filesystem roots above are tried in order for each pass
+// shader, so a preset in the per-user dir whose passes live next to
+// it works without extra plumbing.
 //
 // Returns true on success. On failure `out` is left in an unspecified
 // state and the reason is logged via SPDLOG_ERROR.
@@ -61,5 +72,29 @@ bool LoadPostProcessShader(const std::string& name, PostProcessShaderBundle& out
 // Names of builtin (in-archive) shaders. Used by ports to populate a
 // menu picker without having to know about the resource manager.
 std::vector<std::string> ListBuiltinPostProcessShaders();
+
+// One folder under the per-user shaders directory, listed by the
+// picker. `displayName` is what the picker shows ("Bundled" for the
+// builtin group, the relative folder path for user-installed shaders,
+// "(loose)" for shaders living directly in the user data root).
+// `shaderNames` are the short names (no extension) suitable for
+// passing back to LoadPostProcessShader / the gPostProcessShader cvar.
+// Entries are de-duplicated when the same short name has both a
+// `.glslp` and a `.glsl` on disk (the .glslp wins, matching the
+// loader's priority).
+struct UserPostProcessShaderFolder {
+    std::string displayName;
+    std::vector<std::string> shaderNames;
+};
+
+// Walk the per-user shaders directory (creating it if absent) and
+// return one entry per folder (plus a synthetic entry for any shaders
+// living directly in the root). Returns an empty vector if neither
+// the user-data dir nor the cwd-relative fallback exists yet — the
+// caller may still surface ListBuiltinPostProcessShaders separately.
+//
+// This is intended for menu pickers. It does NOT load or compile the
+// shaders, only discovers their presence.
+std::vector<UserPostProcessShaderFolder> ListUserPostProcessShaders();
 
 } // namespace Fast
