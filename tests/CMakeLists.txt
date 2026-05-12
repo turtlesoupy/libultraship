@@ -13,6 +13,7 @@ add_executable(lus_tests
     string_helper_tests.cpp
     crc64_tests.cpp
     postprocess_transpiler_tests.cpp
+    postprocess_preset_tests.cpp
 )
 
 set_property(TARGET lus_tests PROPERTY CXX_STANDARD 20)
