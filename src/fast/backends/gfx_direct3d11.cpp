@@ -880,17 +880,30 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
         --msaa_level;
     }
 
-    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
+    const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
+    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level || formatChanged;
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
+            DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            switch (fb.postProcessFormat) {
+                case PostProcessFboFormat::Default:
+                    colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    break;
+                case PostProcessFboFormat::Srgb:
+                    colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                    break;
+                case PostProcessFboFormat::Float16:
+                    colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    break;
+            }
             D3D11_TEXTURE2D_DESC texture_desc;
             texture_desc.Width = width;
             texture_desc.Height = height;
             texture_desc.Usage = D3D11_USAGE_DEFAULT;
             texture_desc.BindFlags =
                 (msaa_level <= 1 ? D3D11_BIND_SHADER_RESOURCE : 0) | (render_target ? D3D11_BIND_RENDER_TARGET : 0);
-            texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texture_desc.Format = colorFormat;
             texture_desc.CPUAccessFlags = 0;
             texture_desc.MiscFlags = 0;
             texture_desc.ArraySize = 1;
@@ -923,6 +936,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 
         tex.width = width;
         tex.height = height;
+        fb.lastPostProcessFormat = fb.postProcessFormat;
     }
 
     if (has_depth_buffer &&
@@ -1708,6 +1722,13 @@ void GfxRenderingAPIDX11::DestroyPostProcessProgram(int progId) {
         return;
     }
     mPostProcessPrograms[progId] = PostProcessProgramD3D11{};
+}
+
+void GfxRenderingAPIDX11::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessFormat = fmt;
 }
 
 void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,

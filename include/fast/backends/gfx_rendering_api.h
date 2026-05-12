@@ -138,6 +138,23 @@ class GfxRenderingAPI {
         (void)params;
     }
 
+    // Set the color-attachment pixel format for a post-process
+    // framebuffer. Must be called between CreateFramebuffer and the
+    // first UpdateFramebufferParameters that allocates the color
+    // texture (or before a re-allocation, if the format is changing).
+    // The format hint persists on the FBO until cleared. Default is
+    // PostProcessFboFormat::Default — the backend's regular 8-bit color
+    // format used by the rest of the pipeline.
+    //
+    // Backends that don't yet implement sRGB / float framebuffers leave
+    // this as a no-op; the chain will allocate Default-format
+    // intermediates and the shader's sRGB / HDR math will run in 8-bit
+    // LDR (visually wrong but the pass still renders).
+    virtual void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+        (void)fb_id;
+        (void)fmt;
+    }
+
   protected:
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;

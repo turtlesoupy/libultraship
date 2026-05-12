@@ -11,6 +11,27 @@
 
 namespace Fast {
 
+// Per-pass output framebuffer pixel format. libretro `.glslp` exposes
+// two booleans (`srgb_framebufferN`, `float_framebufferN`); we collapse
+// them into a single enum since they're mutually exclusive in practice
+// (libretro spec: setting both is undefined; real shaders only set one).
+//
+// Default = the backend's regular 8-bit color format (RGBA8 / RGB8 /
+//   BGRA8Unorm depending on backend). Used for the chain's final pass
+//   (mDstFb) regardless of what the .glslp says, because the GUI
+//   consumes mDstFb through ImGui::Image which expects a sampleable
+//   LDR texture.
+// Srgb = sRGB-encoded 8-bit. Hardware auto-converts sRGB->linear on
+//   sample and linear->sRGB on write (when the destination encoding is
+//   live — GL requires GL_FRAMEBUFFER_SRGB enabled, D3D11/Metal handle
+//   it via the RTV/colorAttachment format).
+// Float16 = half-float per channel. No encoding; HDR linear math.
+enum class PostProcessFboFormat {
+    Default,
+    Srgb,
+    Float16,
+};
+
 // Per-frame inputs the runtime supplies to each post-process pass.
 //
 // Backends are responsible for converting these into whatever uniform

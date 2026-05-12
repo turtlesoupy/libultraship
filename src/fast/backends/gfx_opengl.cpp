@@ -835,18 +835,43 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
     if (fb_id != 0) {
-        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
+        // Post-process intermediates may have switched format (sRGB or
+        // float). When that happens the color attachment must be
+        // reallocated even if size/msaa are unchanged.
+        const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
+        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || formatChanged) {
+            GLenum internalFmt = GL_RGB8;
+            GLenum srcFmt = GL_RGB;
+            GLenum srcType = GL_UNSIGNED_BYTE;
+            switch (fb.postProcessFormat) {
+                case PostProcessFboFormat::Default:
+                    internalFmt = GL_RGB8;
+                    srcFmt = GL_RGB;
+                    srcType = GL_UNSIGNED_BYTE;
+                    break;
+                case PostProcessFboFormat::Srgb:
+                    internalFmt = GL_SRGB8_ALPHA8;
+                    srcFmt = GL_RGBA;
+                    srcType = GL_UNSIGNED_BYTE;
+                    break;
+                case PostProcessFboFormat::Float16:
+                    internalFmt = GL_RGBA16F;
+                    srcFmt = GL_RGBA;
+                    srcType = GL_HALF_FLOAT;
+                    break;
+            }
             if (msaa_level <= 1) {
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, width, height, 0, srcFmt, srcType, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, internalFmt, width, height);
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
             }
+            fb.lastPostProcessFormat = fb.postProcessFormat;
         }
 
         if (has_depth_buffer &&
@@ -1072,6 +1097,16 @@ GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
     return mPostProcessVao;
 }
 
+void GfxRenderingAPIOGL::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    // Record the desired format; the next UpdateFramebufferParameters
+    // notices the mismatch against lastPostProcessFormat and reallocates
+    // the color attachment.
+    mFrameBuffers[fb_id].postProcessFormat = fmt;
+}
+
 void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                                         const PostProcessParams& params) {
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
@@ -1114,6 +1149,15 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+
+    // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
+    // hardware encodes the fragment's linear output back to sRGB on
+    // write. For non-sRGB destinations the state is ignored by spec
+    // (encoding only happens when the attachment is sRGB-formatted),
+    // so we leave it enabled afterwards rather than thrashing state.
+    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
+        glEnable(GL_FRAMEBUFFER_SRGB);
+    }
 
     // Sample source FB's color texture on TU0. Filter + wrap mode come
     // from the producer pass's libretro `filter_linearN` / `wrap_modeN`

@@ -48,6 +48,13 @@ struct FramebufferDX11 {
     uint32_t texture_id;
     bool has_depth_buffer;
     uint32_t msaa_level;
+
+    // Post-process intermediates may override the default RGBA8 color
+    // format (sRGB or float). `last` tracks the format the texture is
+    // currently allocated with so UpdateFramebufferParameters can
+    // force a re-allocation when the chain switches a slot's format.
+    PostProcessFboFormat postProcessFormat = PostProcessFboFormat::Default;
+    PostProcessFboFormat lastPostProcessFormat = PostProcessFboFormat::Default;
 };
 
 struct ShaderProgramD3D11 {
@@ -145,6 +152,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void DestroyPostProcessProgram(int progId) override;
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
+    void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;

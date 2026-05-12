@@ -49,6 +49,15 @@ struct FramebufferOGL {
     bool invertY;
 
     GLuint fbo, clrbuf, clrbufMsaa, rbo;
+
+    // Post-process intermediate FBOs override the default RGB8 color
+    // format. `last` tracks the format the texture is currently
+    // allocated with so UpdateFramebufferParameters can force a
+    // re-allocation when the chain switches a slot's format. Both
+    // default to Default for non-post-process FBOs and the chain's
+    // mDstFb (which always carries the regular RGBA8 LDR contract).
+    PostProcessFboFormat postProcessFormat = PostProcessFboFormat::Default;
+    PostProcessFboFormat lastPostProcessFormat = PostProcessFboFormat::Default;
 };
 
 // Post-process fragment program + its standard-uniform locations. The
@@ -126,6 +135,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DestroyPostProcessProgram(int progId) override;
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
+    void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;

@@ -31,6 +31,7 @@ class Buffer;
 class RenderPipelineState;
 class CommandQueue;
 class Viewport;
+class Library;
 } // namespace MTL
 
 namespace CA {
@@ -76,8 +77,19 @@ struct ShaderProgramMetal {
 // Samplers are pulled from the backend-wide (filter, wrap) cache in
 // RunPostProcess so per-pass libretro filter_linearN / wrap_modeN
 // settings take effect; this struct no longer owns one.
+//
+// Metal pins the color-attachment pixel format into the pipeline state
+// at creation time, so when a pass writes into an sRGB / float FBO we
+// need a separately-built pipeline. The library / vs / fs MTL::Function
+// handles stay live so additional variants can be built lazily in
+// RunPostProcess; `pipelineVariants` caches the result keyed by
+// PostProcessFboFormat. The Default variant is built up front for
+// load-time validation + fast path.
 struct PostProcessProgramMetal {
-    MTL::RenderPipelineState* pipeline;
+    MTL::Library* library;
+    MTL::Function* vsFn;
+    MTL::Function* fsFn;
+    MTL::RenderPipelineState* pipelineVariants[3]; // indexed by (int)PostProcessFboFormat
     std::string name;
 };
 
@@ -117,6 +129,13 @@ struct FramebufferMetal {
     bool mHasDepthBuffer;
     uint32_t mMsaaLevel;
     bool mRenderTarget;
+
+    // Post-process intermediates may override BGRA8Unorm with sRGB or
+    // float. `last` tracks what the underlying MTL::Texture is currently
+    // allocated as so UpdateFramebufferParameters can rebuild it when
+    // the chain switches formats.
+    PostProcessFboFormat mPostProcessFormat = PostProcessFboFormat::Default;
+    PostProcessFboFormat mLastPostProcessFormat = PostProcessFboFormat::Default;
 
     // State
     bool mHasEndedEncoding;
@@ -199,6 +218,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void DestroyPostProcessProgram(int progId) override;
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
+    void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
 
     void NewFrame();
     void SetupFloatingFrame();

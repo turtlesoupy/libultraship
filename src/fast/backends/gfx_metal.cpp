@@ -799,18 +799,32 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
         --msaa_level;
     }
 
-    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level;
+    const bool formatChanged = (fb.mPostProcessFormat != fb.mLastPostProcessFormat);
+    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level || formatChanged;
 
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
     if (diff || (fb.mRenderPassDescriptor != nullptr) != render_target) {
+        MTL::PixelFormat colorFormat = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+        switch (fb.mPostProcessFormat) {
+            case PostProcessFboFormat::Default:
+                // Keep the backend-wide default — respect mSrgbMode for
+                // non-post-process FBOs and the chain's mDstFb.
+                break;
+            case PostProcessFboFormat::Srgb:
+                colorFormat = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                colorFormat = MTL::PixelFormatRGBA16Float;
+                break;
+        }
         MTL::TextureDescriptor* tex_descriptor = MTL::TextureDescriptor::alloc()->init();
         tex_descriptor->setTextureType(MTL::TextureType2D);
         tex_descriptor->setWidth(width);
         tex_descriptor->setHeight(height);
         tex_descriptor->setSampleCount(1);
         tex_descriptor->setMipmapLevelCount(1);
-        tex_descriptor->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+        tex_descriptor->setPixelFormat(colorFormat);
         tex_descriptor->setUsage((render_target ? MTL::TextureUsageRenderTarget : 0) | MTL::TextureUsageShaderRead);
 
         if (tex.texture != nullptr)
@@ -938,6 +952,7 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
     fb.mRenderTarget = render_target;
     fb.mHasDepthBuffer = has_depth_buffer;
     fb.mMsaaLevel = msaa_level;
+    fb.mLastPostProcessFormat = fb.mPostProcessFormat;
 
     autorelease_pool->release();
 }
@@ -1402,6 +1417,9 @@ int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src)
         return -1;
     }
 
+    // Build the Default-format pipeline up front. Other format variants
+    // (sRGB / Float16) are compiled lazily in RunPostProcess when a pass
+    // first writes into an FBO with that format.
     MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
     desc->setVertexFunction(vsFn);
     desc->setFragmentFunction(fsFn);
@@ -1415,25 +1433,31 @@ int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src)
     // at the default of Invalid.
 
     MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
-
-    vsFn->release();
-    fsFn->release();
-    library->release();
     desc->release();
 
     if (pipeline == nullptr) {
         SPDLOG_ERROR("Post-process '{}': pipeline state failed: {}", src.name,
                      error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        vsFn->release();
+        fsFn->release();
+        library->release();
         pool->release();
         return -1;
     }
 
     PostProcessProgramMetal slot{};
-    slot.pipeline = pipeline;
+    slot.library = library;
+    slot.vsFn = vsFn;
+    slot.fsFn = fsFn;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Default] = pipeline;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Srgb] = nullptr;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Float16] = nullptr;
     slot.name = src.name;
 
     for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
-        if (mPostProcessPrograms[i].pipeline == nullptr) {
+        // Slot is free if it has no Default-format pipeline (the one we
+        // always build up front).
+        if (mPostProcessPrograms[i].pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
             mPostProcessPrograms[i] = std::move(slot);
             pool->release();
             return (int)i;
@@ -1466,10 +1490,35 @@ void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
         return;
     }
     auto& slot = mPostProcessPrograms[progId];
-    if (slot.pipeline != nullptr) {
-        slot.pipeline->release();
+    for (auto*& variant : slot.pipelineVariants) {
+        if (variant != nullptr) {
+            variant->release();
+            variant = nullptr;
+        }
+    }
+    if (slot.vsFn != nullptr) {
+        slot.vsFn->release();
+        slot.vsFn = nullptr;
+    }
+    if (slot.fsFn != nullptr) {
+        slot.fsFn->release();
+        slot.fsFn = nullptr;
+    }
+    if (slot.library != nullptr) {
+        slot.library->release();
+        slot.library = nullptr;
     }
     slot = PostProcessProgramMetal{};
+}
+
+void GfxRenderingAPIMetal::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    // Record the desired format; UpdateFramebufferParameters notices the
+    // mismatch against mLastPostProcessFormat and reallocates the
+    // underlying MTL::Texture with the new pixel format.
+    mFramebuffers[fb_id].mPostProcessFormat = fmt;
 }
 
 void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
@@ -1477,8 +1526,8 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
     if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
         return;
     }
-    const PostProcessProgramMetal& slot = mPostProcessPrograms[progId];
-    if (slot.pipeline == nullptr) {
+    PostProcessProgramMetal& slot = mPostProcessPrograms[progId];
+    if (slot.pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
         return;
     }
     if (srcFb < 0 || (size_t)srcFb >= mFramebuffers.size()) {
@@ -1546,7 +1595,49 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
 
     MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
     enc->setViewport(vp);
-    enc->setRenderPipelineState(slot.pipeline);
+
+    // Metal pins the color-attachment format into the pipeline state, so
+    // we need a separate pipeline variant per (program, dst format).
+    // Look up / lazily build the variant matching dst's current format.
+    const PostProcessFboFormat dstFmt = dst.mPostProcessFormat;
+    MTL::RenderPipelineState* variant = slot.pipelineVariants[(int)dstFmt];
+    if (variant == nullptr) {
+        MTL::PixelFormat mtlFmt = MTL::PixelFormatBGRA8Unorm;
+        switch (dstFmt) {
+            case PostProcessFboFormat::Default:
+                mtlFmt = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+                break;
+            case PostProcessFboFormat::Srgb:
+                // Intermediate FBOs use BGRA8Unorm_sRGB to match the
+                // surrounding allocation in UpdateFramebufferParameters.
+                mtlFmt = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                mtlFmt = MTL::PixelFormatRGBA16Float;
+                break;
+        }
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(slot.vsFn);
+        desc->setFragmentFunction(slot.fsFn);
+        desc->colorAttachments()->object(0)->setPixelFormat(mtlFmt);
+        desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+        desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+        desc->setSampleCount(1);
+        NS::Error* error = nullptr;
+        variant = mDevice->newRenderPipelineState(desc, &error);
+        desc->release();
+        if (variant == nullptr) {
+            SPDLOG_ERROR("Post-process '{}': pipeline variant for format {} failed: {}",
+                         slot.name, (int)dstFmt,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            // Fall back to the Default variant so we at least render
+            // something rather than a black frame.
+            variant = slot.pipelineVariants[(int)PostProcessFboFormat::Default];
+        } else {
+            slot.pipelineVariants[(int)dstFmt] = variant;
+        }
+    }
+    enc->setRenderPipelineState(variant);
 
     // Slot 0 (Source) sampler comes from the producer pass's libretro
     // filter_linearN / wrap_modeN, encoded as a small cache key. Slot 1

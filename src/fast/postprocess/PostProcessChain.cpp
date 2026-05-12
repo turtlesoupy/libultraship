@@ -106,9 +106,23 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
         p.programId = prog;
         p.config = configs[i];
         // Intermediate passes (not the last) own a chain-managed FBO.
-        // The last pass writes into mDstFb so the GUI can sample it.
+        // The last pass writes into mDstFb so the GUI can sample it —
+        // mDstFb always stays Default-format because ImGui::Image
+        // consumes it as an LDR RGBA8 texture.
         if (i + 1 < sources.size()) {
             p.outputFb = rapi->CreateFramebuffer();
+            // libretro `srgb_framebufferN` / `float_framebufferN`. v1
+            // treats them as mutually exclusive (the spec doesn't
+            // define behavior when both are set); float wins so HDR
+            // bloom passes that incorrectly also tag sRGB still get
+            // the float storage they need.
+            PostProcessFboFormat fmt = PostProcessFboFormat::Default;
+            if (p.config.floatFramebuffer) {
+                fmt = PostProcessFboFormat::Float16;
+            } else if (p.config.srgbFramebuffer) {
+                fmt = PostProcessFboFormat::Srgb;
+            }
+            rapi->SetPostProcessFramebufferFormat(p.outputFb, fmt);
         }
         staged.push_back(std::move(p));
     }
