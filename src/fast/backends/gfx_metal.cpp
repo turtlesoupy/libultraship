@@ -613,6 +613,15 @@ void GfxRenderingAPIMetal::EndFrame() {
     for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
         FramebufferMetal& fb = mFramebuffers[fb_id];
 
+        // DestroyFramebuffer tombstones a slot by setting mTextureId
+        // to UINT32_MAX and deleting mViewport / mScissorRect. The
+        // memsets below would dereference those null pointers and
+        // SEGV at fault_addr=0x10 (= mScissorRect + 16). Skip the
+        // per-frame state reset for slots that have no live state.
+        if (fb.mTextureId == UINT32_MAX) {
+            continue;
+        }
+
         fb.mLastShaderProgram = nullptr;
         fb.mCommandBuffer = nullptr;
         fb.mCommandEncoder = nullptr;
