@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <spdlog/spdlog.h>
+#include <stb_image.h>
 
 #include "fast/postprocess/PostProcessGlslNormalizer.h"
 #include "fast/postprocess/PostProcessPreset.h"
@@ -52,6 +53,53 @@ bool ReadArchiveFile(const std::string& path, std::string& outText) {
     return true;
 }
 
+// Read a binary file (no text-mode line conversion) for stb_image
+// consumption. Same filesystem-then-archive lookup as ReadShaderFile.
+bool ReadShaderBinaryFile(const std::string& fsBase, const std::string& arBase,
+                          const std::string& rel, std::vector<uint8_t>& outBytes) {
+    std::string fsPath = fsBase;
+    if (!fsPath.empty() && fsPath.back() != '/') {
+        fsPath += '/';
+    }
+    fsPath += rel;
+    std::ifstream in(fsPath, std::ios::binary);
+    if (in.is_open()) {
+        in.seekg(0, std::ios::end);
+        const std::streamoff len = in.tellg();
+        in.seekg(0, std::ios::beg);
+        if (len > 0) {
+            outBytes.resize(static_cast<size_t>(len));
+            in.read(reinterpret_cast<char*>(outBytes.data()), len);
+            if (in.good() || in.eof()) {
+                return true;
+            }
+        }
+    }
+    std::string arPath = arBase;
+    if (!arPath.empty() && arPath.back() != '/') {
+        arPath += '/';
+    }
+    arPath += rel;
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto rm = ctx->GetResourceManager();
+    if (rm == nullptr) {
+        return false;
+    }
+    auto file = rm->LoadFileProcess(arPath);
+    if (file == nullptr || !file->IsLoaded || file->Buffer == nullptr) {
+        return false;
+    }
+    const auto& buf = *file->Buffer;
+    if (file->BufferOffset >= buf.size()) {
+        return false;
+    }
+    outBytes.assign(buf.begin() + file->BufferOffset, buf.end());
+    return true;
+}
+
 // Read a file from filesystem `<fsBase>/<rel>` first, then archive
 // `<arBase>/<rel>`. Returns true and populates outText on the first
 // success.
@@ -83,6 +131,34 @@ std::string ShortenPassName(const std::string& path) {
     const size_t dot = path.find_last_of('.');
     const size_t end = (dot != std::string::npos && dot > begin) ? dot : path.size();
     return path.substr(begin, end - begin);
+}
+
+// Decode a PNG (or any stb_image-supported format) into an RGBA8 byte
+// buffer. Returns true on success and populates `outTex.rgba8`,
+// `outTex.width`, `outTex.height`; logs and returns false otherwise.
+// `pngBytes` is the raw file contents (entire image, not streaming).
+bool DecodeExternalTexture(const std::string& diagName,
+                           const std::vector<uint8_t>& pngBytes,
+                           PostProcessShaderExternalTexture& outTex) {
+    int w = 0, h = 0, channels = 0;
+    stbi_uc* decoded = stbi_load_from_memory(pngBytes.data(),
+                                             static_cast<int>(pngBytes.size()),
+                                             &w, &h, &channels,
+                                             /*desired_channels=*/4);
+    if (decoded == nullptr || w <= 0 || h <= 0) {
+        SPDLOG_ERROR("Post-process external texture '{}': stbi_load_from_memory failed ({})",
+                     diagName, stbi_failure_reason() ? stbi_failure_reason() : "no detail");
+        if (decoded != nullptr) {
+            stbi_image_free(decoded);
+        }
+        return false;
+    }
+    const size_t byteCount = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+    outTex.width = static_cast<uint32_t>(w);
+    outTex.height = static_cast<uint32_t>(h);
+    outTex.rgba8.assign(decoded, decoded + byteCount);
+    stbi_image_free(decoded);
+    return true;
 }
 
 // Run the user-shader pipeline on a raw GLSL string: normalize ->
@@ -141,12 +217,15 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
         return false;
     }
 
-    // Collect the preset's alias names in declaration order. Each
-    // pass's compile sees the same alias list so the binding slots
-    // (2 + alias_index) stay stable across the chain — pass 0 binds
-    // slot 2 to the same alias name pass 4 does.
+    // Collect the preset's named-sampler bindings in declaration order:
+    // first the per-pass `aliasN` outputs, then the external
+    // `textures = "..."` entries. Each pass's compile sees the same
+    // ordered list so the binding slots (2 + index) stay stable across
+    // the chain — pass 0 binds slot 2 to the same name pass 4 does, and
+    // external textures land at the same slot for every pass that
+    // references them.
     std::vector<std::string> aliasNames;
-    aliasNames.reserve(preset.passes.size());
+    aliasNames.reserve(preset.passes.size() + preset.textures.size());
     for (const auto& passCfg : preset.passes) {
         if (passCfg.alias.empty()) {
             continue;
@@ -162,10 +241,56 @@ bool LoadPresetBundle(const std::string& name, const std::string& fsBase,
             aliasNames.push_back(passCfg.alias);
         }
     }
+    for (const auto& tex : preset.textures) {
+        if (tex.name.empty()) {
+            continue;
+        }
+        bool dup = false;
+        for (const std::string& existing : aliasNames) {
+            if (existing == tex.name) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            aliasNames.push_back(tex.name);
+        }
+    }
+
+    // Decode every external texture up front. Failure on any one
+    // texture aborts the load — better to surface the error
+    // immediately than render with a black slot the user will assume
+    // is a shader bug. The texture path is resolved relative to the
+    // .glslp's directory (filesystem ./shaders/ or archive
+    // shaders/postprocess/).
+    std::vector<PostProcessShaderExternalTexture> externalTextures;
+    externalTextures.reserve(preset.textures.size());
+    for (const auto& tex : preset.textures) {
+        if (tex.name.empty() || tex.path.empty()) {
+            SPDLOG_ERROR("Post-process preset '{}': textures entry missing name or path", name);
+            return false;
+        }
+        std::vector<uint8_t> pngBytes;
+        if (!ReadShaderBinaryFile(fsBase, arBase, tex.path, pngBytes)) {
+            SPDLOG_ERROR("Post-process preset '{}' texture '{}': '{}' not found "
+                         "(searched filesystem '{}' and archive '{}')",
+                         name, tex.name, tex.path, fsBase, arBase);
+            return false;
+        }
+        PostProcessShaderExternalTexture loaded;
+        loaded.name = tex.name;
+        loaded.filterLinear = tex.filterLinear;
+        loaded.wrapMode = tex.wrapMode;
+        if (!DecodeExternalTexture(name + "/" + tex.name, pngBytes, loaded)) {
+            return false;
+        }
+        externalTextures.push_back(std::move(loaded));
+    }
 
     out.name = name;
     out.sources.clear();
     out.configs.clear();
+    out.externalTextures = std::move(externalTextures);
     out.sources.reserve(preset.passes.size());
     out.configs.reserve(preset.passes.size());
 

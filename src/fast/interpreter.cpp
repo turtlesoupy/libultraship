@@ -6467,7 +6467,8 @@ void Interpreter::UpdatePostProcessFromCVars() {
         PostProcessShaderBundle bundle;
         bool loadedOk = false;
         if (LoadPostProcessShader(name, bundle)) {
-            if (mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs)) {
+            if (mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs,
+                                              bundle.externalTextures)) {
                 loadedOk = true;
             } else {
                 SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);

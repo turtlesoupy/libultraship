@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "PostProcessPreset.h"
+#include "PostProcessSourceLoader.h"
 #include "PostProcessTypes.h"
 
 namespace Fast {
@@ -54,11 +55,18 @@ class PostProcessChain {
     // Multi-pass entry. `sources[i]` is the loaded + normalized +
     // transpiled GLSL for pass i; `configs[i]` carries that pass's
     // scale/filter/etc. metadata. The two vectors must be the same
-    // size and at least 1 entry. Returns true on success; on failure
-    // the chain is left in its prior state.
+    // size and at least 1 entry. `externalTextures` is an optional
+    // list of pre-decoded RGBA8 images (libretro `.glslp` `textures
+    // = "..."` declarations) — uploaded once to the backend via
+    // CreatePostProcessStaticTexture and bound per-pass at the
+    // sampler slot the transpiler reserved for each name. Returns
+    // true on success; on failure the chain is left in its prior
+    // state (any partial backend resources allocated during the call
+    // are rolled back).
     bool LoadPasses(GfxRenderingAPI* rapi,
                     const std::vector<PostProcessSource>& sources,
-                    const std::vector<PostProcessPresetPass>& configs);
+                    const std::vector<PostProcessPresetPass>& configs,
+                    const std::vector<PostProcessShaderExternalTexture>& externalTextures = {});
 
     // Tear down all passes, releasing programs and intermediate FBOs.
     // Drop back to passthrough. The chain's final-output FBO (mDstFb)
@@ -108,8 +116,19 @@ class PostProcessChain {
         size_t      producerPassIdx;
     };
 
+    // One uploaded external-texture slot.
+    struct ExternalTexture {
+        std::string name;
+        int         textureId    = -1;
+        uint32_t    width        = 1;
+        uint32_t    height       = 1;
+        bool        filterLinear = true;
+        PostProcessWrapMode wrapMode = PostProcessWrapMode::ClampToEdge;
+    };
+
     std::vector<Pass> mPasses;
     std::vector<Alias> mAliases;
+    std::vector<ExternalTexture> mExternalTextures;
     int mDstFb = -1;
     uint32_t mDstWidth = 0;
     uint32_t mDstHeight = 0;

@@ -114,10 +114,41 @@ void EnsureCapacity(std::vector<PostProcessPresetPass>& passes, int index) {
 
 } // namespace
 
+namespace {
+
+// Find or create an external-texture entry by name. Returns reference
+// into the vector — invalidated by subsequent emplace, so callers
+// must finish using it before the next call.
+PostProcessPresetTexture& UpsertTexture(std::vector<PostProcessPresetTexture>& tex,
+                                        const std::string& name) {
+    for (auto& t : tex) {
+        if (t.name == name) {
+            return t;
+        }
+    }
+    tex.emplace_back();
+    tex.back().name = name;
+    return tex.back();
+}
+
+// Lower-case copy. Used for the `wrap_mode` / `<name>_wrap_mode`
+// values whose tokens are case-insensitive in practice.
+std::string ToLower(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out.push_back(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+} // namespace
+
 bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
                             PostProcessPreset& out, std::string& errOut) {
     out.baseDir = baseDir;
     out.passes.clear();
+    out.textures.clear();
 
     int declaredShaders = -1;
 
@@ -155,12 +186,60 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
             continue;
         }
         if (key == "textures") {
-            // v1: external lookup textures are unsupported. Quietly
-            // ignore the list so presets that declare them still load
-            // their pass chain — the shaders that reference the texture
-            // by uniform name will get a fallback (transpiler emits an
-            // undeclared sampler error which surfaces in logs).
+            // Semicolon-separated list of external-texture identifiers.
+            // Each name `N` later gets its own `N`, `N_linear`,
+            // `N_wrap_mode`, `N_mipmap` keys; we provision an empty
+            // entry per name here so those subsequent keys land on a
+            // stable record.
+            size_t start = 0;
+            while (start <= val.size()) {
+                size_t end = val.find(';', start);
+                if (end == std::string::npos) {
+                    end = val.size();
+                }
+                std::string n = Trim(val.substr(start, end - start));
+                if (!n.empty()) {
+                    UpsertTexture(out.textures, n);
+                }
+                if (end == val.size()) {
+                    break;
+                }
+                start = end + 1;
+            }
             continue;
+        }
+
+        // External-texture keys come in two shapes: bare `<name>` for
+        // the file path, and `<name>_<suffix>` for the per-texture
+        // attributes. Resolve by trying the longest suffix match first.
+        {
+            bool handledAsTexture = false;
+            for (auto& tex : out.textures) {
+                const std::string& n = tex.name;
+                if (key == n) {
+                    tex.path = val;
+                    handledAsTexture = true;
+                    break;
+                }
+                if (key == n + "_linear") {
+                    tex.filterLinear = ParseBool(val, tex.filterLinear);
+                    handledAsTexture = true;
+                    break;
+                }
+                if (key == n + "_wrap_mode") {
+                    ParseWrapMode(ToLower(val), tex.wrapMode);
+                    handledAsTexture = true;
+                    break;
+                }
+                if (key == n + "_mipmap") {
+                    tex.mipmap = ParseBool(val, tex.mipmap);
+                    handledAsTexture = true;
+                    break;
+                }
+            }
+            if (handledAsTexture) {
+                continue;
+            }
         }
 
         std::string base;

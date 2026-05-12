@@ -1724,6 +1724,49 @@ void GfxRenderingAPIDX11::DestroyPostProcessProgram(int progId) {
     mPostProcessPrograms[progId] = PostProcessProgramD3D11{};
 }
 
+int GfxRenderingAPIDX11::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                        const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = rgba8;
+    init.SysMemPitch = width * 4u;
+    StaticTextureD3D11 slot;
+    if (FAILED(mDevice->CreateTexture2D(&td, &init, slot.texture.GetAddressOf()))) {
+        return -1;
+    }
+    if (FAILED(mDevice->CreateShaderResourceView(slot.texture.Get(), nullptr,
+                                                  slot.srv.GetAddressOf()))) {
+        slot.texture.Reset();
+        return -1;
+    }
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i].texture.Get() == nullptr) {
+            mPostProcessStaticTextures[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(std::move(slot));
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    mPostProcessStaticTextures[textureId] = StaticTextureD3D11{};
+}
+
 void GfxRenderingAPIDX11::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
     if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
         return;
@@ -1886,7 +1929,14 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     for (size_t i = 0; i < params.extraBindingsCount && totalSlots < kMaxPostProcessSlots; ++i) {
         const auto& eb = params.extraBindings[i];
         ID3D11ShaderResourceView* srv = originalSrv; // defensive fallback
-        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size()) {
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size()) {
+            ID3D11ShaderResourceView* maybe =
+                mPostProcessStaticTextures[eb.staticTextureId].srv.Get();
+            if (maybe != nullptr) {
+                srv = maybe;
+            }
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size()) {
             const FramebufferDX11& f = mFrameBuffers[eb.sourceFb];
             if (f.texture_id < mTextures.size()) {
                 ID3D11ShaderResourceView* maybe = mTextures[f.texture_id].resource_view.Get();

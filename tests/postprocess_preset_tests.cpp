@@ -158,6 +158,35 @@ wrap_mode1 = MIRROR
 // declares the count and the trailing entries have no shaderN, we just
 // trim. A gap in the middle (shader0 and shader2 set, shader1 missing)
 // is unambiguously broken and should reject.
+TEST(PostProcessPreset, ParsesExternalTexturesWithAttributes) {
+    // libretro convention: `textures = "A;B;..."` first, then per-name
+    // `<n>`, `<n>_linear`, `<n>_wrap_mode`, `<n>_mipmap`.
+    constexpr const char* kSrc = R"(shaders = 1
+shader0 = pass.glsl
+textures = "Mask;Noise"
+Mask = shaders/masks/aperture.png
+Mask_linear = false
+Mask_wrap_mode = repeat
+Mask_mipmap = true
+Noise = shaders/noise.png
+Noise_linear = true
+)";
+    Fast::PostProcessPreset preset;
+    std::string err;
+    ASSERT_TRUE(Fast::ParsePostProcessPreset(kSrc, "/tmp/presets", preset, err)) << err;
+    ASSERT_EQ(preset.textures.size(), 2u);
+    EXPECT_EQ(preset.textures[0].name, "Mask");
+    EXPECT_EQ(preset.textures[0].path, "shaders/masks/aperture.png");
+    EXPECT_FALSE(preset.textures[0].filterLinear);
+    EXPECT_EQ(preset.textures[0].wrapMode, Fast::PostProcessWrapMode::Repeat);
+    EXPECT_TRUE(preset.textures[0].mipmap);
+    EXPECT_EQ(preset.textures[1].name, "Noise");
+    EXPECT_EQ(preset.textures[1].path, "shaders/noise.png");
+    EXPECT_TRUE(preset.textures[1].filterLinear);
+    EXPECT_EQ(preset.textures[1].wrapMode, Fast::PostProcessWrapMode::ClampToEdge);
+    EXPECT_FALSE(preset.textures[1].mipmap);
+}
+
 TEST(PostProcessPreset, TolaratesOverDeclaredCount) {
     constexpr const char* kSrc = R"(shaders = 3
 shader0 = x.glsl

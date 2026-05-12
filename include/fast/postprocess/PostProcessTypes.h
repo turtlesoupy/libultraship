@@ -92,17 +92,26 @@ struct PostProcessParams {
 };
 
 // One named-sampler binding flowed through PostProcessParams. Backends
-// look up the FBO color texture at `sourceFb` and bind it + a sampler
-// matching `filterLinear` / `wrapMode` at slot 2 + bindingIndex.
+// look up a texture for the binding using one of two mutually-exclusive
+// sources:
 //
-// `sourceFb = -1` means "alias's producer pass hasn't run yet at this
-// point in the chain" — backends should bind a 1x1 black texture (or
-// the Original FB as a defensive fallback) so the shader's
-// `texture(<alias>, ...)` reads black rather than reading whatever was
-// last in the slot, which would visually leak prior frame state.
+//   sourceFb >= 0          — sample the color texture of FBO `sourceFb`
+//                            (used by `.glslp` aliasN bindings whose
+//                            producer pass already ran in this frame)
+//   staticTextureId >= 0   — sample a backend-managed static 2D texture
+//                            (used by `.glslp` external `textures =
+//                            "..."` declarations; loaded once at
+//                            LoadPasses time and reused every frame)
+//
+// If both are -1 the binding is "not yet available" (alias producer
+// hasn't run at this pass index). Backends should bind a defensive
+// fallback (1x1 black, or the Original FB) so the shader's
+// `texture(<name>, ...)` reads something sane rather than the slot's
+// stale contents from a prior pass.
 struct PostProcessExtraBinding {
-    std::string         name;          // Diagnostic / matches transpiler slot
-    int                 sourceFb = -1; // FBO id whose color texture we sample
+    std::string         name;            // Diagnostic / matches transpiler slot
+    int                 sourceFb = -1;   // FBO id whose color texture we sample
+    int                 staticTextureId = -1; // CreatePostProcessStaticTexture handle
     uint32_t            width    = 1;
     uint32_t            height   = 1;
     bool                filterLinear = true;

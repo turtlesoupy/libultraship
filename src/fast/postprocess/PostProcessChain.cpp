@@ -72,12 +72,13 @@ void PostProcessChain::OnResize(GfxRenderingAPI* rapi, uint32_t dstWidth, uint32
 
 bool PostProcessChain::LoadShader(GfxRenderingAPI* rapi, const PostProcessSource& src) {
     PostProcessPresetPass cfg; // Defaults: scaleType=Source, scale=1.0, filter=false.
-    return LoadPasses(rapi, { src }, { cfg });
+    return LoadPasses(rapi, { src }, { cfg }, {});
 }
 
 bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
                                   const std::vector<PostProcessSource>& sources,
-                                  const std::vector<PostProcessPresetPass>& configs) {
+                                  const std::vector<PostProcessPresetPass>& configs,
+                                  const std::vector<PostProcessShaderExternalTexture>& externalTextures) {
     if (rapi == nullptr || !mBackendSupported) {
         return false;
     }
@@ -151,9 +152,52 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
         }
     }
 
+    // Upload external textures via the backend's static-texture API.
+    // Roll back the just-staged programs / FBOs if any upload fails
+    // so the chain doesn't end up half-loaded with phantom slots.
+    std::vector<ExternalTexture> stagedTextures;
+    stagedTextures.reserve(externalTextures.size());
+    for (const auto& tex : externalTextures) {
+        if (tex.width == 0 || tex.height == 0 || tex.rgba8.empty()) {
+            for (auto& p : staged) {
+                rapi->DestroyPostProcessProgram(p.programId);
+                if (p.outputFb >= 0) {
+                    rapi->DestroyFramebuffer(p.outputFb);
+                }
+            }
+            for (auto& st : stagedTextures) {
+                rapi->DestroyPostProcessStaticTexture(st.textureId);
+            }
+            return false;
+        }
+        const int id = rapi->CreatePostProcessStaticTexture(tex.width, tex.height,
+                                                            tex.rgba8.data());
+        if (id < 0) {
+            for (auto& p : staged) {
+                rapi->DestroyPostProcessProgram(p.programId);
+                if (p.outputFb >= 0) {
+                    rapi->DestroyFramebuffer(p.outputFb);
+                }
+            }
+            for (auto& st : stagedTextures) {
+                rapi->DestroyPostProcessStaticTexture(st.textureId);
+            }
+            return false;
+        }
+        ExternalTexture et;
+        et.name = tex.name;
+        et.textureId = id;
+        et.width = tex.width;
+        et.height = tex.height;
+        et.filterLinear = tex.filterLinear;
+        et.wrapMode = tex.wrapMode;
+        stagedTextures.push_back(std::move(et));
+    }
+
     UnloadShader(rapi);
     mPasses = std::move(staged);
     mAliases = std::move(stagedAliases);
+    mExternalTextures = std::move(stagedTextures);
     mLoadedName = sources.front().name; // Preset / shader display name.
     return true;
 }
@@ -170,8 +214,14 @@ void PostProcessChain::UnloadShader(GfxRenderingAPI* rapi) {
             rapi->DestroyFramebuffer(p.outputFb);
         }
     }
+    for (auto& tex : mExternalTextures) {
+        if (tex.textureId >= 0 && mBackendSupported) {
+            rapi->DestroyPostProcessStaticTexture(tex.textureId);
+        }
+    }
     mPasses.clear();
     mAliases.clear();
+    mExternalTextures.clear();
     mLoadedName.clear();
 }
 
@@ -195,12 +245,27 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
 
     // Per-pass extraBindings buffer. Stable storage across the call so
     // each pass can hand the backend a pointer that outlives the
-    // RunPostProcess body. Sized once at the alias count, indexed by
-    // alias slot; entries with sourceFb == -1 signal "not yet produced
-    // at this pass index" so backends can fall back safely.
-    std::vector<PostProcessExtraBinding> extraBindings(mAliases.size());
-    for (size_t i = 0; i < mAliases.size(); ++i) {
+    // RunPostProcess body. Sized once at (alias count + external-
+    // texture count). Aliases occupy slots 0..N-1, external textures
+    // slots N..N+M-1 (matching PostProcessSourceLoader's aliasNames
+    // order). Entries with both sourceFb == -1 and staticTextureId ==
+    // -1 signal "not yet produced at this pass index" so backends can
+    // fall back safely.
+    const size_t aliasN = mAliases.size();
+    const size_t texN = mExternalTextures.size();
+    std::vector<PostProcessExtraBinding> extraBindings(aliasN + texN);
+    for (size_t i = 0; i < aliasN; ++i) {
         extraBindings[i].name = mAliases[i].name;
+    }
+    for (size_t j = 0; j < texN; ++j) {
+        const ExternalTexture& tex = mExternalTextures[j];
+        auto& b = extraBindings[aliasN + j];
+        b.name = tex.name;
+        b.staticTextureId = tex.textureId;
+        b.width = tex.width;
+        b.height = tex.height;
+        b.filterLinear = tex.filterLinear;
+        b.wrapMode = tex.wrapMode;
     }
 
     // libretro semantics: `filter_linearN` and `wrap_modeN` apply to

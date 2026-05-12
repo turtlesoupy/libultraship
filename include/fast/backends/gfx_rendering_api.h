@@ -155,6 +155,27 @@ class GfxRenderingAPI {
         (void)fmt;
     }
 
+    // Upload a static 2D texture for post-process use (libretro `.glslp`
+    // external `textures = "..."` entries). `rgba8` is a tightly-packed
+    // RGBA8 buffer of width*height*4 bytes. Returns an opaque integer
+    // handle round-trippable to DestroyPostProcessStaticTexture; -1 on
+    // failure. The handle's lifetime is the post-process chain's:
+    // PostProcessChain::LoadPasses creates them, UnloadShader releases.
+    //
+    // Default no-op returns -1; backends without the implementation
+    // leave external textures unbound and the chain falls back to the
+    // Original FB. The OpenGL / D3D11 / Metal backends override.
+    virtual int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                               const uint8_t* rgba8) {
+        (void)width;
+        (void)height;
+        (void)rgba8;
+        return -1;
+    }
+    virtual void DestroyPostProcessStaticTexture(int textureId) {
+        (void)textureId;
+    }
+
   protected:
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;

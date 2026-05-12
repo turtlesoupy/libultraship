@@ -1101,6 +1101,43 @@ GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
     return mPostProcessVao;
 }
 
+int GfxRenderingAPIOGL::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                       const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (tex == 0) {
+        return -1;
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba8);
+    // Sampler state is set per RunPostProcess call from the per-binding
+    // filterLinear / wrapMode — leave the texture object defaults here.
+    glBindTexture(GL_TEXTURE_2D, 0);
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i] == 0) {
+            mPostProcessStaticTextures[i] = tex;
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(tex);
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    GLuint& slot = mPostProcessStaticTextures[textureId];
+    if (slot != 0) {
+        glDeleteTextures(1, &slot);
+        slot = 0;
+    }
+}
+
 void GfxRenderingAPIOGL::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
     if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
         return;
@@ -1232,9 +1269,13 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     };
     for (size_t i = 0; i < params.extraBindingsCount; ++i) {
         const auto& eb = params.extraBindings[i];
-        GLuint tex = originalTex;
-        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size() &&
-            mFrameBuffers[eb.sourceFb].clrbuf != 0) {
+        GLuint tex = originalTex; // defensive fallback
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size() &&
+            mPostProcessStaticTextures[eb.staticTextureId] != 0) {
+            tex = mPostProcessStaticTextures[eb.staticTextureId];
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size() &&
+                   mFrameBuffers[eb.sourceFb].clrbuf != 0) {
             tex = mFrameBuffers[eb.sourceFb].clrbuf;
         }
         const GLenum unit = GL_TEXTURE2 + (GLenum)i;

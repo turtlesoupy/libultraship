@@ -41,9 +41,27 @@ struct PostProcessPresetPass {
     std::string alias;                    // Cross-pass reference name (optional).
 };
 
+// One external texture declared via the `.glslp` `textures = "..."`
+// list. Backends upload the loaded RGBA8 bytes into a static texture
+// and bind it (alongside alias FBOs) at the sampler slot reserved by
+// the transpiler for this name.
+struct PostProcessPresetTexture {
+    std::string         name;        // Uniform identifier in the shader.
+    std::string         path;        // PNG path relative to baseDir.
+    bool                filterLinear = true; // libretro default differs from
+                                             // `filter_linearN` (which defaults
+                                             // false). For external textures
+                                             // libretro picks true unless the
+                                             // `_linear` key explicitly says no.
+    PostProcessWrapMode wrapMode = PostProcessWrapMode::ClampToEdge;
+    bool                mipmap   = false;    // Reserved for future phase;
+                                             // ignored by backends in v1.
+};
+
 struct PostProcessPreset {
     std::string baseDir;                       // Directory holding the .glslp.
     std::vector<PostProcessPresetPass> passes; // 1+ entries on success.
+    std::vector<PostProcessPresetTexture> textures; // 0+ external texture decls.
 };
 
 // Parse a libretro `.glslp` preset from in-memory text. `baseDir` is the

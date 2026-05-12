@@ -143,6 +143,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                       const uint8_t* rgba8) override;
+    void DestroyPostProcessStaticTexture(int textureId) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -183,6 +186,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     std::vector<PostProcessProgramOGL> mPostProcessPrograms;
     GLuint mPostProcessVao = 0;
     GLuint mPostProcessVbo = 0;
+
+    // Static GL texture objects for libretro `.glslp` external
+    // `textures = "..."` entries. The vector index returned by
+    // CreatePostProcessStaticTexture round-trips through the chain;
+    // empty slots (texture == 0) are reused.
+    std::vector<GLuint> mPostProcessStaticTextures;
 };
 
 } // namespace Fast

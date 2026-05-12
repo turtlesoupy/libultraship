@@ -1483,6 +1483,16 @@ GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
         }
     }
     mPostProcessSamplers.clear();
+    // Same teardown contract for the static-texture cache — the chain
+    // releases known live entries via DestroyPostProcessStaticTexture,
+    // but a process-exit teardown that bypasses the chain would leak.
+    for (auto*& tex : mPostProcessStaticTextures) {
+        if (tex != nullptr) {
+            tex->release();
+            tex = nullptr;
+        }
+    }
+    mPostProcessStaticTextures.clear();
 }
 
 void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
@@ -1509,6 +1519,48 @@ void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
         slot.library = nullptr;
     }
     slot = PostProcessProgramMetal{};
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                         const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureType2D);
+    desc->setWidth(width);
+    desc->setHeight(height);
+    desc->setSampleCount(1);
+    desc->setMipmapLevelCount(1);
+    desc->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    desc->setUsage(MTL::TextureUsageShaderRead);
+    MTL::Texture* tex = mDevice->newTexture(desc);
+    desc->release();
+    if (tex == nullptr) {
+        return -1;
+    }
+    MTL::Region region = MTL::Region::Make2D(0, 0, width, height);
+    tex->replaceRegion(region, 0, rgba8, width * 4u);
+
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i] == nullptr) {
+            mPostProcessStaticTextures[i] = tex;
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(tex);
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    MTL::Texture*& slot = mPostProcessStaticTextures[textureId];
+    if (slot != nullptr) {
+        slot->release();
+        slot = nullptr;
+    }
 }
 
 void GfxRenderingAPIMetal::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
@@ -1704,8 +1756,12 @@ void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int 
     // call reads a sensible value rather than the stale slot.
     for (size_t i = 0; i < params.extraBindingsCount; ++i) {
         const auto& eb = params.extraBindings[i];
-        MTL::Texture* texToBind = originalTexture;
-        if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFramebuffers.size()) {
+        MTL::Texture* texToBind = originalTexture; // defensive fallback
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size() &&
+            mPostProcessStaticTextures[eb.staticTextureId] != nullptr) {
+            texToBind = mPostProcessStaticTextures[eb.staticTextureId];
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFramebuffers.size()) {
             const FramebufferMetal& f = mFramebuffers[eb.sourceFb];
             if (f.mTextureId != UINT32_MAX) {
                 MTL::Texture* t = mTextures[f.mTextureId].texture;

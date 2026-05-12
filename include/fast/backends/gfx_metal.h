@@ -219,6 +219,9 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                       const uint8_t* rgba8) override;
+    void DestroyPostProcessStaticTexture(int textureId) override;
 
     void NewFrame();
     void SetupFloatingFrame();
@@ -287,6 +290,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     // filter_linearN / wrap_modeN translate into a small bounded set of
     // MTL::SamplerState objects.
     std::unordered_map<uint32_t, MTL::SamplerState*> mPostProcessSamplers;
+
+    // Static textures uploaded for libretro `.glslp` external
+    // `textures = "..."` entries. Vector index = handle returned by
+    // CreatePostProcessStaticTexture. Empty slots (texture == nullptr)
+    // are reused.
+    std::vector<MTL::Texture*> mPostProcessStaticTextures;
 };
 
 } // namespace Fast

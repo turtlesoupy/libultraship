@@ -153,6 +153,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
                         const PostProcessParams& params) override;
     void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                       const uint8_t* rgba8) override;
+    void DestroyPostProcessStaticTexture(int textureId) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -238,6 +241,16 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         mPostProcessSamplers;
     // Constant buffer for PostProcessUniformsD3D11; created lazily.
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessCb;
+
+    // Static textures uploaded for libretro `.glslp` external
+    // `textures = "..."` entries. Index returned by
+    // CreatePostProcessStaticTexture is the vector index; empty slots
+    // (texture == nullptr) are reused.
+    struct StaticTextureD3D11 {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    };
+    std::vector<StaticTextureD3D11> mPostProcessStaticTextures;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,
