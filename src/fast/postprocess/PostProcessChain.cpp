@@ -198,6 +198,15 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         pp.dstHeight = outH;
         pp.srcFilterLinear = srcFilter;
         pp.srcWrapMode     = srcWrap;
+        // libretro `frame_count_modN`: clamps FrameCount to a bounded
+        // period so scanline-crawl / bayer-dither shaders that index into
+        // a fixed-length pattern see the counter cycle 0..mod-1 forever
+        // rather than drift toward UINT32_MAX. Zero (the parser default)
+        // means "no modulo" — pass through unchanged.
+        if (p.config.frameCountMod > 0) {
+            pp.frameCount = params.frameCount %
+                            static_cast<uint32_t>(p.config.frameCountMod);
+        }
         rapi->RunPostProcess(p.programId, curIn, outFb, originalFb, pp);
 
         curIn = outFb;
