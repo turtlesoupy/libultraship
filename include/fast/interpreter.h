@@ -623,6 +623,40 @@ int32_t gfx_check_image_signature(const char* imgData);
 const char* gfx_get_shader(int16_t id);
 const char* GfxGetOpcodeName(int8_t opcode);
 
+/* ─── Game-specific DL safety hooks ──────────────────────────────────────
+ * libultraship's GFX walker can be given two optional callbacks by the
+ * embedding game so it can defend against malformed DLs without dragging
+ * game-specific symbols into libultraship.
+ *
+ * Use case: SSB64's per-MObj material-setup DLs are built at runtime
+ * directly into the scene heap and sometimes lack `gsSPEndDisplayList`,
+ * causing gfx_step to walk off the buffer into adjacent memory. The game
+ * registers a bounds-check that consults its own DL-source range registry
+ * (scene arena + reloc files); libultraship calls it before deref / push
+ * and skips the walk frame if the cmd has escaped any known DL allocation.
+ *
+ * Both callbacks are optional. With none registered, gfx_step behaves
+ * exactly as before. */
+
+/* DL walker bounds-check.
+ *   Returns 0 (UNKNOWN) — let through; libultraship makes no decision.
+ *   Returns 1 (IN_RANGE) — confirmed valid; allow.
+ *   Returns 2 (WALKED_PAST) — addr is just past a registered range; reject. */
+using DLBoundsCheckFn = int (*)(uintptr_t addr);
+void RegisterDLBoundsCheck(DLBoundsCheckFn fn);
+
+/* Address classifier for diag dumps. Writes a human-readable label
+ * (e.g. "scene_arena+0x4528") into buf. Returns nonzero if classified. */
+using AddressClassifierFn = int (*)(uintptr_t addr, char* buf, size_t buf_size);
+void RegisterAddressClassifier(AddressClassifierFn fn);
+
+/* Dump the recent-DL-pushes and recent-segment-writes ring buffers via
+ * SPDLOG_CRITICAL. Called from SIGSEGV handlers (CrashHandler.cpp,
+ * port_watchdog.cpp) — `badCmd` is best-effort, typically `siginfo->si_addr`.
+ * Safe to call multiple times; the buffers are static and not mutated by
+ * dumping. */
+void DumpDLDiag(void* badCmd, const char* reason);
+
 } // namespace Fast
 
 extern "C" void gfx_texture_cache_clear();

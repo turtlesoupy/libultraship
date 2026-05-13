@@ -2,6 +2,7 @@
 #include "ship/utils/StringHelper.h"
 #include "ship/debug/CrashHandler.h"
 #include "ship/Context.h"
+#include "fast/interpreter.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -149,6 +150,18 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
     constexpr size_t nMaxFrames = arr.size();
     size_t size = backtrace(arr.data(), nMaxFrames);
     char** symbols = backtrace_symbols(arr.data(), nMaxFrames);
+
+    /* Dump the GFX diag ring buffers BEFORE the dialog blocks. The dialog
+     * can hang the process indefinitely waiting for user input; flushing
+     * here ensures the diag survives even if the dialog is killed externally.
+     * `sigInfo->si_addr` is the faulting address — when the crash is in
+     * gfx_step, that's the stale cmd we want to trace upstream. The dump
+     * routine + ring buffers live in fast/interpreter.cpp; their contents
+     * are populated by the GFX walker regardless of whether the game has
+     * registered any callbacks. */
+    Fast::DumpDLDiag(sigInfo ? sigInfo->si_addr : nullptr,
+                     "CrashHandler::ErrorHandler SIGSEGV");
+    Context::GetInstance()->GetLogger()->flush();
 
     snprintf(intToCharBuffer, sizeof(intToCharBuffer), "Signal: %i", sig);
     crashHandler->AppendLine(intToCharBuffer);

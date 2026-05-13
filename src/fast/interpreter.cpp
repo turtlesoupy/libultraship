@@ -65,6 +65,20 @@ extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, s
 extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
 extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
 
+/* Game-specific DL safety hooks. The embedding game (e.g. SSB64) registers
+ * a bounds-check and an address classifier via the public API in
+ * fast/interpreter.h. libultraship calls these from gfx_step and the diag
+ * dump but otherwise has no knowledge of game-specific memory layouts.
+ * Default behavior with no callbacks registered is identical to the
+ * un-hooked walker. */
+static Fast::DLBoundsCheckFn sDLBoundsCheck = nullptr;
+static Fast::AddressClassifierFn sAddressClassifier = nullptr;
+
+/* Return-code constants matching public API documentation. */
+static constexpr int kDLBoundsUnknown    = 0;
+static constexpr int kDLBoundsInRange    = 1;
+static constexpr int kDLBoundsWalkedPast = 2;
+
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/utils/Utils.h"
@@ -422,12 +436,15 @@ void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
 }
 
-/* ─── DIAG-ONLY: PR #133 lead-gap tracing ─────────────────────────────────
-   Ring buffers of recent segment writes and recent DL pushes. Dumped from
-   gfx_step() when ASan reports the next cmd lives in poisoned memory.
-   Entirely gated on PORT_DIAG_HAVE_ASAN — non-ASan release builds compile
-   to zero bytes here and at every call site. */
-#ifdef PORT_DIAG_HAVE_ASAN
+/* ─── DIAG: stale-DL-pointer tracing (PR #133 lead-gap + variant 5) ──────
+   Ring buffers of recent segment writes and recent DL pushes. Dumped on
+   any SIGSEGV (via port_dump_dl_diag, called from CrashHandler::ErrorHandler)
+   so we can identify which holder pushed the stale pointer that crashed
+   gfx_step. Also dumps from gfx_step itself under ASan when poisoned memory
+   is detected. Memory cost: ~3 KB BSS for the ring buffers, 2 atomic
+   increments per push/segwrite. Always-on so the diag survives release
+   builds where the heap-layout-dependent stale-pointer crashes actually
+   manifest (Linux/glibc, NVIDIA OpenGL). */
 namespace {
 struct DiagSegWrite {
     int segNum;
@@ -474,14 +491,28 @@ static inline void diagRecordDLPush(F3DGfx* caller, F3DGfx* callee, F3DGfx* norm
     sDiagDLPushesIdx = (sDiagDLPushesIdx + 1) % DIAG_RING;
 }
 
+/* Defined in port/bridge/lbreloc_bridge.cpp. Classifies an address into
+ * scene_arena+offset / reloc[id]+offset / n64_seg / low_brk / high_heap.
+ * Weak — diag still runs even in builds that don't link the port-side
+ * classifier (e.g. unit tests with a stub lbreloc_bridge). */
+static void diagClassify(uintptr_t addr, char* buf, size_t buf_size) {
+    if (sAddressClassifier && sAddressClassifier(addr, buf, buf_size)) {
+        return;
+    }
+    std::snprintf(buf, buf_size, "0x%lx", (unsigned long)addr);
+}
+
 static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
-    SPDLOG_CRITICAL("==== PR#133 LEAD-GAP DIAG ({}) ====", reason);
-    SPDLOG_CRITICAL("badCmd host={} frame={}", (void*)badCmd, sDiagFrame);
+    char clsbuf[160];
+    SPDLOG_CRITICAL("==== GFX STALE-DL DIAG ({}) ====", reason);
+    diagClassify((uintptr_t)badCmd, clsbuf, sizeof(clsbuf));
+    SPDLOG_CRITICAL("badCmd host={} class={} frame={}", (void*)badCmd, clsbuf, sDiagFrame);
     if (auto inst = mInstance.lock()) {
         SPDLOG_CRITICAL("-- segment table --");
         for (int i = 0; i < MAX_SEGMENT_POINTERS; ++i) {
             if (inst->mSegmentPointers[i] != 0) {
-                SPDLOG_CRITICAL("  seg[{:#x}] = {:#x}", i, inst->mSegmentPointers[i]);
+                diagClassify(inst->mSegmentPointers[i], clsbuf, sizeof(clsbuf));
+                SPDLOG_CRITICAL("  seg[{:#x}] = {:#x} class={}", i, inst->mSegmentPointers[i], clsbuf);
             }
         }
     }
@@ -490,20 +521,37 @@ static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
         size_t k = (sDiagSegWritesIdx + i) % DIAG_RING;
         const auto& e = sDiagSegWrites[k];
         if (!e.where) continue;
-        SPDLOG_CRITICAL("  [frame={}] seg[{:#x}] {:#x} -> {:#x} ({})",
-                        e.frame, e.segNum, e.oldVal, e.newVal, e.where);
+        diagClassify(e.newVal, clsbuf, sizeof(clsbuf));
+        SPDLOG_CRITICAL("  [frame={}] seg[{:#x}] {:#x} -> {:#x} class={} ({})",
+                        e.frame, e.segNum, e.oldVal, e.newVal, clsbuf, e.where);
     }
     SPDLOG_CRITICAL("-- recent DL pushes (oldest first) --");
     for (size_t i = 0; i < DIAG_RING; ++i) {
         size_t k = (sDiagDLPushesIdx + i) % DIAG_RING;
         const auto& e = sDiagDLPushes[k];
         if (!e.where) continue;
-        SPDLOG_CRITICAL("  [frame={}] caller w0={:#x} w1={:#x} callee={} norm={} ({})",
-                        e.frame, e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, e.where);
+        diagClassify((uintptr_t)e.callee_normalized, clsbuf, sizeof(clsbuf));
+        SPDLOG_CRITICAL("  [frame={}] caller w0={:#x} w1={:#x} callee={} norm={} class={} ({})",
+                        e.frame, e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, clsbuf, e.where);
     }
     SPDLOG_CRITICAL("==== END DIAG ====");
 }
-#endif  // PORT_DIAG_HAVE_ASAN
+
+/* Public API — see fast/interpreter.h. Called from CrashHandler.cpp and
+ * port_watchdog.cpp on SIGSEGV. badCmd is best-effort (typically
+ * siginfo->si_addr); the ring buffers tell the rest of the story. Safe
+ * to call from a signal handler: only touches static buffers + spdlog. */
+void DumpDLDiag(void* badCmd, const char* reason) {
+    diagDumpAll((F3DGfx*)badCmd, reason ? reason : "SIGSEGV");
+}
+
+void RegisterDLBoundsCheck(DLBoundsCheckFn fn) {
+    sDLBoundsCheck = fn;
+}
+
+void RegisterAddressClassifier(AddressClassifierFn fn) {
+    sAddressClassifier = fn;
+}
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
@@ -3355,26 +3403,18 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
-#ifdef PORT_DIAG_HAVE_ASAN
             uintptr_t _old = mSegmentPointers[segNumber];
-#endif
             mSegmentPointers[segNumber] = data;
-#ifdef PORT_DIAG_HAVE_ASAN
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
-#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
             if (segIndex == mInterpolationIndex) {
-#ifdef PORT_DIAG_HAVE_ASAN
                 uintptr_t _old = mSegmentPointers[segNumber];
-#endif
                 mSegmentPointers[segNumber] = data;
-#ifdef PORT_DIAG_HAVE_ASAN
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT_INTERP", 0);
-#endif
             }
         } break;
         case G_MW_MATRIX: {
@@ -3452,26 +3492,18 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
-#ifdef PORT_DIAG_HAVE_ASAN
             uintptr_t _old = mSegmentPointers[segNumber];
-#endif
             mSegmentPointers[segNumber] = data;
-#ifdef PORT_DIAG_HAVE_ASAN
             diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
-#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
             if (segIndex == mInterpolationIndex) {
-#ifdef PORT_DIAG_HAVE_ASAN
                 uintptr_t _old = mSegmentPointers[segNumber];
-#endif
                 mSegmentPointers[segNumber] = data;
-#ifdef PORT_DIAG_HAVE_ASAN
                 diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT_INTERP", 0);
-#endif
             }
         } break;
     }
@@ -4395,9 +4427,7 @@ void GfxExecStack::start(F3DGfx* dlist) {
         cmd_stack.pop();
     gfx_path.clear();
     F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
-#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
-#endif
     cmd_stack.push(normalized);
     disp_stack.clear();
 }
@@ -4427,9 +4457,7 @@ void GfxExecStack::branch(F3DGfx* caller) {
     cmd_stack.pop();
     cmd_stack.push(nullptr);
     F3DGfx* normalized = portNormalizeDisplayListPointer(old);
-#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
-#endif
     cmd_stack.push(normalized);
 
     gfx_path.push_back(caller);
@@ -4437,9 +4465,7 @@ void GfxExecStack::branch(F3DGfx* caller) {
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
     F3DGfx* normalized = portNormalizeDisplayListPointer(callee);
-#ifdef PORT_DIAG_HAVE_ASAN
     diagRecordDLPush(caller, callee, normalized, "ExecStack::call");
-#endif
     cmd_stack.push(normalized);
     gfx_path.push_back(caller);
 }
@@ -4690,6 +4716,26 @@ bool gfx_pop_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
+    /* Defensive empty-check. The shader stack can be unbalanced in two
+     * scenarios:
+     *   1. A garbage byte from a runaway DL walk happens to encode
+     *      OTR_G_POP_SHADER — a stale-pointer crash family.
+     *   2. The walk was aborted mid-flight (via g_exec_stack.stop() from
+     *      the bounds-check in gfx_step) after a matching G_PUSH_SHADER
+     *      had executed but before its G_POP_SHADER — leaves the stack
+     *      with a stray entry that survives to the next frame.
+     * Either way, popping an empty std::stack hits a libstdc++ assertion
+     * (stl_stack.h:333) and SIGABRTs. Skipping the pop preserves
+     * correctness when (1) and is harmless when (2). */
+    if (gfx->mShaderStack.empty()) {
+        static int sUnbalancedPopWarnCount = 0;
+        if (sUnbalancedPopWarnCount < 10) {
+            sUnbalancedPopWarnCount++;
+            SPDLOG_WARN("gfx_pop_shader: unbalanced pop on empty mShaderStack — skipping (cmd=0x{:x})",
+                        (unsigned long long)(uintptr_t)cmd);
+        }
+        return false;
+    }
     gfx->mShaderStack.pop();
 
     return false;
@@ -4957,6 +5003,37 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
                     subGFX = (F3DGfx*)(fileBase + offset);
                 }
             }
+        }
+    }
+
+    /* DL-range bounds check. Reject push if subGFX would walk into a
+     * page that's about to fault. Two cases caught here:
+     *   - Unresolved N64 segments (≤ 0x0FFFFFFF): no segment-table entry,
+     *     SegAddr returned the raw N64 token. (Variant 4 in
+     *     docs/bugs/linux_stale_scene_data_family_2026-05-11.md.)
+     *   - Walked-past-registered-range: subGFX is just past the end of a
+     *     known DL allocation. (Variant 5 — game-built DL without an
+     *     explicit gsSPEndDisplayList terminator runs off the scene
+     *     arena.)
+     * Unregistered addresses are allowed through — the check is
+     * conservative to avoid false-rejecting valid pushes from subsystems
+     * that haven't been hooked into the registry yet. */
+    {
+        uintptr_t subAddr = (uintptr_t)subGFX;
+        bool reject = (subAddr <= 0x0FFFFFFF) ||
+                      (sDLBoundsCheck && sDLBoundsCheck(subAddr) == kDLBoundsWalkedPast);
+        if (reject) {
+            static int sRejectCount = 0;
+            if (sRejectCount < 10) {
+                sRejectCount++;
+                SPDLOG_WARN("gfx_dl_handler: rejecting DL push outside any "
+                            "registered range (w1=0x{:x}, subGFX=0x{:x}) — "
+                            "would have walked into unmapped memory",
+                            (unsigned long long)cmd->words.w1,
+                            (unsigned long long)subAddr);
+                Fast::DumpDLDiag(subGFX, "gfx_dl_handler: bounds-rejected");
+            }
+            return false;
         }
     }
 
@@ -6036,6 +6113,42 @@ static void gfx_step() {
         diagDumpAll(cmd, "gfx_step: about to deref poisoned cmd");
     }
 #endif
+
+    /* Walk-bounds check. The G_DL handler's bounds check (gfx_dl_handler_common
+     * above) rejects pushes outside any registered range, but a DL inside a
+     * registered range can still walk off the end if it lacks a
+     * gsSPEndDisplayList terminator (variant 5: per-MObj material setup DL
+     * via segment-0xE stride correction). Catch that here: if cmd has stepped
+     * just past the end of any registered range, terminate this frame as if
+     * G_ENDDL had been encountered. Pop the frame with `ret()` and return —
+     * Run's outer loop will pick up the parent frame (or exit if stack is
+     * empty). */
+    {
+        if (sDLBoundsCheck && sDLBoundsCheck((uintptr_t)cmd) == kDLBoundsWalkedPast) {
+            static int sCount = 0;
+            if (sCount < 10) {
+                sCount++;
+                SPDLOG_WARN("gfx_step: cmd 0x{:x} walked past registered DL range "
+                            "— stopping entire walk (likely missing gsSPEndDisplayList "
+                            "in a game-built DL; parent frames may also be in garbage)",
+                            (unsigned long long)(uintptr_t)cmd);
+                Fast::DumpDLDiag(cmd, "gfx_step: walked past range");
+            }
+            /* Stop the ENTIRE walk, not just this frame. A frame that has
+             * walked past its source's end was reading garbage opcodes for
+             * an unknown duration before we caught it; parent frames may
+             * also have consumed garbage (out-of-band G_DL, G_BRANCH).
+             * Popping only this frame resumes the parent at a stale cmd
+             * and the garbage opcode stream continues — observed
+             * `gfx_copy_fb_handler_custom` crashing on bad args this way.
+             * Tear down the whole exec stack and let Run's loop exit
+             * cleanly; this frame's draws are lost but the next frame
+             * recovers. */
+            g_exec_stack.stop();
+            return;
+        }
+    }
+
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 
     if (sGbiTraceCallback) {
@@ -6154,22 +6267,24 @@ void Interpreter::SpReset() {
     // freed memory (SIGSEGV) or fall through SegAddr unresolved and produce
     // the addr=0x01... fingerprint of issue #103 / #128.
     for (int i = 0; i < MAX_SEGMENT_POINTERS; i++) {
-#ifdef PORT_DIAG_HAVE_ASAN
         uintptr_t _old = mSegmentPointers[i];
-#endif
         mSegmentPointers[i] = 0;
-#ifdef PORT_DIAG_HAVE_ASAN
         if (_old != 0) {
             diagRecordSegWrite(i, _old, 0, "SpReset", 0);
         }
-#endif
     }
-#ifdef PORT_DIAG_HAVE_ASAN
     /* DIAG: bump frame counter so log entries line up with frames. SpReset is
        called at the start of every Run/RunGuiOnly invocation. */
     portDiagBumpFrame();
-#endif
     ResetRdpTextureState();
+
+    /* Reset the shader-tracking stack to balanced state per frame. If a
+     * previous frame's walk was aborted by g_exec_stack.stop() (variant 5
+     * walked-past guard) between G_PUSH_SHADER and the matching
+     * G_POP_SHADER, the stack carries a stray entry. Garbage opcode
+     * streams during runaway walks can also push/pop unbalanced. Clearing
+     * per frame ensures each frame starts with a known-empty stack. */
+    while (!mShaderStack.empty()) mShaderStack.pop();
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
