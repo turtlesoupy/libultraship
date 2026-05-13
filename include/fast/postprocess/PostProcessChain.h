@@ -164,9 +164,17 @@ class PostProcessChain {
     // separately from mPasses so the legacy .glsl/.glslp run path
     // stays byte-identical until the slang Run path comes online in
     // Phase 3D-2.
+    //
+    // Phase 3E: feedbackFb is non-negative when at least one later
+    // pass samples this pass via the `PassFeedback<idx>` semantic.
+    // The chain ping-pongs outputFb and feedbackFb at the end of each
+    // frame so this frame's pass renders into the previously-stale
+    // slot and last frame's output remains live for `PassFeedback`
+    // consumers. -1 means "no feedback consumer; static outputFb".
     struct SlangPass {
         int programId = -1;
         int outputFb = -1;
+        int feedbackFb = -1;
         uint32_t lastWidth = 0;
         uint32_t lastHeight = 0;
         PostProcessPresetPass config;
@@ -177,6 +185,20 @@ class PostProcessChain {
     std::vector<Alias> mAliases;
     std::vector<ExternalTexture> mExternalTextures;
     std::vector<SlangPass> mSlangPasses;
+
+    // Phase 3E: ring buffer of game-FB snapshots for libretro
+    // `OriginalHistory<N>` semantic samplers. Indexed via
+    // (mFrameIndex - K) % mOriginalHistoryFbs.size() where K is the
+    // history index referenced by the shader; K=0 is the live game
+    // FB and bypasses storage. mOriginalHistoryFbs is sized to
+    // (maxHistoryIdx) entries — empty when no shader references
+    // OriginalHistory.
+    std::vector<int> mOriginalHistoryFbs;
+    uint32_t mOriginalHistoryWidth = 0;
+    uint32_t mOriginalHistoryHeight = 0;
+    // Wraps; subtraction is computed modulo the ring size.
+    uint64_t mFrameIndex = 0;
+
     int mDstFb = -1;
     uint32_t mDstWidth = 0;
     uint32_t mDstHeight = 0;

@@ -16,6 +16,37 @@ namespace Fast {
 
 namespace {
 
+// Parse a libretro slang semantic sampler name with a trailing
+// non-negative integer suffix (e.g. "OriginalHistory3" -> ("OriginalHistory", 3),
+// "PassFeedback0" -> ("PassFeedback", 0)). Returns true on match.
+// Used to discover which `OriginalHistory<N>` / `PassFeedback<N>` /
+// `PassOutput<N>` indices a slang artifact references so the chain
+// can pre-allocate the matching history ring slots and per-pass
+// feedback buffers at load time.
+bool MatchSemanticIndex(const std::string& name, const std::string& prefix, int& idxOut) {
+    if (name.size() <= prefix.size()) {
+        return false;
+    }
+    if (name.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    int idx = 0;
+    bool any = false;
+    for (size_t i = prefix.size(); i < name.size(); ++i) {
+        char c = name[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        idx = idx * 10 + (c - '0');
+        any = true;
+    }
+    if (!any) {
+        return false;
+    }
+    idxOut = idx;
+    return true;
+}
+
 // Pack the standard libretro slang semantic values + (Phase 3D-2) zero
 // for any unrecognised UBO member into a byte blob whose layout
 // matches the artifact's reflected offsets. Unknown members (user
@@ -308,11 +339,23 @@ void PostProcessChain::UnloadShader(GfxRenderingAPI* rapi) {
         if (sp.outputFb >= 0 && mBackendSupported) {
             rapi->DestroyFramebuffer(sp.outputFb);
         }
+        if (sp.feedbackFb >= 0 && mBackendSupported) {
+            rapi->DestroyFramebuffer(sp.feedbackFb);
+        }
+    }
+    for (int fb : mOriginalHistoryFbs) {
+        if (fb >= 0 && mBackendSupported) {
+            rapi->DestroyFramebuffer(fb);
+        }
     }
     mPasses.clear();
     mAliases.clear();
     mExternalTextures.clear();
     mSlangPasses.clear();
+    mOriginalHistoryFbs.clear();
+    mOriginalHistoryWidth = 0;
+    mOriginalHistoryHeight = 0;
+    mFrameIndex = 0;
     mLoadedName.clear();
 }
 
@@ -381,8 +424,49 @@ bool PostProcessChain::LoadSlangPasses(GfxRenderingAPI* rapi,
         staged.push_back(std::move(p));
     }
 
+    // Phase 3E: scan every artifact's samplers to discover which
+    // libretro semantic slots the chain needs to provide:
+    //   - OriginalHistory<N>: pre-allocate N game-FB-sized ring slots
+    //     so the chain can route the N-frames-ago game FB to the
+    //     shader. (OriginalHistory0 == live game FB; needs no slot.)
+    //   - PassFeedback<N>: mark pass N as needing a feedback FBO so
+    //     this frame's draw can ping-pong against last frame's output.
+    int maxHistoryIdx = 0;
+    std::vector<bool> passNeedsFeedback(staged.size(), false);
+    for (const SlangPass& sp : staged) {
+        for (const auto& sampler : sp.artifact.samplers) {
+            int idx = 0;
+            if (MatchSemanticIndex(sampler.name, "OriginalHistory", idx)) {
+                if (idx > maxHistoryIdx) {
+                    maxHistoryIdx = idx;
+                }
+                continue;
+            }
+            if (MatchSemanticIndex(sampler.name, "PassFeedback", idx)) {
+                if (idx >= 0 && (size_t)idx < staged.size()) {
+                    passNeedsFeedback[idx] = true;
+                }
+                continue;
+            }
+        }
+    }
+    std::vector<int> stagedHistoryFbs;
+    stagedHistoryFbs.reserve(maxHistoryIdx);
+    for (int i = 0; i < maxHistoryIdx; ++i) {
+        stagedHistoryFbs.push_back(rapi->CreateFramebuffer());
+    }
+    for (size_t i = 0; i < staged.size(); ++i) {
+        if (passNeedsFeedback[i]) {
+            staged[i].feedbackFb = rapi->CreateFramebuffer();
+        }
+    }
+
     UnloadShader(rapi);
     mSlangPasses = std::move(staged);
+    mOriginalHistoryFbs = std::move(stagedHistoryFbs);
+    mOriginalHistoryWidth = 0;
+    mOriginalHistoryHeight = 0;
+    mFrameIndex = 0;
     if (!diagnosticNames.empty()) {
         mLoadedName = diagnosticNames.front();
     }
@@ -402,6 +486,47 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         const int originalFb = srcFb;
         const uint32_t originalWidth = params.srcWidth;
         const uint32_t originalHeight = params.srcHeight;
+
+        // Phase 3E: capture this frame's game FB into the history
+        // ring before any pass runs, so later samplers reading
+        // OriginalHistory<N> see well-defined data. We always write
+        // into the slot (mFrameIndex - 1) % size — i.e. the slot
+        // that would be sampled as OriginalHistory1 by this frame's
+        // shaders. Equivalent reasoning: bumping mFrameIndex at the
+        // start "ages out" the oldest entry and frees up the now-
+        // newest slot. Skipped entirely when no shader referenced
+        // OriginalHistory (mOriginalHistoryFbs is empty).
+        if (!mOriginalHistoryFbs.empty()) {
+            mFrameIndex += 1;
+            const size_t ringSize = mOriginalHistoryFbs.size();
+            const size_t writeSlot = static_cast<size_t>(mFrameIndex - 1) % ringSize;
+            // Each history FBO sized to match the game FB so the
+            // copy lands without scaling. Reallocate when the source
+            // FB dimensions change between frames (window resize +
+            // matched-resolution path).
+            if (mOriginalHistoryWidth != originalWidth ||
+                mOriginalHistoryHeight != originalHeight) {
+                for (int fb : mOriginalHistoryFbs) {
+                    rapi->UpdateFramebufferParameters(fb,
+                                                       originalWidth, originalHeight,
+                                                       /*msaa_level=*/1,
+                                                       /*opengl_invertY=*/false,
+                                                       /*render_target=*/true,
+                                                       /*has_depth_buffer=*/false,
+                                                       /*can_extract_depth=*/false);
+                }
+                mOriginalHistoryWidth = originalWidth;
+                mOriginalHistoryHeight = originalHeight;
+            }
+            rapi->CopyFramebuffer(mOriginalHistoryFbs[writeSlot], originalFb,
+                                  0, 0,
+                                  static_cast<int>(originalWidth),
+                                  static_cast<int>(originalHeight),
+                                  0, 0,
+                                  static_cast<int>(originalWidth),
+                                  static_cast<int>(originalHeight));
+        }
+
         int curIn = srcFb;
         uint32_t curW = params.srcWidth;
         uint32_t curH = params.srcHeight;
@@ -428,6 +553,14 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
                                                       /*render_target=*/true,
                                                       /*has_depth_buffer=*/false,
                                                       /*can_extract_depth=*/false);
+                    if (sp.feedbackFb >= 0) {
+                        rapi->UpdateFramebufferParameters(sp.feedbackFb, outW, outH,
+                                                          /*msaa_level=*/1,
+                                                          /*opengl_invertY=*/false,
+                                                          /*render_target=*/true,
+                                                          /*has_depth_buffer=*/false,
+                                                          /*can_extract_depth=*/false);
+                    }
                     sp.lastWidth = outW;
                     sp.lastHeight = outH;
                 }
@@ -449,12 +582,53 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
                 const std::string& n = sp.artifact.samplers[s].name;
                 if (n == "Source") {
                     samplerFbIds[s] = curIn;
-                } else if (n == "Original") {
-                    samplerFbIds[s] = originalFb;
+                    continue;
                 }
-                // PassOutputN / OriginalHistoryN / PassFeedbackN /
-                // aliases fall through unbound; Phase 3D-3 / 3E plumb
-                // them.
+                if (n == "Original") {
+                    samplerFbIds[s] = originalFb;
+                    continue;
+                }
+                int idx = 0;
+                if (MatchSemanticIndex(n, "OriginalHistory", idx)) {
+                    // K=0 is the live game FB; K>=1 reads from the
+                    // ring. If the ring is shallower than requested
+                    // (shouldn't happen because load-time scan sized
+                    // it), leave the slot at -1 and the backend
+                    // picks a fallback.
+                    if (idx == 0) {
+                        samplerFbIds[s] = originalFb;
+                    } else if (idx <= static_cast<int>(mOriginalHistoryFbs.size())) {
+                        const size_t ringSize = mOriginalHistoryFbs.size();
+                        const size_t readSlot =
+                            static_cast<size_t>(mFrameIndex - static_cast<uint64_t>(idx)) % ringSize;
+                        samplerFbIds[s] = mOriginalHistoryFbs[readSlot];
+                    }
+                    continue;
+                }
+                if (MatchSemanticIndex(n, "PassFeedback", idx)) {
+                    if (idx >= 0 && (size_t)idx < mSlangPasses.size()) {
+                        const SlangPass& producer = mSlangPasses[idx];
+                        if (producer.feedbackFb >= 0) {
+                            samplerFbIds[s] = producer.feedbackFb;
+                        }
+                    }
+                    continue;
+                }
+                if (MatchSemanticIndex(n, "PassOutput", idx)) {
+                    // PassOutput<N>: this frame's pass N output.
+                    // Only valid when pass N has already run (N < i);
+                    // self-reference and forward reference fall back
+                    // to whatever feedback / -1 routing produces.
+                    if (idx >= 0 && (size_t)idx < i) {
+                        samplerFbIds[s] = mSlangPasses[idx].outputFb;
+                    } else if (idx >= 0 && (size_t)idx < mSlangPasses.size() &&
+                               mSlangPasses[idx].feedbackFb >= 0) {
+                        samplerFbIds[s] = mSlangPasses[idx].feedbackFb;
+                    }
+                    continue;
+                }
+                // Aliases / external textures fall through unbound
+                // for slang — Phase 3F+ wires them.
             }
 
             PostProcessParams pp = params;
@@ -475,6 +649,17 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
             curIn = outFb;
             curW = outW;
             curH = outH;
+        }
+
+        // Phase 3E: ping-pong each feedback pass's outputFb /
+        // feedbackFb at end-of-frame so next frame's draw lands in
+        // the (now-stale) slot and this frame's output survives as
+        // PassFeedback<idx> for the next pass. lastWidth/lastHeight
+        // stay correct because both FBOs are sized identically.
+        for (auto& sp : mSlangPasses) {
+            if (sp.feedbackFb >= 0) {
+                std::swap(sp.outputFb, sp.feedbackFb);
+            }
         }
         return mDstFb;
     }

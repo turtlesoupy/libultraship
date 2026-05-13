@@ -522,7 +522,12 @@ std::vector<std::string> ListBuiltinPostProcessShaders() {
     // exercises the slang load path. Visually distinguishable from
     // the legacy `scanlines` by a subtle blue cast on the dark
     // bands.
-    return { "scanlines", "crt-lottes", "slang-scanlines" };
+    //
+    // `slang-persistence` is the Phase 3E canary — exercises the
+    // game-FB history ring via the `OriginalHistory1` semantic.
+    // Visible as a mild motion-trail / persistence effect when the
+    // game moves.
+    return { "scanlines", "crt-lottes", "slang-scanlines", "slang-persistence" };
 }
 
 namespace {
