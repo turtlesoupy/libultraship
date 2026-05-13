@@ -402,17 +402,6 @@ class Interpreter {
     void RegisterBlendedTexture(const char* name, uint8_t* mask, uint8_t* replacement);
     void UnregisterBlendedTexture(const char* name);
 
-    // Phase 2.3: per-pass `#pragma parameter` slider state. The port
-    // menu reads parameter descriptors and writes back slider values
-    // through this accessor (returns the live chain; mutations apply
-    // to the next RunPostProcess).
-    PostProcessChain& GetPostProcessChain() {
-        return mPostProcessChain;
-    }
-    const PostProcessChain& GetPostProcessChain() const {
-        return mPostProcessChain;
-    }
-
     // Register a CPU address range as a mirror of a GPU framebuffer's sub-rect.
     // When ImportTexture sees a gsDPSetTextureImage(cpuAddr) where cpuAddr falls
     // inside [base, base+sizeBytes), it binds the registered FB via

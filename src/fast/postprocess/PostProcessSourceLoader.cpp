@@ -234,13 +234,7 @@ PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl
     PostProcessSource src;
     src.name = displayName;
     src.aliasNames = aliasNames;
-    // Parse `#pragma parameter` declarations before normalization so
-    // the normalizer can both strip the pragma lines and re-emit each
-    // parameter as a `uniform float <name>;` (replacing the shader's
-    // `#define <name> <default>` fallback). The transpiler appends a
-    // matching `float <name>;` to the UBO tail per parameter.
-    src.parameters = ParseShaderParameters(rawGlsl);
-    src.glsl = NormalizeUserGlsl(rawGlsl, aliasNames, src.parameters);
+    src.glsl = NormalizeUserGlsl(rawGlsl, aliasNames);
     std::string err;
     if (!PostProcessTranspiler::SynthesizeMissing(src, err)) {
         SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", displayName, err);

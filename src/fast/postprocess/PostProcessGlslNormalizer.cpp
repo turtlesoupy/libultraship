@@ -184,150 +184,14 @@ constexpr const char* kPreamble =
     "in vec2 vTexCoord;\n"
     "out vec4 fragColor;\n";
 
-// Parse a single `#pragma parameter ...` line into `out`. Returns true
-// on success. The libretro spec form is:
-//   #pragma parameter <name> "<label>" <default> <min> <max> [<step>]
-// Quotes around the label are required by spec; some shaders ship them
-// without quotes — we accept either to match RetroArch's lenient
-// behavior. Unparseable lines log a warning and return false.
-bool ParseParameterLine(const std::string& line, PostProcessShaderParameter& out) {
-    // Skip "#pragma parameter".
-    constexpr const char* kPrefix = "#pragma parameter";
-    const size_t firstNonWs = line.find_first_not_of(" \t");
-    if (firstNonWs == std::string::npos) {
-        return false;
-    }
-    if (line.compare(firstNonWs, std::strlen(kPrefix), kPrefix) != 0) {
-        return false;
-    }
-    size_t pos = firstNonWs + std::strlen(kPrefix);
-
-    auto skipWs = [&]() {
-        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
-            ++pos;
-        }
-    };
-    auto readIdent = [&]() -> std::string {
-        skipWs();
-        const size_t start = pos;
-        while (pos < line.size() && IsIdChar(line[pos])) {
-            ++pos;
-        }
-        return line.substr(start, pos - start);
-    };
-    auto readLabel = [&]() -> std::string {
-        skipWs();
-        if (pos >= line.size()) {
-            return {};
-        }
-        if (line[pos] == '"') {
-            ++pos;
-            const size_t start = pos;
-            while (pos < line.size() && line[pos] != '"') {
-                ++pos;
-            }
-            std::string label = line.substr(start, pos - start);
-            if (pos < line.size()) {
-                ++pos; // consume closing quote
-            }
-            return label;
-        }
-        // Unquoted label — read until next whitespace.
-        const size_t start = pos;
-        while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') {
-            ++pos;
-        }
-        return line.substr(start, pos - start);
-    };
-    auto readFloat = [&](float& v) -> bool {
-        skipWs();
-        if (pos >= line.size()) {
-            return false;
-        }
-        const char* p = line.c_str() + pos;
-        char* end = nullptr;
-        const float parsed = std::strtof(p, &end);
-        if (end == p) {
-            return false;
-        }
-        pos += (size_t)(end - p);
-        v = parsed;
-        return true;
-    };
-
-    out.name = readIdent();
-    if (out.name.empty()) {
-        return false;
-    }
-    out.label = readLabel();
-    if (out.label.empty()) {
-        out.label = out.name;
-    }
-    if (!readFloat(out.defaultValue) || !readFloat(out.minValue) || !readFloat(out.maxValue)) {
-        return false;
-    }
-    float step = 0.0f;
-    if (readFloat(step) && step > 0.0f) {
-        out.step = step;
-    } else {
-        const float range = out.maxValue - out.minValue;
-        out.step = (range > 0.0f) ? range * 0.01f : 0.01f;
-    }
-    // Clamp default into the declared range to avoid initial-value
-    // assertions downstream. The libretro spec implies the default
-    // sits inside the range but doesn't mandate it.
-    if (out.defaultValue < out.minValue) {
-        out.defaultValue = out.minValue;
-    } else if (out.defaultValue > out.maxValue) {
-        out.defaultValue = out.maxValue;
-    }
-    return true;
-}
-
-std::vector<PostProcessShaderParameter> ParseShaderParametersImpl(const std::string& src) {
-    std::vector<PostProcessShaderParameter> out;
-    std::istringstream in(src);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.find("#pragma parameter") == std::string::npos) {
-            continue;
-        }
-        PostProcessShaderParameter p;
-        if (!ParseParameterLine(line, p)) {
-            continue;
-        }
-        bool dup = false;
-        for (const auto& existing : out) {
-            if (existing.name == p.name) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) {
-            out.push_back(std::move(p));
-        }
-    }
-    return out;
-}
-
 } // namespace
 
-std::vector<PostProcessShaderParameter> ParseShaderParameters(const std::string& src) {
-    return ParseShaderParametersImpl(src);
-}
-
 std::string NormalizeUserGlsl(const std::string& src) {
-    return NormalizeUserGlsl(src, {}, {});
+    return NormalizeUserGlsl(src, {});
 }
 
 std::string NormalizeUserGlsl(const std::string& src,
                               const std::vector<std::string>& aliasNames) {
-    return NormalizeUserGlsl(src, aliasNames, {});
-}
-
-std::string NormalizeUserGlsl(const std::string& src,
-                              const std::vector<std::string>& aliasNames,
-                              const std::vector<PostProcessShaderParameter>& parameters) {
     // Step 1 — rewrite libretro / legacy identifier names to our schema.
     // Done as a whole-buffer pass before line-walking so that downstream
     // strip decisions see canonical names regardless of which alias the
@@ -383,19 +247,6 @@ std::string NormalizeUserGlsl(const std::string& src,
 
     // Step 2 — walk lines, drop our own future preamble's worth of
     // declarations plus user `#version` / `#pragma parameter` directives.
-    // Build a quick "is this token a parameter name" lookup for the
-    // #define-stripping pass below. Linear scan is fine — shaders
-    // declare at most a few dozen parameters and we walk each line
-    // once.
-    auto isParamName = [&parameters](const std::string& ident) -> bool {
-        for (const auto& p : parameters) {
-            if (p.name == ident) {
-                return true;
-            }
-        }
-        return false;
-    };
-
     std::istringstream in(body);
     std::string line;
     std::vector<std::string> out;
@@ -407,32 +258,12 @@ std::string NormalizeUserGlsl(const std::string& src,
             if (line.compare(firstNonWs, 8, "#version") == 0) {
                 continue;
             }
-            // Strip `#pragma parameter`; we re-emit each parameter as
-            // a real `uniform float` in the preamble below.
+            // Strip `#pragma parameter`; the UI doesn't surface these
+            // yet, and glslang warns on unknown pragmas. The `#define`
+            // fall-back blocks in the shaders themselves carry the
+            // default values, so nothing visual changes.
             if (line.compare(firstNonWs, 17, "#pragma parameter") == 0) {
                 continue;
-            }
-            // Strip `#define <param_name> <value>` for any parsed
-            // parameter — the GLSL preprocessor would otherwise
-            // expand our `uniform float <name>` declaration to
-            // `uniform float <value>` (invalid). The shader's
-            // fallback default is replaced by the live uniform
-            // value the chain pushes each frame.
-            if (line.compare(firstNonWs, 7, "#define") == 0) {
-                size_t p = firstNonWs + 7;
-                while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) {
-                    ++p;
-                }
-                const size_t identStart = p;
-                while (p < line.size() && IsIdChar(line[p])) {
-                    ++p;
-                }
-                if (p > identStart) {
-                    const std::string ident = line.substr(identStart, p - identStart);
-                    if (isParamName(ident)) {
-                        continue;
-                    }
-                }
             }
         }
         if (IsSchemaDeclarationLine(line)) {
@@ -469,23 +300,6 @@ std::string NormalizeUserGlsl(const std::string& src,
         normalized += "uniform vec2 ";
         normalized += alias;
         normalized += "Size;\n";
-    }
-    // libretro `#pragma parameter` declarations land here as plain
-    // `uniform float <name>` slots. The shader body's `#define
-    // <name> <fallback>` blocks remain in-source — the GLSL spec
-    // lets `uniform float X` and `#define X 0.5` coexist (the
-    // uniform wins because it is the actual identifier; the
-    // #define gets re-applied to literal text matches outside the
-    // declaration, which is fine for the shader). The transpiled
-    // HLSL/MSL gets a matching UBO tail member from the transpiler.
-    // Strip user-declared duplicates so we own the canonical decl.
-    for (const auto& p : parameters) {
-        if (p.name.empty()) {
-            continue;
-        }
-        normalized += "uniform float ";
-        normalized += p.name;
-        normalized += ";\n";
     }
     for (const auto& l : out) {
         normalized += l;

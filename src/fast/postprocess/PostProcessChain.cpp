@@ -108,15 +108,6 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
         Pass p;
         p.programId = prog;
         p.config = configs[i];
-        // Snapshot parameter descriptors and seed live values from
-        // the pragma defaults. The picker UI mutates parameterValues
-        // through SetParameterValue; the descriptor list stays stable
-        // for the lifetime of this chain load.
-        p.parameterDescs = sources[i].parameters;
-        p.parameterValues.reserve(p.parameterDescs.size());
-        for (const auto& desc : p.parameterDescs) {
-            p.parameterValues.push_back(desc.defaultValue);
-        }
         // Phase 2.2: mark this pass's output as mip-allocated if the
         // next pass has `mipmap_input = true`. Pass i's mipmapInput
         // means pass i samples its Source (pass i-1's output) with
@@ -377,8 +368,6 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         pp.srcFilterLinear = srcFilter;
         pp.srcWrapMode     = srcWrap;
         pp.srcUseMipmap    = useMipmap;
-        pp.parameters      = p.parameterValues.empty() ? nullptr : p.parameterValues.data();
-        pp.parametersCount = p.parameterValues.size();
         // libretro `frame_count_modN`: clamps FrameCount to a bounded
         // period so scanline-crawl / bayer-dither shaders that index into
         // a fixed-length pattern see the counter cycle 0..mod-1 forever
@@ -405,53 +394,6 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
 
 bool PostProcessChain::IsActive() const {
     return mBackendSupported && !mPasses.empty() && mDstFb >= 0;
-}
-
-size_t PostProcessChain::GetParameterCount(size_t passIdx) const {
-    if (passIdx >= mPasses.size()) {
-        return 0;
-    }
-    return mPasses[passIdx].parameterDescs.size();
-}
-
-const PostProcessShaderParameter* PostProcessChain::GetParameterDescriptor(size_t passIdx,
-                                                                          size_t paramIdx) const {
-    if (passIdx >= mPasses.size()) {
-        return nullptr;
-    }
-    const Pass& p = mPasses[passIdx];
-    if (paramIdx >= p.parameterDescs.size()) {
-        return nullptr;
-    }
-    return &p.parameterDescs[paramIdx];
-}
-
-float PostProcessChain::GetParameterValue(size_t passIdx, size_t paramIdx) const {
-    if (passIdx >= mPasses.size()) {
-        return 0.0f;
-    }
-    const Pass& p = mPasses[passIdx];
-    if (paramIdx >= p.parameterValues.size()) {
-        return 0.0f;
-    }
-    return p.parameterValues[paramIdx];
-}
-
-void PostProcessChain::SetParameterValue(size_t passIdx, size_t paramIdx, float value) {
-    if (passIdx >= mPasses.size()) {
-        return;
-    }
-    Pass& p = mPasses[passIdx];
-    if (paramIdx >= p.parameterValues.size()) {
-        return;
-    }
-    const auto& desc = p.parameterDescs[paramIdx];
-    if (value < desc.minValue) {
-        value = desc.minValue;
-    } else if (value > desc.maxValue) {
-        value = desc.maxValue;
-    }
-    p.parameterValues[paramIdx] = value;
 }
 
 } // namespace Fast

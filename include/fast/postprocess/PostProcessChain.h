@@ -89,25 +89,6 @@ class PostProcessChain {
         return mLoadedName;
     }
 
-    // Phase 2.3: per-pass `#pragma parameter` slider state. The chain
-    // owns one float per declared parameter, initialized from the
-    // pragma's default. The picker UI reads the descriptor list to
-    // build sliders and writes back values via SetParameterValue.
-    //
-    // Indexing: parameter (passIdx, paramIdx) maps to mPasses[passIdx]
-    // .parameterValues[paramIdx] and the descriptor comes from the
-    // matching `mPasses[passIdx].parameterDescs[paramIdx]` (a snapshot
-    // of PostProcessSource::parameters made at load time). The two
-    // arrays share length per pass.
-    size_t GetPassCount() const {
-        return mPasses.size();
-    }
-    size_t GetParameterCount(size_t passIdx) const;
-    // Returns nullptr for out-of-range indices.
-    const PostProcessShaderParameter* GetParameterDescriptor(size_t passIdx, size_t paramIdx) const;
-    float GetParameterValue(size_t passIdx, size_t paramIdx) const;
-    void  SetParameterValue(size_t passIdx, size_t paramIdx, float value);
-
   private:
     struct Pass {
         int programId = -1;
@@ -130,14 +111,6 @@ class PostProcessChain {
         // UpdateFramebufferParameters.
         bool outputMipmapped = false;
         PostProcessPresetPass config;
-        // Phase 2.3: per-pass `#pragma parameter` state snapshot
-        // (lengths must match). The descs are an immutable copy of
-        // PostProcessSource::parameters taken at LoadPasses time;
-        // values are mutable and seeded from each descriptor's
-        // defaultValue. The chain pushes &parameterValues[0] into
-        // PostProcessParams.parameters every RunPostProcess.
-        std::vector<PostProcessShaderParameter> parameterDescs;
-        std::vector<float> parameterValues;
     };
 
     // libretro `aliasN` produces a named binding sampleable by any

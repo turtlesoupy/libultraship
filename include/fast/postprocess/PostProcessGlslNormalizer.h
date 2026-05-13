@@ -9,32 +9,6 @@
 
 namespace Fast {
 
-// One libretro `#pragma parameter` declaration parsed from a shader.
-// Spec form: `#pragma parameter <name> "<label>" <default> <min> <max> [<step>]`.
-// `name` is the uniform identifier the shader reads (the normalizer
-// emits `uniform float <name>;` in the preamble and the transpiled UBO
-// reserves a float slot for it). `label` is the human-readable string
-// the shader-picker UI shows next to the slider. The numeric fields
-// match the spec exactly; `step` defaults to (max-min)/100 when the
-// pragma omits it.
-struct PostProcessShaderParameter {
-    std::string name;
-    std::string label;
-    float       defaultValue = 0.0f;
-    float       minValue     = 0.0f;
-    float       maxValue     = 1.0f;
-    float       step         = 0.01f;
-};
-
-// Parse `#pragma parameter` declarations from a user-supplied GLSL
-// source and return them in declaration order. Malformed pragmas are
-// silently skipped — the spec doesn't define error recovery, and the
-// alternative (failing the whole shader load on a typo) is worse for
-// the picker UX. The normalizer separately strips the pragma lines so
-// the GLSL compiler doesn't see them; this function operates on the
-// raw user source (i.e. call it BEFORE NormalizeUserGlsl).
-std::vector<PostProcessShaderParameter> ParseShaderParameters(const std::string& src);
-
 // Normalize a user-supplied post-process GLSL source into the canonical
 // LUS Phase-1 form so it loads regardless of which convention the shader
 // was authored against:
@@ -75,14 +49,5 @@ std::string NormalizeUserGlsl(const std::string& src);
 // argument overload.
 std::string NormalizeUserGlsl(const std::string& src,
                               const std::vector<std::string>& aliasNames);
-
-// Overload that accepts the parsed `#pragma parameter` list and
-// declares each parameter as `uniform float <name>;` in the preamble.
-// The list typically comes from a prior ParseShaderParameters call on
-// the same source. Pass an empty vector to behave identically to the
-// two-argument overload.
-std::string NormalizeUserGlsl(const std::string& src,
-                              const std::vector<std::string>& aliasNames,
-                              const std::vector<PostProcessShaderParameter>& parameters);
 
 } // namespace Fast
