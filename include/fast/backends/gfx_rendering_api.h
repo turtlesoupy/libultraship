@@ -234,6 +234,41 @@ class GfxRenderingAPI {
         (void)progId;
     }
 
+    // Phase 3D-2: dispatch a compiled slang program.
+    //
+    //   - `dstFb` is the framebuffer the pass renders into (must
+    //     already be sized + bound-able by the backend; the chain
+    //     calls UpdateFramebufferParameters before Run).
+    //   - `uboData` / `uboBytes` are the pre-built UBO blob (chain
+    //     packed the semantic + parameter values per the artifact's
+    //     reflection). Backends memcpy / write the blob to the
+    //     program's UBO before drawing. May be nullptr / 0 when the
+    //     shader declares no UBO.
+    //   - `samplerFbIds[i]` is the FBO whose color texture binds at
+    //     sampler slot i (matching the artifact's samplerNames[i]).
+    //     `-1` means "no producer available" — backends should bind a
+    //     defensive fallback so the shader's texture(N) reads
+    //     something sane rather than a stale slot. The chain pads
+    //     missing slots with -1; backends must accept the count.
+    //   - `params` carries per-frame state for backend-side
+    //     conveniences (FlipY hint, FrameCount cross-check). The
+    //     authoritative uniform values live in `uboData`.
+    //
+    // Default no-op. Backends without slang Run support leave it as
+    // such and the chain's slang Run path becomes a passthrough.
+    virtual void RunPostProcessSlang(int progId, int dstFb,
+                                     const uint8_t* uboData, uint32_t uboBytes,
+                                     const int* samplerFbIds, uint32_t samplerCount,
+                                     const PostProcessParams& params) {
+        (void)progId;
+        (void)dstFb;
+        (void)uboData;
+        (void)uboBytes;
+        (void)samplerFbIds;
+        (void)samplerCount;
+        (void)params;
+    }
+
   protected:
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;

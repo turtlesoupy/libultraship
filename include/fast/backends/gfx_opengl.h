@@ -197,6 +197,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void DestroyPostProcessStaticTexture(int textureId) override;
     int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
     void DestroyPostProcessSlangProgram(int progId) override;
+    void RunPostProcessSlang(int progId, int dstFb,
+                             const uint8_t* uboData, uint32_t uboBytes,
+                             const int* samplerFbIds, uint32_t samplerCount,
+                             const PostProcessParams& params) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -204,6 +208,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetPerDrawUniforms();
     GLuint CompilePostProcessProgram(const std::string& fsSource, std::string& errOut);
     GLuint EnsurePostProcessVao();
+    GLuint EnsurePostProcessSlangVao();
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES];
@@ -244,6 +249,13 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     // the legacy mPostProcessPrograms — neither table interferes with
     // the other and the chain decides which Create function to call.
     std::vector<PostProcessSlangProgramOGL> mPostProcessSlangPrograms;
+    // Phase 3D-2: slang VAO/VBO. Layout is {vec4 Position, vec2
+    // TexCoord} interleaved — slang vertex stages declare both
+    // attributes at location 0 / location 1, unlike the LUS-schema
+    // VS which only takes a 2D position. Created once on first
+    // RunPostProcessSlang and reused for every slang draw.
+    GLuint mPostProcessSlangVao = 0;
+    GLuint mPostProcessSlangVbo = 0;
 
     // Static GL texture objects for libretro `.glslp` external
     // `textures = "..."` entries. The vector index returned by

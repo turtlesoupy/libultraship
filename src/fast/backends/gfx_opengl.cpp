@@ -1217,6 +1217,145 @@ void GfxRenderingAPIOGL::DestroyPostProcessSlangProgram(int progId) {
     slot = PostProcessSlangProgramOGL{};
 }
 
+GLuint GfxRenderingAPIOGL::EnsurePostProcessSlangVao() {
+    if (mPostProcessSlangVao != 0 && mPostProcessSlangVbo != 0) {
+        return mPostProcessSlangVao;
+    }
+    // Fullscreen triangle for slang: vec4 Position (clip space) +
+    // vec2 TexCoord (covers [0,1] after the rasterizer interpolates).
+    // The slang VS multiplies Position by an identity MVP (provided
+    // by the chain), so the vertices land in clip space directly.
+    static const GLfloat kSlangVerts[] = {
+        // Position (xyzw)            // TexCoord (uv)
+        -1.0f, -1.0f, 0.0f, 1.0f,     0.0f, 0.0f,
+         3.0f, -1.0f, 0.0f, 1.0f,     2.0f, 0.0f,
+        -1.0f,  3.0f, 0.0f, 1.0f,     0.0f, 2.0f,
+    };
+    glGenVertexArrays(1, &mPostProcessSlangVao);
+    glBindVertexArray(mPostProcessSlangVao);
+    glGenBuffers(1, &mPostProcessSlangVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessSlangVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kSlangVerts), kSlangVerts, GL_STATIC_DRAW);
+    // location 0 = vec4 Position.
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
+                          reinterpret_cast<void*>(0));
+    // location 1 = vec2 TexCoord.
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
+                          reinterpret_cast<void*>(4 * sizeof(GLfloat)));
+    return mPostProcessSlangVao;
+}
+
+void GfxRenderingAPIOGL::RunPostProcessSlang(int progId, int dstFb,
+                                             const uint8_t* uboData, uint32_t uboBytes,
+                                             const int* samplerFbIds, uint32_t samplerCount,
+                                             const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    const PostProcessSlangProgramOGL& slot = mPostProcessSlangPrograms[progId];
+    if (slot.program == 0) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.fbo == 0) {
+        return;
+    }
+
+    // Fixed-function state: identical to the legacy post-process
+    // path. Mirrors the cache-invalidation pattern so the next
+    // regular draw sees consistent state.
+    if (mLastScissorEnabled != 0) {
+        glDisable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 0;
+    }
+    if (mLastBlendEnabled != 0) {
+        glDisable(GL_BLEND);
+        mLastBlendEnabled = 0;
+    }
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
+    mCurrentFrameBuffer = dstFb;
+    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
+        glEnable(GL_FRAMEBUFFER_SRGB);
+    }
+
+    // Upload the chain-built UBO blob. The buffer was allocated at
+    // CreatePostProcessSlangProgram time so we just refill.
+    if (slot.ubo != 0 && uboData != nullptr && uboBytes > 0) {
+        glBindBuffer(GL_UNIFORM_BUFFER, slot.ubo);
+        const GLsizeiptr writeBytes =
+            static_cast<GLsizeiptr>(std::min<uint32_t>(uboBytes, slot.uboBytes));
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, writeBytes, uboData);
+        glBindBufferBase(GL_UNIFORM_BUFFER, slot.uboBindingPoint, slot.ubo);
+    }
+
+    // Bind sampler textures in declaration order. Each entry's
+    // samplerFbIds[i] is the FBO whose color texture goes on unit i.
+    // -1 means "use a fallback" — we pick TU0's source if available,
+    // else leave whatever was bound.
+    GLuint fallbackTex = 0;
+    if (samplerCount > 0 && samplerFbIds != nullptr && samplerFbIds[0] >= 0 &&
+        (size_t)samplerFbIds[0] < mFrameBuffers.size()) {
+        fallbackTex = mFrameBuffers[samplerFbIds[0]].clrbuf;
+    }
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        GLuint tex = fallbackTex;
+        if (fbId >= 0 && (size_t)fbId < mFrameBuffers.size() &&
+            mFrameBuffers[fbId].clrbuf != 0) {
+            tex = mFrameBuffers[fbId].clrbuf;
+        }
+        if (tex == 0) {
+            continue;
+        }
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        // Phase 3D-2 minimal sampler state: linear / clamp-to-edge on
+        // every slot. Per-slot libretro filter_linearN / wrap_modeN
+        // routing comes with Phase 3D-3 multipass.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (i < SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[i] = tex;
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    mLastActiveTexture = 0;
+
+    glUseProgram(slot.program);
+    mLastLoadedShader = nullptr;
+
+    EnsurePostProcessSlangVao();
+    glBindVertexArray(mPostProcessSlangVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Restore the regular-draw VAO/VBO bindings.
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray(mOpenglVao);
+#else
+    glBindVertexArray(0);
+#endif
+    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
+}
+
 GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
     if (mPostProcessVao != 0 && mPostProcessVbo != 0) {
         return mPostProcessVao;

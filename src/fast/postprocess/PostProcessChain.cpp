@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include <spdlog/spdlog.h>
 
@@ -14,6 +15,74 @@
 namespace Fast {
 
 namespace {
+
+// Pack the standard libretro slang semantic values + (Phase 3D-2) zero
+// for any unrecognised UBO member into a byte blob whose layout
+// matches the artifact's reflected offsets. Unknown members (user
+// `#pragma parameter` declarations) get default-initialised to zero;
+// Phase 3F plumbs parameter defaults / overrides here.
+std::vector<uint8_t> BuildSlangUbo(const PostProcessSlangArtifact& art,
+                                   uint32_t srcW, uint32_t srcH,
+                                   uint32_t dstW, uint32_t dstH,
+                                   uint32_t origW, uint32_t origH,
+                                   uint32_t frameCount) {
+    std::vector<uint8_t> blob(art.uboTotalBytes, 0);
+    if (blob.empty()) {
+        return blob;
+    }
+    auto writeAt = [&](uint32_t offset, const void* data, uint32_t size) {
+        if (size == 0) {
+            return;
+        }
+        if (offset + size > blob.size()) {
+            size = (offset >= blob.size()) ? 0u : static_cast<uint32_t>(blob.size() - offset);
+        }
+        if (size > 0) {
+            std::memcpy(blob.data() + offset, data, size);
+        }
+    };
+    // libretro's standard semantic block size convention is vec4 for
+    // OutputSize/SourceSize/OriginalSize (xy = width/height, zw =
+    // 1/width and 1/height) — but glslang gives us the actual declared
+    // size via reflection, so we clamp the write to whatever the
+    // shader picked (vec2 shaders, while uncommon, still work).
+    auto recip = [](float v) -> float {
+        return v == 0.0f ? 0.0f : 1.0f / v;
+    };
+    for (const auto& m : art.uboMembers) {
+        if (m.name == "MVP") {
+            static constexpr float kIdentity[16] = {
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 1.0f,
+            };
+            writeAt(m.offsetBytes, kIdentity,
+                    std::min<uint32_t>(m.sizeBytes, sizeof(kIdentity)));
+        } else if (m.name == "OutputSize") {
+            const float v[4] = { static_cast<float>(dstW), static_cast<float>(dstH),
+                                 recip(static_cast<float>(dstW)),
+                                 recip(static_cast<float>(dstH)) };
+            writeAt(m.offsetBytes, v, std::min<uint32_t>(m.sizeBytes, sizeof(v)));
+        } else if (m.name == "SourceSize") {
+            const float v[4] = { static_cast<float>(srcW), static_cast<float>(srcH),
+                                 recip(static_cast<float>(srcW)),
+                                 recip(static_cast<float>(srcH)) };
+            writeAt(m.offsetBytes, v, std::min<uint32_t>(m.sizeBytes, sizeof(v)));
+        } else if (m.name == "OriginalSize") {
+            const float v[4] = { static_cast<float>(origW), static_cast<float>(origH),
+                                 recip(static_cast<float>(origW)),
+                                 recip(static_cast<float>(origH)) };
+            writeAt(m.offsetBytes, v, std::min<uint32_t>(m.sizeBytes, sizeof(v)));
+        } else if (m.name == "FrameCount") {
+            writeAt(m.offsetBytes, &frameCount,
+                    std::min<uint32_t>(m.sizeBytes, sizeof(uint32_t)));
+        }
+        // Unknown members (user parameters etc.) stay zero. The
+        // blob's underlying storage is already zero-initialised.
+    }
+    return blob;
+}
 
 uint32_t AxisSize(PostProcessScaleType type, float scale, uint32_t source, uint32_t viewport) {
     float pixels = 1.0f;
@@ -325,6 +394,91 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
         return srcFb;
     }
 
+    // Phase 3D-2: if slang passes are loaded, run them and return.
+    // Legacy and slang chains are mutually exclusive on a single
+    // LoadPasses / LoadSlangPasses call — UnloadShader runs between
+    // them — so we don't have to interleave.
+    if (!mSlangPasses.empty()) {
+        const int originalFb = srcFb;
+        const uint32_t originalWidth = params.srcWidth;
+        const uint32_t originalHeight = params.srcHeight;
+        int curIn = srcFb;
+        uint32_t curW = params.srcWidth;
+        uint32_t curH = params.srcHeight;
+        const size_t lastIdx = mSlangPasses.size() - 1;
+        // Reusable scratch storage so we don't churn allocators per
+        // pass — each pass writes its own samplerFbIds prefix.
+        std::vector<int> samplerFbIds;
+        for (size_t i = 0; i < mSlangPasses.size(); ++i) {
+            SlangPass& sp = mSlangPasses[i];
+            const bool isLast = (i == lastIdx);
+            uint32_t outW, outH;
+            int outFb;
+            if (isLast) {
+                outW = mDstWidth;
+                outH = mDstHeight;
+                outFb = mDstFb;
+            } else {
+                outW = AxisSize(sp.config.scaleTypeX, sp.config.scaleX, curW, params.dstWidth);
+                outH = AxisSize(sp.config.scaleTypeY, sp.config.scaleY, curH, params.dstHeight);
+                if (outW != sp.lastWidth || outH != sp.lastHeight) {
+                    rapi->UpdateFramebufferParameters(sp.outputFb, outW, outH,
+                                                      /*msaa_level=*/1,
+                                                      /*opengl_invertY=*/false,
+                                                      /*render_target=*/true,
+                                                      /*has_depth_buffer=*/false,
+                                                      /*can_extract_depth=*/false);
+                    sp.lastWidth = outW;
+                    sp.lastHeight = outH;
+                }
+                outFb = sp.outputFb;
+            }
+
+            uint32_t framePassed = params.frameCount;
+            if (sp.config.frameCountMod > 0) {
+                framePassed = params.frameCount %
+                              static_cast<uint32_t>(sp.config.frameCountMod);
+            }
+
+            std::vector<uint8_t> uboBlob = BuildSlangUbo(
+                sp.artifact, curW, curH, outW, outH,
+                originalWidth, originalHeight, framePassed);
+
+            samplerFbIds.assign(sp.artifact.samplers.size(), -1);
+            for (size_t s = 0; s < sp.artifact.samplers.size(); ++s) {
+                const std::string& n = sp.artifact.samplers[s].name;
+                if (n == "Source") {
+                    samplerFbIds[s] = curIn;
+                } else if (n == "Original") {
+                    samplerFbIds[s] = originalFb;
+                }
+                // PassOutputN / OriginalHistoryN / PassFeedbackN /
+                // aliases fall through unbound; Phase 3D-3 / 3E plumb
+                // them.
+            }
+
+            PostProcessParams pp = params;
+            pp.srcWidth = curW;
+            pp.srcHeight = curH;
+            pp.originalWidth = originalWidth;
+            pp.originalHeight = originalHeight;
+            pp.dstWidth = outW;
+            pp.dstHeight = outH;
+            pp.frameCount = framePassed;
+            rapi->RunPostProcessSlang(sp.programId, outFb,
+                                      uboBlob.empty() ? nullptr : uboBlob.data(),
+                                      static_cast<uint32_t>(uboBlob.size()),
+                                      samplerFbIds.empty() ? nullptr : samplerFbIds.data(),
+                                      static_cast<uint32_t>(samplerFbIds.size()),
+                                      pp);
+
+            curIn = outFb;
+            curW = outW;
+            curH = outH;
+        }
+        return mDstFb;
+    }
+
     // The chain's "original" FB stays pinned to the game FB across
     // every pass — that's the sampler 1 binding (`Original`) libretro
     // multipass shaders use to combine the post-bloom buffer with the
@@ -475,7 +629,8 @@ int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessPar
 }
 
 bool PostProcessChain::IsActive() const {
-    return mBackendSupported && !mPasses.empty() && mDstFb >= 0;
+    return mBackendSupported && (!mPasses.empty() || !mSlangPasses.empty()) &&
+           mDstFb >= 0;
 }
 
 } // namespace Fast
