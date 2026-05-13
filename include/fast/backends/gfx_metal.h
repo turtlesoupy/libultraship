@@ -93,6 +93,37 @@ struct PostProcessProgramMetal {
     std::string name;
 };
 
+// Phase 3D-3: compiled slang post-process program for the Metal
+// backend. Distinct from PostProcessProgramMetal because:
+//   - The vertex stage is authored (uses [[stage_in]] vertex
+//     attributes), not a [[vertex_id]] stub.
+//   - The UBO size is per-program; we hold an MTL::Buffer sized
+//     to the slang artifact's declared bytes and refill each Run.
+//   - The slang VS gets its vertex data from a shared MTL::Buffer
+//     (mPostProcessSlangVbo) at vertex buffer index 30 — chosen
+//     so SPIRV-Cross's MSL emit of `constant UBO& global
+//     [[buffer(0)]]` keeps UBO at buffer 0 without colliding.
+//
+// The pipelineVariants[] cache works the same as the legacy
+// PostProcessProgramMetal: build Default up front, build sRGB /
+// Float16 lazily when first targeted by RunPostProcessSlang.
+struct PostProcessSlangProgramMetal {
+    // VS and FS each come from their own MTL::Library (SPIRV-Cross
+    // emits each stage as standalone MSL). Both libraries are
+    // retained for the slot's lifetime — releasing one while a
+    // function from it is still bound to a pipeline state is UB,
+    // even if the pipeline appears to retain the function.
+    MTL::Library* vsLibrary = nullptr;
+    MTL::Library* fsLibrary = nullptr;
+    MTL::Function* vsFn = nullptr;
+    MTL::Function* fsFn = nullptr;
+    MTL::RenderPipelineState* pipelineVariants[3] = {};
+    MTL::Buffer* ubo = nullptr;
+    uint32_t uboBytes = 0;
+    std::string name;
+    std::vector<std::string> samplerNames;
+};
+
 // Layout must match the `PostProcessUniforms` struct emitted by the
 // transpiler. The bundled hand-written MSL companions
 // (scanlines.msl / crt-lottes.msl) declare a shorter struct (no
@@ -231,6 +262,12 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;
+    int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
+    void DestroyPostProcessSlangProgram(int progId) override;
+    void RunPostProcessSlang(int progId, int dstFb,
+                             const uint8_t* uboData, uint32_t uboBytes,
+                             const int* samplerFbIds, uint32_t samplerCount,
+                             const PostProcessParams& params) override;
 
     void NewFrame();
     void SetupFloatingFrame();
@@ -305,6 +342,17 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     // CreatePostProcessStaticTexture. Empty slots (texture == nullptr)
     // are reused.
     std::vector<MTL::Texture*> mPostProcessStaticTextures;
+
+    // Phase 3D-3: slang post-process programs + shared vertex buffer.
+    // The VBO holds 3 vertices of {vec4 Position, vec2 TexCoord}
+    // interleaved (24 B stride, 72 B total) — created lazily on
+    // first slang Run and reused for every slang draw.
+    std::vector<PostProcessSlangProgramMetal> mPostProcessSlangPrograms;
+    MTL::Buffer* mPostProcessSlangVbo = nullptr;
+    // Vertex buffer slot the slang pipelines route their stage_in
+    // through. Picked high so it never collides with
+    // SPIRV-Cross's `[[buffer(0)]]` UBO binding.
+    static constexpr uint32_t kPostProcessSlangVertexBufferIndex = 30;
 };
 
 } // namespace Fast

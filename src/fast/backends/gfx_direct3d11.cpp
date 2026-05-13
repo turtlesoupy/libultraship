@@ -2045,6 +2045,289 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     mContext->PSSetShaderResources(0, (UINT)totalSlots, nullSrvs);
 }
 
+// Phase 3D-3: compile a slang program (authored VS + FS) for the
+// D3D11 backend. SPIRV-Cross emits the slang VS attributes at
+// TEXCOORD0 (vec4 Position) + TEXCOORD1 (vec2 TexCoord) with default
+// options, and the chain provides matching interleaved vertex data
+// via mPostProcessSlangVbo at run time.
+int GfxRenderingAPIDX11::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsHlsl.empty() || src.fsHlsl.empty()) {
+        SPDLOG_ERROR("Slang post-process shader '{}': missing VS or FS HLSL "
+                     "(transpiler should have populated both — check earlier log)",
+                     src.name);
+        return -1;
+    }
+
+#if DEBUG_D3D
+    UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    HRESULT hr = mD3dCompile(src.vsHlsl.data(), src.vsHlsl.size(), nullptr, nullptr, nullptr,
+                             "VSMain", "vs_5_0", compileFlags, 0,
+                             vsBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': VSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+    errBlob.Reset();
+    hr = mD3dCompile(src.fsHlsl.data(), src.fsHlsl.size(), nullptr, nullptr, nullptr,
+                     "PSMain", "ps_5_0", compileFlags, 0,
+                     psBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': PSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+
+    PostProcessSlangProgramD3D11 slot;
+    hr = mDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                     slot.vertex_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreateVertexShader failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+    hr = mDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                    slot.pixel_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreatePixelShader failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+
+    // Vertex layout matches the slang VBO populated lazily on first
+    // run: {vec4 Position, vec2 TexCoord} interleaved, stride 24.
+    // SPIRV-Cross's HLSL output uses TEXCOORD<location> for input
+    // attribute semantics by default, so location=0 becomes
+    // TEXCOORD0 and location=1 becomes TEXCOORD1.
+    const D3D11_INPUT_ELEMENT_DESC kSlangLayout[] = {
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    hr = mDevice->CreateInputLayout(kSlangLayout, ARRAYSIZE(kSlangLayout),
+                                    vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                                    slot.input_layout.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreateInputLayout failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+
+    if (src.uboBytes > 0) {
+        const UINT bytes = (UINT)((src.uboBytes + 15) & ~15u);
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.ByteWidth = bytes;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = mDevice->CreateBuffer(&bd, nullptr, slot.ubo.GetAddressOf());
+        if (FAILED(hr)) {
+            SPDLOG_ERROR("Slang post-process '{}': CreateBuffer(ubo {}B) failed (hr=0x{:08X})",
+                         src.name, bytes, (uint32_t)hr);
+            return -1;
+        }
+        slot.uboBytes = bytes;
+    }
+    slot.name = src.name;
+    slot.samplerNames = src.samplerNames;
+
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].vertex_shader.Get() == nullptr) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessSlangPrograms.push_back(std::move(slot));
+    return (int)mPostProcessSlangPrograms.size() - 1;
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    mPostProcessSlangPrograms[progId] = PostProcessSlangProgramD3D11{};
+}
+
+void GfxRenderingAPIDX11::RunPostProcessSlang(int progId, int dstFb,
+                                              const uint8_t* uboData, uint32_t uboBytes,
+                                              const int* samplerFbIds, uint32_t samplerCount,
+                                              const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    PostProcessSlangProgramD3D11& slot = mPostProcessSlangPrograms[progId];
+    if (slot.vertex_shader.Get() == nullptr || slot.pixel_shader.Get() == nullptr) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.render_target_view.Get() == nullptr) {
+        return;
+    }
+    TextureData& dstTex = mTextures[dstFbInfo.texture_id];
+
+    // Lazily build the slang vertex buffer (fullscreen triangle:
+    // 3 vertices of {vec4 Position, vec2 TexCoord}).
+    if (mPostProcessSlangVbo.Get() == nullptr) {
+        static const float kSlangVerts[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,  0.0f, 0.0f,
+             3.0f, -1.0f, 0.0f, 1.0f,  2.0f, 0.0f,
+            -1.0f,  3.0f, 0.0f, 1.0f,  0.0f, 2.0f,
+        };
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.ByteWidth = sizeof(kSlangVerts);
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = kSlangVerts;
+        ThrowIfFailed(mDevice->CreateBuffer(&bd, &init, mPostProcessSlangVbo.GetAddressOf()));
+    }
+
+    // Upload the chain-built UBO blob into the program's cbuffer.
+    if (slot.ubo.Get() != nullptr && uboData != nullptr && uboBytes > 0) {
+        D3D11_MAPPED_SUBRESOURCE ms{};
+        ThrowIfFailed(mContext->Map(slot.ubo.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
+        auto* dst = static_cast<uint8_t*>(ms.pData);
+        std::memset(dst, 0, slot.uboBytes);
+        std::memcpy(dst, uboData, std::min<uint32_t>(uboBytes, slot.uboBytes));
+        mContext->Unmap(slot.ubo.Get(), 0);
+    }
+
+    // Set destination as the sole render target, no depth.
+    ID3D11RenderTargetView* rtv = dstFbInfo.render_target_view.Get();
+    mContext->OMSetRenderTargets(1, &rtv, nullptr);
+
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)dstTex.width;
+    vp.Height = (float)dstTex.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &vp);
+
+    // Bind the slang vertex buffer + input layout.
+    UINT stride = 6 * sizeof(float); // vec4 + vec2 = 24
+    UINT offset = 0;
+    ID3D11Buffer* vbo = mPostProcessSlangVbo.Get();
+    mContext->IASetInputLayout(slot.input_layout.Get());
+    mContext->IASetVertexBuffers(0, 1, &vbo, &stride, &offset);
+    mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    mContext->VSSetShader(slot.vertex_shader.Get(), nullptr, 0);
+    mContext->PSSetShader(slot.pixel_shader.Get(), nullptr, 0);
+
+    const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+
+    // Build a single sampler reused across all slots — Phase 3D-3
+    // single-pass scope. Per-slot libretro filter/wrap routing comes
+    // with Phase 3D-3 multipass; for now Source-and-Original on
+    // linear/clamp matches the legacy behaviour.
+    auto wrapModeToD3D = [](PostProcessWrapMode m) -> D3D11_TEXTURE_ADDRESS_MODE {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return D3D11_TEXTURE_ADDRESS_CLAMP;
+            case PostProcessWrapMode::ClampToBorder:  return D3D11_TEXTURE_ADDRESS_BORDER;
+            case PostProcessWrapMode::Repeat:         return D3D11_TEXTURE_ADDRESS_WRAP;
+            case PostProcessWrapMode::MirroredRepeat: return D3D11_TEXTURE_ADDRESS_MIRROR;
+        }
+        return D3D11_TEXTURE_ADDRESS_CLAMP;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> ID3D11SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second.Get();
+        }
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                           : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        const D3D11_TEXTURE_ADDRESS_MODE addr = wrapModeToD3D(wrap);
+        sd.AddressU = addr;
+        sd.AddressV = addr;
+        sd.AddressW = addr;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sd, sampler.GetAddressOf()));
+        ID3D11SamplerState* raw = sampler.Get();
+        mPostProcessSamplers.emplace(key, std::move(sampler));
+        return raw;
+    };
+
+    // Bind samplerFbIds[i]'s SRV at slot i. Use the first valid SRV
+    // as the fallback for any -1 entries.
+    constexpr size_t kMaxSlangSlots = 8;
+    ID3D11ShaderResourceView* srvs[kMaxSlangSlots] = {};
+    ID3D11SamplerState* samplers[kMaxSlangSlots] = {};
+    ID3D11ShaderResourceView* fallbackSrv = nullptr;
+    for (uint32_t i = 0; i < samplerCount && i < kMaxSlangSlots; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (fbId >= 0 && (size_t)fbId < mFrameBuffers.size()) {
+            const FramebufferDX11& f = mFrameBuffers[fbId];
+            if (f.texture_id < mTextures.size()) {
+                srv = mTextures[f.texture_id].resource_view.Get();
+            }
+        }
+        if (srv != nullptr && fallbackSrv == nullptr) {
+            fallbackSrv = srv;
+        }
+        srvs[i] = srv;
+        samplers[i] = getSampler(params.srcFilterLinear, params.srcWrapMode);
+    }
+    // Fill any nulls with the fallback so the shader's texture()
+    // calls don't trip a D3D11 null-SRV bind warning.
+    for (uint32_t i = 0; i < samplerCount && i < kMaxSlangSlots; ++i) {
+        if (srvs[i] == nullptr) {
+            srvs[i] = fallbackSrv;
+        }
+    }
+    const UINT slotCount = std::min<uint32_t>(samplerCount, kMaxSlangSlots);
+    if (slotCount > 0) {
+        mContext->PSSetShaderResources(0, slotCount, srvs);
+        mContext->PSSetSamplers(0, slotCount, samplers);
+    }
+
+    // Bind the slang UBO at both b0 stages (VS uses MVP; FS uses
+    // SourceSize / OutputSize / parameters).
+    ID3D11Buffer* cb = slot.ubo.Get();
+    if (cb != nullptr) {
+        mContext->VSSetConstantBuffers(0, 1, &cb);
+        mContext->PSSetConstantBuffers(0, 1, &cb);
+    }
+
+    mContext->Draw(3, 0);
+
+    // Invalidate the regular-draw caches so the next DrawTriangles
+    // re-binds everything.
+    mLastShaderProgram = nullptr;
+    for (size_t i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastBlendState.Reset();
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    mLastVertexBufferStride = 0;
+
+    // Detach SRVs so a later pass writing into any of these textures
+    // doesn't trip the RTV-and-SRV-bound warning.
+    ID3D11ShaderResourceView* nullSrvs[kMaxSlangSlots] = {};
+    if (slotCount > 0) {
+        mContext->PSSetShaderResources(0, slotCount, nullSrvs);
+    }
+}
+
 } // namespace Fast
 
 // C-callable entry point for the port. Defined outside the Fast namespace so

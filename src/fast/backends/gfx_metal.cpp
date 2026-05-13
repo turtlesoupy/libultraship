@@ -1513,6 +1513,41 @@ GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
         }
     }
     mPostProcessStaticTextures.clear();
+    // Phase 3D-3: release any leftover slang programs the chain didn't
+    // explicitly destroy, plus the shared vertex buffer.
+    for (auto& slot : mPostProcessSlangPrograms) {
+        for (auto*& variant : slot.pipelineVariants) {
+            if (variant != nullptr) {
+                variant->release();
+                variant = nullptr;
+            }
+        }
+        if (slot.vsFn != nullptr) {
+            slot.vsFn->release();
+            slot.vsFn = nullptr;
+        }
+        if (slot.fsFn != nullptr) {
+            slot.fsFn->release();
+            slot.fsFn = nullptr;
+        }
+        if (slot.vsLibrary != nullptr) {
+            slot.vsLibrary->release();
+            slot.vsLibrary = nullptr;
+        }
+        if (slot.fsLibrary != nullptr) {
+            slot.fsLibrary->release();
+            slot.fsLibrary = nullptr;
+        }
+        if (slot.ubo != nullptr) {
+            slot.ubo->release();
+            slot.ubo = nullptr;
+        }
+    }
+    mPostProcessSlangPrograms.clear();
+    if (mPostProcessSlangVbo != nullptr) {
+        mPostProcessSlangVbo->release();
+        mPostProcessSlangVbo = nullptr;
+    }
 }
 
 void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
@@ -1539,6 +1574,156 @@ void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
         slot.library = nullptr;
     }
     slot = PostProcessProgramMetal{};
+}
+
+// Phase 3D-3: build a fullscreen-triangle vertex descriptor for slang
+// pipelines. Attribute layout matches the slang VBO populated lazily
+// on first slang Run: vec4 Position at offset 0, vec2 TexCoord at
+// offset 16, stride 24. Bound at high vertex-buffer index
+// (kPostProcessSlangVertexBufferIndex) so SPIRV-Cross's `[[buffer(0)]]`
+// UBO declaration has its own slot.
+static MTL::VertexDescriptor* MakeSlangVertexDescriptor(uint32_t bufferIndex) {
+    MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
+    vd->attributes()->object(0)->setFormat(MTL::VertexFormatFloat4);
+    vd->attributes()->object(0)->setOffset(0);
+    vd->attributes()->object(0)->setBufferIndex(bufferIndex);
+    vd->attributes()->object(1)->setFormat(MTL::VertexFormatFloat2);
+    vd->attributes()->object(1)->setOffset(16);
+    vd->attributes()->object(1)->setBufferIndex(bufferIndex);
+    vd->layouts()->object(bufferIndex)->setStride(24);
+    vd->layouts()->object(bufferIndex)->setStepRate(1);
+    vd->layouts()->object(bufferIndex)->setStepFunction(MTL::VertexStepFunctionPerVertex);
+    return vd;
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsMsl.empty() || src.fsMsl.empty()) {
+        SPDLOG_ERROR("Slang post-process '{}': missing VS or FS MSL", src.name);
+        return -1;
+    }
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = nullptr;
+
+    // Slang VS + FS live in separate sources (each was emitted by
+    // SPIRV-Cross from its own SPIR-V module). Compile each into its
+    // own MTL::Library and pull the entry-point function out.
+    auto compileSource = [&](const std::string& msl, const char* fnName,
+                             MTL::Library*& outLib, MTL::Function*& outFn) -> bool {
+        MTL::Library* lib = mDevice->newLibrary(
+            NS::String::string(msl.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+        if (lib == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': MSL compile failed ({}): {}", src.name, fnName,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            return false;
+        }
+        MTL::Function* fn = lib->newFunction(NS::String::string(fnName, NS::UTF8StringEncoding));
+        if (fn == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': MSL missing entry '{}'", src.name, fnName);
+            lib->release();
+            return false;
+        }
+        outLib = lib;
+        outFn = fn;
+        return true;
+    };
+
+    PostProcessSlangProgramMetal slot{};
+    // Both libraries are retained for the slot's lifetime.
+    if (!compileSource(src.vsMsl, "postprocess_vertex", slot.vsLibrary, slot.vsFn)) {
+        pool->release();
+        return -1;
+    }
+    if (!compileSource(src.fsMsl, "postprocess_fragment", slot.fsLibrary, slot.fsFn)) {
+        slot.vsFn->release();
+        slot.vsLibrary->release();
+        pool->release();
+        return -1;
+    }
+
+    MTL::VertexDescriptor* vd = MakeSlangVertexDescriptor(kPostProcessSlangVertexBufferIndex);
+
+    MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    desc->setVertexFunction(slot.vsFn);
+    desc->setFragmentFunction(slot.fsFn);
+    desc->setVertexDescriptor(vd);
+    desc->colorAttachments()->object(0)->setPixelFormat(
+        mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+    desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+    desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+    desc->setSampleCount(1);
+
+    MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
+    desc->release();
+    vd->release();
+
+    if (pipeline == nullptr) {
+        SPDLOG_ERROR("Slang post-process '{}': pipeline state failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        slot.vsFn->release();
+        slot.fsFn->release();
+        slot.vsLibrary->release();
+        slot.fsLibrary->release();
+        pool->release();
+        return -1;
+    }
+    slot.pipelineVariants[(int)PostProcessFboFormat::Default] = pipeline;
+    slot.name = src.name;
+    slot.samplerNames = src.samplerNames;
+
+    if (src.uboBytes > 0) {
+        const NS::UInteger uboBytes = (src.uboBytes + 15) & ~15u;
+        slot.ubo = mDevice->newBuffer(uboBytes, MTL::ResourceStorageModeShared);
+        slot.uboBytes = static_cast<uint32_t>(uboBytes);
+    }
+
+    int handle = -1;
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            handle = (int)i;
+            break;
+        }
+    }
+    if (handle < 0) {
+        mPostProcessSlangPrograms.push_back(std::move(slot));
+        handle = (int)mPostProcessSlangPrograms.size() - 1;
+    }
+    pool->release();
+    return handle;
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessSlangPrograms[progId];
+    for (auto*& variant : slot.pipelineVariants) {
+        if (variant != nullptr) {
+            variant->release();
+            variant = nullptr;
+        }
+    }
+    if (slot.vsFn != nullptr) {
+        slot.vsFn->release();
+        slot.vsFn = nullptr;
+    }
+    if (slot.fsFn != nullptr) {
+        slot.fsFn->release();
+        slot.fsFn = nullptr;
+    }
+    if (slot.vsLibrary != nullptr) {
+        slot.vsLibrary->release();
+        slot.vsLibrary = nullptr;
+    }
+    if (slot.fsLibrary != nullptr) {
+        slot.fsLibrary->release();
+        slot.fsLibrary = nullptr;
+    }
+    if (slot.ubo != nullptr) {
+        slot.ubo->release();
+        slot.ubo = nullptr;
+    }
+    slot = PostProcessSlangProgramMetal{};
 }
 
 int GfxRenderingAPIMetal::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
@@ -1634,6 +1819,244 @@ void GfxRenderingAPIMetal::SetPostProcessFramebufferFormat(int fb_id, PostProces
     // mismatch against mLastPostProcessFormat and reallocates the
     // underlying MTL::Texture with the new pixel format.
     mFramebuffers[fb_id].mPostProcessFormat = fmt;
+}
+
+// Phase 3D-3: dispatch a compiled slang program. Mirrors the legacy
+// RunPostProcess but routes vertex data through a bound MTL::Buffer
+// (not [[vertex_id]]) and uploads a chain-built UBO blob to buffer(0)
+// on both stages instead of the fixed PostProcessUniformsMetal struct.
+void GfxRenderingAPIMetal::RunPostProcessSlang(int progId, int dstFb,
+                                                const uint8_t* uboData, uint32_t uboBytes,
+                                                const int* samplerFbIds, uint32_t samplerCount,
+                                                const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    PostProcessSlangProgramMetal& slot = mPostProcessSlangPrograms[progId];
+    if (slot.pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& dst = mFramebuffers[dstFb];
+    if (dst.mRenderPassDescriptor == nullptr) {
+        return;
+    }
+    MTL::Texture* dstTexture =
+        (dst.mTextureId != UINT32_MAX) ? mTextures[dst.mTextureId].texture : nullptr;
+    if (dstTexture == nullptr) {
+        return;
+    }
+
+    // Re-use the legacy host-cb hunt to find a non-screen command
+    // buffer to append our encoder to. The first sampler entry's
+    // source FBO is the most likely owner; otherwise scan drawn FBs.
+    MTL::CommandBuffer* hostCb = nullptr;
+    FramebufferMetal* hostFb = nullptr;
+    int seedFb = (samplerCount > 0 && samplerFbIds != nullptr) ? samplerFbIds[0] : -1;
+    if (seedFb >= 0 && (size_t)seedFb < mFramebuffers.size()) {
+        FramebufferMetal& candidate = mFramebuffers[seedFb];
+        if (candidate.mCommandBuffer != nullptr) {
+            hostCb = candidate.mCommandBuffer;
+            hostFb = &candidate;
+        }
+    }
+    if (hostCb == nullptr) {
+        for (int id : mDrawnFramebuffers) {
+            if (id == 0 || id == dstFb) {
+                continue;
+            }
+            if ((size_t)id >= mFramebuffers.size()) {
+                continue;
+            }
+            FramebufferMetal& candidate = mFramebuffers[id];
+            if (candidate.mCommandBuffer != nullptr) {
+                hostCb = candidate.mCommandBuffer;
+                hostFb = &candidate;
+                break;
+            }
+        }
+    }
+    if (hostCb == nullptr || hostFb == nullptr) {
+        SPDLOG_WARN("Slang post-process: no live non-screen command buffer; skipping pass for '{}'",
+                    slot.name);
+        return;
+    }
+    if (!hostFb->mHasEndedEncoding && hostFb->mCommandEncoder != nullptr) {
+        hostFb->mCommandEncoder->endEncoding();
+        hostFb->mHasEndedEncoding = true;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Build the shared slang VBO once. 3 vertices of {vec4 Position,
+    // vec2 TexCoord} in clip space + [0,2] UVs.
+    if (mPostProcessSlangVbo == nullptr) {
+        static const float kSlangVerts[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,  0.0f, 0.0f,
+             3.0f, -1.0f, 0.0f, 1.0f,  2.0f, 0.0f,
+            -1.0f,  3.0f, 0.0f, 1.0f,  0.0f, 2.0f,
+        };
+        mPostProcessSlangVbo = mDevice->newBuffer(kSlangVerts, sizeof(kSlangVerts),
+                                                   MTL::ResourceStorageModeShared);
+    }
+
+    MTL::RenderPassColorAttachmentDescriptor* color = dst.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::LoadAction origLoad = color->loadAction();
+    color->setLoadAction(MTL::LoadActionDontCare);
+
+    MTL::RenderCommandEncoder* enc = hostCb->renderCommandEncoder(dst.mRenderPassDescriptor);
+    enc->setLabel(NS::String::string("Slang post-process pass", NS::UTF8StringEncoding));
+
+    MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
+    enc->setViewport(vp);
+
+    // Lazy-build the pipeline variant for the destination's color
+    // format, mirroring the legacy path.
+    const PostProcessFboFormat dstFmt = dst.mPostProcessFormat;
+    MTL::RenderPipelineState* variant = slot.pipelineVariants[(int)dstFmt];
+    if (variant == nullptr) {
+        MTL::PixelFormat mtlFmt = MTL::PixelFormatBGRA8Unorm;
+        switch (dstFmt) {
+            case PostProcessFboFormat::Default:
+                mtlFmt = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+                break;
+            case PostProcessFboFormat::Srgb:
+                mtlFmt = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                mtlFmt = MTL::PixelFormatRGBA16Float;
+                break;
+        }
+        MTL::VertexDescriptor* vd = MakeSlangVertexDescriptor(kPostProcessSlangVertexBufferIndex);
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(slot.vsFn);
+        desc->setFragmentFunction(slot.fsFn);
+        desc->setVertexDescriptor(vd);
+        desc->colorAttachments()->object(0)->setPixelFormat(mtlFmt);
+        desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+        desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+        desc->setSampleCount(1);
+        NS::Error* error = nullptr;
+        variant = mDevice->newRenderPipelineState(desc, &error);
+        desc->release();
+        vd->release();
+        if (variant == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': pipeline variant for format {} failed: {}",
+                         slot.name, (int)dstFmt,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            variant = slot.pipelineVariants[(int)PostProcessFboFormat::Default];
+        } else {
+            slot.pipelineVariants[(int)dstFmt] = variant;
+        }
+    }
+    enc->setRenderPipelineState(variant);
+
+    // Sampler binding plan: a single sampler reused at every slot
+    // for Phase 3D-3 scope. Per-slot libretro filter/wrap routing
+    // arrives with multipass slang chains in later phases.
+    auto wrapModeToMetal = [](PostProcessWrapMode m) -> MTL::SamplerAddressMode {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return MTL::SamplerAddressModeClampToEdge;
+            case PostProcessWrapMode::ClampToBorder:  return MTL::SamplerAddressModeClampToBorderColor;
+            case PostProcessWrapMode::Repeat:         return MTL::SamplerAddressModeRepeat;
+            case PostProcessWrapMode::MirroredRepeat: return MTL::SamplerAddressModeMirrorRepeat;
+        }
+        return MTL::SamplerAddressModeClampToEdge;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> MTL::SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second;
+        }
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        const MTL::SamplerMinMagFilter f =
+            linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+        sd->setMinFilter(f);
+        sd->setMagFilter(f);
+        sd->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        const MTL::SamplerAddressMode addr = wrapModeToMetal(wrap);
+        sd->setSAddressMode(addr);
+        sd->setTAddressMode(addr);
+        if (wrap == PostProcessWrapMode::ClampToBorder) {
+            sd->setBorderColor(MTL::SamplerBorderColorTransparentBlack);
+        }
+        MTL::SamplerState* sampler = mDevice->newSamplerState(sd);
+        sd->release();
+        mPostProcessSamplers.emplace(key, sampler);
+        return sampler;
+    };
+    MTL::SamplerState* sampler = getSampler(params.srcFilterLinear, params.srcWrapMode);
+
+    // Bind samplerFbIds[i]'s texture at slot i. Fallback to the
+    // first valid texture if any entry is -1 so the shader's
+    // sample() calls don't read undefined memory.
+    MTL::Texture* fallbackTex = nullptr;
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        if (fbId >= 0 && (size_t)fbId < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[fbId];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    fallbackTex = t;
+                    break;
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        MTL::Texture* tex = fallbackTex;
+        if (fbId >= 0 && (size_t)fbId < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[fbId];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    tex = t;
+                }
+            }
+        }
+        if (tex != nullptr) {
+            enc->setFragmentTexture(tex, (NS::UInteger)i);
+            enc->setFragmentSamplerState(sampler, (NS::UInteger)i);
+        }
+    }
+
+    // UBO upload — bind to buffer(0) on both stages so the
+    // SPIRV-Cross-emitted `constant UBO& global [[buffer(0)]]`
+    // declaration finds it. Use setVertexBytes / setFragmentBytes
+    // (inline) for small blobs; spill to a persistent buffer for
+    // larger ones. Slang shaders rarely exceed 4KB so the inline
+    // path covers almost everything.
+    if (uboData != nullptr && uboBytes > 0) {
+        constexpr uint32_t kSetBytesThreshold = 4096;
+        if (uboBytes <= kSetBytesThreshold) {
+            enc->setVertexBytes(uboData, uboBytes, 0);
+            enc->setFragmentBytes(uboData, uboBytes, 0);
+        } else if (slot.ubo != nullptr) {
+            // Refill the per-program persistent buffer.
+            std::memcpy(slot.ubo->contents(), uboData,
+                        std::min<uint32_t>(uboBytes, slot.uboBytes));
+            slot.ubo->didModifyRange(NS::Range::Make(0, slot.uboBytes));
+            enc->setVertexBuffer(slot.ubo, 0, 0);
+            enc->setFragmentBuffer(slot.ubo, 0, 0);
+        }
+    }
+
+    // Bind the slang vertex buffer at the high index the descriptor
+    // routes attributes through.
+    enc->setVertexBuffer(mPostProcessSlangVbo, 0, kPostProcessSlangVertexBufferIndex);
+
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
+    enc->endEncoding();
+
+    color->setLoadAction(origLoad);
+
+    pool->release();
 }
 
 void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,

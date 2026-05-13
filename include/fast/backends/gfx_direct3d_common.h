@@ -118,6 +118,35 @@ struct PostProcessUniformsD3D11 {
 static constexpr size_t kPostProcessUniformsPrefixBytes = 40;
 static constexpr size_t kPostProcessUniformsAliasStride = 8; // vec2 in std140
 
+// Phase 3D-3: compiled slang program for D3D11. Distinct from
+// PostProcessProgramD3D11 because the slang path has an authored VS
+// (consumes vertex data — not SV_VertexID), the UBO size is per-
+// program (declared by the .slang's UBO block), and samplers are
+// bound in declaration order rather than at fixed Source=0 /
+// Original=1 slots.
+//
+// SPIRV-Cross emits the slang VS with input attributes at
+// `TEXCOORD<location>` semantics (locations 0 and 1 for the
+// standard slang Position+TexCoord pair). The input layout below
+// matches that emit; the per-program slot owns the layout because
+// future shaders may declare different attribute layouts.
+struct PostProcessSlangProgramD3D11 {
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader>  pixel_shader;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout>  input_layout;
+    // Per-program cbuffer sized to the slang artifact's declared
+    // UBO bytes (rounded up to 16-byte multiple for D3D11). The
+    // chain memcpys the pre-built UBO blob into it each frame.
+    Microsoft::WRL::ComPtr<ID3D11Buffer>       ubo;
+    uint32_t uboBytes = 0;
+    std::string name;
+    // Sampler-binding plan: each entry's name comes from the
+    // artifact's samplers[] in declaration order. Backends bind
+    // samplerFbIds[i]'s texture at slot i and a sampler at the
+    // same slot.
+    std::vector<std::string> samplerNames;
+};
+
 class GfxWindowBackendDXGI;
 
 class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
@@ -180,6 +209,12 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;
+    int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
+    void DestroyPostProcessSlangProgram(int progId) override;
+    void RunPostProcessSlang(int progId, int dstFb,
+                             const uint8_t* uboData, uint32_t uboBytes,
+                             const int* samplerFbIds, uint32_t samplerCount,
+                             const PostProcessParams& params) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -279,6 +314,14 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
     };
     std::vector<StaticTextureD3D11> mPostProcessStaticTextures;
+
+    // Phase 3D-3: slang post-process programs. Independent handle
+    // namespace from mPostProcessPrograms. Vertex buffer + cached
+    // slang-flavor blend state are shared across all slang programs
+    // (the geometry never changes), allocated lazily on first slang
+    // Run.
+    std::vector<PostProcessSlangProgramD3D11> mPostProcessSlangPrograms;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessSlangVbo;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,
