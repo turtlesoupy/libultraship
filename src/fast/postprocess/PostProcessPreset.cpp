@@ -1,7 +1,8 @@
-// Implemented from the public libretro `.glslp` preset format documented
-// at https://docs.libretro.com/development/shaders/glsl-shaders/ and the
-// example presets in libretro/glsl-shaders. No code copied from
-// RetroArch or any GPL-licensed shader runtime.
+// Implemented from the public libretro `.glslp` and `.slangp` preset
+// format documentation at https://docs.libretro.com/development/shaders/
+// and the example presets in libretro/glsl-shaders / libretro/slang-
+// shaders. No code copied from RetroArch or any GPL-licensed shader
+// runtime.
 
 #include "fast/postprocess/PostProcessPreset.h"
 
@@ -142,13 +143,44 @@ std::string ToLower(const std::string& s) {
     return out;
 }
 
-} // namespace
+// Return true iff `v` parses cleanly as a decimal number (libretro's
+// `.slangp` parameter overrides are always numeric — integer or float,
+// optionally signed). Used to filter parameter-override capture from
+// truly malformed entries, so a junk key=value line doesn't poison the
+// parameterOverrides map and silently override a real parameter later.
+bool TryParseFloat(const std::string& v, float& out) {
+    if (v.empty()) {
+        return false;
+    }
+    const char* begin = v.c_str();
+    char* end = nullptr;
+    const float parsed = std::strtof(begin, &end);
+    if (end == begin) {
+        return false;
+    }
+    // strtof stops at the first non-numeric char; we want strict
+    // numeric. Tolerate trailing whitespace only (already trimmed
+    // by caller, but be defensive).
+    while (end && *end != '\0') {
+        if (!std::isspace(static_cast<unsigned char>(*end))) {
+            return false;
+        }
+        ++end;
+    }
+    out = parsed;
+    return true;
+}
 
-bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
-                            PostProcessPreset& out, std::string& errOut) {
+bool ParsePresetImpl(const std::string& src, const std::string& baseDir,
+                     PostProcessPresetFlavor flavor,
+                     PostProcessPreset& out, std::string& errOut) {
+    const char* const formatTag =
+        (flavor == PostProcessPresetFlavor::Slangp) ? ".slangp" : ".glslp";
+    out.flavor = flavor;
     out.baseDir = baseDir;
     out.passes.clear();
     out.textures.clear();
+    out.parameterOverrides.clear();
 
     int declaredShaders = -1;
 
@@ -170,7 +202,7 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
         }
         const size_t eq = line.find('=');
         if (eq == std::string::npos) {
-            errOut = std::string(".glslp line ") + std::to_string(lineNo) +
+            errOut = std::string(formatTag) + " line " + std::to_string(lineNo) +
                      ": missing '=' (\"" + line + "\")";
             return false;
         }
@@ -245,9 +277,21 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
         std::string base;
         int index = -1;
         if (!SplitIndexed(key, base, index)) {
-            // Unknown global key — preset-parameter overrides etc. land
-            // here. Silently skip so future / unsupported properties
-            // don't fail the parse.
+            // Unknown global key. For .glslp this is the historical
+            // "silently drop unsupported keys" path (used by libretro
+            // presets that carry preset-format metadata we don't need).
+            // For .slangp the same shape encodes parameter overrides
+            // for `#pragma parameter` declarations in the referenced
+            // .slang sources — capture every numeric-valued entry so
+            // the chain can apply it once the .slang files are parsed.
+            // Non-numeric unknowns (e.g. `parameters = "FOO;BAR"`) stay
+            // dropped under both flavors.
+            if (flavor == PostProcessPresetFlavor::Slangp) {
+                float numeric = 0.0f;
+                if (TryParseFloat(val, numeric)) {
+                    out.parameterOverrides[key] = numeric;
+                }
+            }
             continue;
         }
         EnsureCapacity(out.passes, index);
@@ -301,7 +345,7 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
     }
 
     if (out.passes.empty()) {
-        errOut = ".glslp declared no passes";
+        errOut = std::string(formatTag) + " declared no passes";
         return false;
     }
 
@@ -312,17 +356,29 @@ bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
         out.passes.pop_back();
     }
     if (out.passes.empty()) {
-        errOut = ".glslp had no pass with a shader path";
+        errOut = std::string(formatTag) + " had no pass with a shader path";
         return false;
     }
     for (size_t i = 0; i < out.passes.size(); ++i) {
         if (out.passes[i].shaderPath.empty()) {
-            errOut = std::string(".glslp pass ") + std::to_string(i) +
+            errOut = std::string(formatTag) + " pass " + std::to_string(i) +
                      " missing 'shader" + std::to_string(i) + "' entry";
             return false;
         }
     }
     return true;
+}
+
+} // namespace
+
+bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
+                            PostProcessPreset& out, std::string& errOut) {
+    return ParsePresetImpl(src, baseDir, PostProcessPresetFlavor::Glslp, out, errOut);
+}
+
+bool ParseSlangPreset(const std::string& src, const std::string& baseDir,
+                      PostProcessPreset& out, std::string& errOut) {
+    return ParsePresetImpl(src, baseDir, PostProcessPresetFlavor::Slangp, out, errOut);
 }
 
 } // namespace Fast

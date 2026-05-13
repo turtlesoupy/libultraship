@@ -1,13 +1,25 @@
-// Implemented from the public libretro `.glslp` preset format documented
-// at https://docs.libretro.com/development/shaders/glsl-shaders/ and the
-// example presets in libretro/glsl-shaders. No code copied from
-// RetroArch or any GPL-licensed shader runtime.
+// Implemented from the public libretro `.glslp` and `.slangp` preset
+// format documentation at https://docs.libretro.com/development/shaders/
+// and the example presets in libretro/glsl-shaders /
+// libretro/slang-shaders. No code copied from RetroArch or any
+// GPL-licensed shader runtime.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
 namespace Fast {
+
+// Which libretro preset dialect a parsed PostProcessPreset came from.
+// The INI surface is nearly identical between the two formats, but
+// the referenced shader files use different source languages (.glsl
+// legacy vs .slang Vulkan-GLSL) and the slang dialect adds first-
+// class parameter overrides on top.
+enum class PostProcessPresetFlavor {
+    Glslp,   // Legacy GLSL multipass (libretro/glsl-shaders).
+    Slangp,  // Vulkan-GLSL slang multipass (libretro/slang-shaders).
+};
 
 enum class PostProcessScaleType {
     Source,   // Next FBO size = previous-pass output size * scale.
@@ -59,9 +71,20 @@ struct PostProcessPresetTexture {
 };
 
 struct PostProcessPreset {
-    std::string baseDir;                       // Directory holding the .glslp.
+    PostProcessPresetFlavor flavor = PostProcessPresetFlavor::Glslp;
+    std::string baseDir;                       // Directory holding the preset.
     std::vector<PostProcessPresetPass> passes; // 1+ entries on success.
     std::vector<PostProcessPresetTexture> textures; // 0+ external texture decls.
+
+    // libretro `.slangp` `<name> = <number>` lines whose keys don't
+    // match any indexed pass key, external-texture name, or known
+    // global key. These are parameter overrides keyed by the matching
+    // `#pragma parameter` identifier in one of the .slang files; the
+    // caller prunes / applies them after the source files are parsed.
+    //
+    // Always empty for `.glslp` presets (the parser silently drops
+    // unknown global keys in that flavor for back-compat).
+    std::map<std::string, float> parameterOverrides;
 };
 
 // Parse a libretro `.glslp` preset from in-memory text. `baseDir` is the
@@ -74,5 +97,23 @@ struct PostProcessPreset {
 // use it on failure.
 bool ParsePostProcessPreset(const std::string& src, const std::string& baseDir,
                             PostProcessPreset& out, std::string& errOut);
+
+// Parse a libretro `.slangp` preset from in-memory text. Same INI
+// surface as `.glslp` — all the `shaderN`, `filter_linearN`,
+// `wrap_modeN`, `scale_*N`, `srgb_framebufferN`, `float_framebufferN`,
+// `mipmap_inputN`, `frame_count_modN`, `aliasN`, `textures`, and
+// per-texture keys parse identically. Differences:
+//
+//   - `out.flavor` is tagged Slangp so downstream code can pick the
+//     `.slang`-aware shader compile path.
+//   - Any unrecognized global `<key> = <value>` line whose value is
+//     numeric is recorded in `out.parameterOverrides[key]` for later
+//     matching against `#pragma parameter` declarations.
+//   - Error messages reference `.slangp` rather than `.glslp`.
+//
+// Returns true on success; on failure `errOut` carries a one-line
+// reason and `out` is left in an unspecified state.
+bool ParseSlangPreset(const std::string& src, const std::string& baseDir,
+                      PostProcessPreset& out, std::string& errOut);
 
 } // namespace Fast
