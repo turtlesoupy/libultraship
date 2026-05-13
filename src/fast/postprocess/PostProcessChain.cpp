@@ -232,10 +232,92 @@ void PostProcessChain::UnloadShader(GfxRenderingAPI* rapi) {
             rapi->DestroyPostProcessStaticTexture(tex.textureId);
         }
     }
+    for (auto& sp : mSlangPasses) {
+        if (sp.programId >= 0 && mBackendSupported) {
+            rapi->DestroyPostProcessSlangProgram(sp.programId);
+        }
+        if (sp.outputFb >= 0 && mBackendSupported) {
+            rapi->DestroyFramebuffer(sp.outputFb);
+        }
+    }
     mPasses.clear();
     mAliases.clear();
     mExternalTextures.clear();
+    mSlangPasses.clear();
     mLoadedName.clear();
+}
+
+bool PostProcessChain::LoadSlangPasses(GfxRenderingAPI* rapi,
+                                       const std::vector<PostProcessSlangArtifact>& artifacts,
+                                       const std::vector<PostProcessPresetPass>& configs,
+                                       const std::vector<std::string>& diagnosticNames) {
+    if (rapi == nullptr || !mBackendSupported) {
+        return false;
+    }
+    if (artifacts.empty() || artifacts.size() != configs.size()) {
+        return false;
+    }
+    if (!diagnosticNames.empty() && diagnosticNames.size() != artifacts.size()) {
+        return false;
+    }
+
+    // Stage everything up front; a partial failure rolls back what we
+    // built and leaves the chain on whatever was loaded before.
+    std::vector<SlangPass> staged;
+    staged.reserve(artifacts.size());
+    for (size_t i = 0; i < artifacts.size(); ++i) {
+        const PostProcessSlangArtifact& art = artifacts[i];
+        PostProcessSlangProgramSource src;
+        src.name = diagnosticNames.empty() ? std::string() : diagnosticNames[i];
+        src.vsGlsl = art.vertex.glsl;
+        src.fsGlsl = art.fragment.glsl;
+        src.vsHlsl = art.vertex.hlsl;
+        src.fsHlsl = art.fragment.hlsl;
+        src.vsMsl  = art.vertex.msl;
+        src.fsMsl  = art.fragment.msl;
+        src.uboBytes = art.uboTotalBytes;
+        src.samplerNames.reserve(art.samplers.size());
+        for (const auto& sampler : art.samplers) {
+            src.samplerNames.push_back(sampler.name);
+        }
+        const int prog = rapi->CreatePostProcessSlangProgram(src);
+        if (prog < 0) {
+            // Backend either doesn't support slang or compile failed.
+            // Roll back what we already built.
+            for (auto& s : staged) {
+                rapi->DestroyPostProcessSlangProgram(s.programId);
+                if (s.outputFb >= 0) {
+                    rapi->DestroyFramebuffer(s.outputFb);
+                }
+            }
+            return false;
+        }
+        SlangPass p;
+        p.programId = prog;
+        p.config = configs[i];
+        p.artifact = art;
+        // Intermediate passes own a chain-managed FBO; the last
+        // pass writes into mDstFb (allocated at Init time and sized
+        // by OnResize), matching the legacy mPasses convention.
+        if (i + 1 < artifacts.size()) {
+            p.outputFb = rapi->CreateFramebuffer();
+            PostProcessFboFormat fmt = PostProcessFboFormat::Default;
+            if (p.config.floatFramebuffer) {
+                fmt = PostProcessFboFormat::Float16;
+            } else if (p.config.srgbFramebuffer) {
+                fmt = PostProcessFboFormat::Srgb;
+            }
+            rapi->SetPostProcessFramebufferFormat(p.outputFb, fmt);
+        }
+        staged.push_back(std::move(p));
+    }
+
+    UnloadShader(rapi);
+    mSlangPasses = std::move(staged);
+    if (!diagnosticNames.empty()) {
+        mLoadedName = diagnosticNames.front();
+    }
+    return true;
 }
 
 int PostProcessChain::Run(GfxRenderingAPI* rapi, int srcFb, const PostProcessParams& params) {

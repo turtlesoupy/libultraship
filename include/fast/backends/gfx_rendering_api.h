@@ -208,6 +208,32 @@ class GfxRenderingAPI {
         (void)textureId;
     }
 
+    // Phase 3D-1: slang program creation. Sits alongside the legacy
+    // CreatePostProcessProgram so backends that haven't implemented
+    // slang yet leave the default `return -1` and the chain falls
+    // back to refusing to load slang shaders on that backend.
+    //
+    // The slang program model differs from the legacy one in two
+    // ways: the vertex stage is authored by the shader (not a stock
+    // stub), and per-frame uniforms ride on a UBO of arbitrary
+    // declared layout instead of the fixed loose-uniform LUS schema.
+    // Backends compile both stages, look up sampler bindings by
+    // name, and pre-allocate a per-program constant buffer of
+    // `src.uboBytes`. The Run path is not part of Phase 3D-1 — see
+    // the upcoming RunPostProcessSlang virtual.
+    //
+    // Returned program IDs follow the same opaque-handle contract as
+    // CreatePostProcessProgram: round-trippable to
+    // DestroyPostProcessSlangProgram; -1 on failure. The handle
+    // namespace is independent of the legacy program handles.
+    virtual int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+        (void)src;
+        return -1;
+    }
+    virtual void DestroyPostProcessSlangProgram(int progId) {
+        (void)progId;
+    }
+
   protected:
     int8_t mCurrentDepthTest = 0;
     int8_t mCurrentDepthMask = 0;

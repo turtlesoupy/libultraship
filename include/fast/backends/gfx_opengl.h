@@ -95,6 +95,41 @@ struct PostProcessProgramOGL {
     std::string name;
 };
 
+// Phase 3D-1: compiled slang program slot. Distinct from the legacy
+// PostProcessProgramOGL because:
+//   - The vertex stage is authored by the shader (compiled at runtime
+//     rather than referencing the stock fullscreen-triangle stub).
+//   - Per-frame uniforms ride on a UBO of arbitrary declared layout,
+//     not the loose-uniform LUS schema, so we hold a UBO id and its
+//     byte size rather than per-member GLint locations.
+//   - Sampler texture units are bound by name at link time (one
+//     glUniform1i call per sampler) so the run path only needs to
+//     glActiveTexture + glBindTexture per slot.
+//
+// Phase 3D-1 fills the program + ubo + sampler bookkeeping; the Run
+// path (Phase 3D-2) consumes them. Until 3D-2 lands, a slot built
+// here is dormant — it stays in memory until Unload destroys it.
+struct PostProcessSlangProgramOGL {
+    GLuint program = 0;
+    std::string name;
+    // Per-program UBO buffer + size. Allocated in
+    // CreatePostProcessSlangProgram; bound at the program's
+    // GL_UNIFORM_BUFFER binding point during Run.
+    GLuint ubo = 0;
+    uint32_t uboBytes = 0;
+    // Binding point assigned to this program's UBO (matches the
+    // shader's `layout(std140) uniform UBO { ... }` after the
+    // explicit glUniformBlockBinding done at link time). Always 0
+    // for now since each slang program owns its own UBO; deferred
+    // multi-block layouts will widen this.
+    GLuint uboBindingPoint = 0;
+    // Names of samplers in slot order (slot 0..N-1). glUniform1i was
+    // called for each at link time so the FS texture(N) calls already
+    // point at the right unit; the run path just binds textures to
+    // GL_TEXTURE0+i without further uniform pokes.
+    std::vector<std::string> samplerNames;
+};
+
 struct TextureInfo {
     uint16_t width;
     uint16_t height;
@@ -160,6 +195,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
                                        const uint8_t* rgba8) override;
     void DestroyPostProcessStaticTexture(int textureId) override;
+    int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
+    void DestroyPostProcessSlangProgram(int progId) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
@@ -200,6 +237,13 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     std::vector<PostProcessProgramOGL> mPostProcessPrograms;
     GLuint mPostProcessVao = 0;
     GLuint mPostProcessVbo = 0;
+
+    // Phase 3D-1: compiled slang programs. Handles returned by
+    // CreatePostProcessSlangProgram are vector indices into this
+    // table; empty slots (program == 0) are reused. Lives alongside
+    // the legacy mPostProcessPrograms — neither table interferes with
+    // the other and the chain decides which Create function to call.
+    std::vector<PostProcessSlangProgramOGL> mPostProcessSlangPrograms;
 
     // Static GL texture objects for libretro `.glslp` external
     // `textures = "..."` entries. The vector index returned by

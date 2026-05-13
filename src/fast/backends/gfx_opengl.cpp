@@ -1084,6 +1084,139 @@ void GfxRenderingAPIOGL::DestroyPostProcessProgram(int progId) {
     }
 }
 
+// Phase 3D-1: compile a slang program (authored VS + FS) and pre-
+// allocate its UBO. Sampler texture units are pinned at link time via
+// glUniform1i so the run path (Phase 3D-2) only needs to bind
+// textures, not re-poke uniform values. The legacy LUS-schema path
+// (CreatePostProcessProgram) is untouched.
+int GfxRenderingAPIOGL::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsGlsl.empty() || src.fsGlsl.empty()) {
+        SPDLOG_ERROR("Slang post-process shader '{}' missing VS or FS GLSL", src.name);
+        return -1;
+    }
+
+    auto compile = [&](GLenum type, const char* source) -> GLuint {
+        GLuint sh = glCreateShader(type);
+        glShaderSource(sh, 1, &source, nullptr);
+        glCompileShader(sh);
+        GLint ok = GL_FALSE;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            GLint len = 0;
+            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+            std::string log(std::max(len, 1) - 1, '\0');
+            if (len > 0) {
+                glGetShaderInfoLog(sh, len, nullptr, log.data());
+            }
+            SPDLOG_ERROR("Slang post-process shader '{}' {} compile failed: {}",
+                         src.name,
+                         (type == GL_VERTEX_SHADER) ? "vertex" : "fragment",
+                         log);
+            glDeleteShader(sh);
+            return 0;
+        }
+        return sh;
+    };
+
+    GLuint vs = compile(GL_VERTEX_SHADER, src.vsGlsl.c_str());
+    if (vs == 0) {
+        return -1;
+    }
+    GLuint fs = compile(GL_FRAGMENT_SHADER, src.fsGlsl.c_str());
+    if (fs == 0) {
+        glDeleteShader(vs);
+        return -1;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    // Slang vertex stages declare attributes via `layout(location=N)
+    // in ...;` so we let GLSL's explicit-attrib-location handling
+    // bind them; no glBindAttribLocation needed.
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        std::string log(std::max(len, 1) - 1, '\0');
+        if (len > 0) {
+            glGetProgramInfoLog(prog, len, nullptr, log.data());
+        }
+        SPDLOG_ERROR("Slang post-process shader '{}' link failed: {}", src.name, log);
+        glDeleteProgram(prog);
+        return -1;
+    }
+
+    // Pin each sampler uniform to texture unit i in declaration order.
+    // The slang shader's GLSL declarations had their binding= and
+    // descriptor-set= decorations stripped during transpile, so unit
+    // assignment lives at the program level (here) and the Run path
+    // only needs glActiveTexture(GL_TEXTURE0 + i) + glBindTexture.
+    glUseProgram(prog);
+    for (size_t i = 0; i < src.samplerNames.size(); ++i) {
+        const GLint loc = glGetUniformLocation(prog, src.samplerNames[i].c_str());
+        if (loc >= 0) {
+            glUniform1i(loc, static_cast<GLint>(i));
+        }
+        // Missing samplers (loc == -1) are fine — the driver optimised
+        // the binding out because the shader never sampled it. The run
+        // path can still bind a texture at the unit; it's just unused.
+    }
+    glUseProgram(0);
+
+    // Bind the UBO (named "UBO" by slang convention) to binding point 0
+    // on this program and allocate a dedicated buffer of the declared
+    // size. The Run path memcpys frame data here and reuses the same
+    // glBuffer every frame.
+    const GLuint uboBindingPoint = 0;
+    GLuint ubo = 0;
+    if (src.uboBytes > 0) {
+        const GLuint blockIdx = glGetUniformBlockIndex(prog, "UBO");
+        if (blockIdx != GL_INVALID_INDEX) {
+            glUniformBlockBinding(prog, blockIdx, uboBindingPoint);
+        }
+        glGenBuffers(1, &ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(src.uboBytes),
+                     nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    }
+
+    PostProcessSlangProgramOGL slot{};
+    slot.program = prog;
+    slot.name = src.name;
+    slot.ubo = ubo;
+    slot.uboBytes = src.uboBytes;
+    slot.uboBindingPoint = uboBindingPoint;
+    slot.samplerNames = src.samplerNames;
+
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].program == 0) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            return static_cast<int>(i);
+        }
+    }
+    mPostProcessSlangPrograms.push_back(std::move(slot));
+    return static_cast<int>(mPostProcessSlangPrograms.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessSlangPrograms[progId];
+    if (slot.program != 0) {
+        glDeleteProgram(slot.program);
+    }
+    if (slot.ubo != 0) {
+        glDeleteBuffers(1, &slot.ubo);
+    }
+    slot = PostProcessSlangProgramOGL{};
+}
+
 GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
     if (mPostProcessVao != 0 && mPostProcessVbo != 0) {
         return mPostProcessVao;

@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "PostProcessPreset.h"
+#include "PostProcessSlangTranspiler.h"
 #include "PostProcessSourceLoader.h"
 #include "PostProcessTypes.h"
 
@@ -67,6 +68,28 @@ class PostProcessChain {
                     const std::vector<PostProcessSource>& sources,
                     const std::vector<PostProcessPresetPass>& configs,
                     const std::vector<PostProcessShaderExternalTexture>& externalTextures = {});
+
+    // Phase 3D-1: load one or more `.slang` shaders via the backend's
+    // slang program path. Mirrors LoadPasses in lifecycle (compile up
+    // front, roll back on failure, drop prior load on success) but
+    // uses CreatePostProcessSlangProgram with the slang's authored
+    // vertex + fragment pair and reflected UBO/sampler layout.
+    //
+    // Returns true on success; on failure the chain stays in its
+    // prior state. On a backend without slang support
+    // (CreatePostProcessSlangProgram defaults to -1), the first
+    // artifact compile fails and the chain rejects cleanly so callers
+    // can fall back to a .glsl/.glslp preset.
+    //
+    // Phase 3D-1 stops here: programs are compiled and held, but the
+    // Run path doesn't yet dispatch them. The chain reports
+    // IsActive() == false when only slang passes are loaded, so
+    // callers must not yet rely on slang rendering. Phase 3D-2 wires
+    // the actual draw.
+    bool LoadSlangPasses(GfxRenderingAPI* rapi,
+                         const std::vector<PostProcessSlangArtifact>& artifacts,
+                         const std::vector<PostProcessPresetPass>& configs,
+                         const std::vector<std::string>& diagnosticNames);
 
     // Tear down all passes, releasing programs and intermediate FBOs.
     // Drop back to passthrough. The chain's final-output FBO (mDstFb)
@@ -135,9 +158,25 @@ class PostProcessChain {
         PostProcessWrapMode wrapMode = PostProcessWrapMode::ClampToEdge;
     };
 
+    // Phase 3D-1: one compiled slang pass. Holds the backend program
+    // id, the reflection artifact (for the later UBO-upload step), and
+    // the same per-pass FBO bookkeeping the legacy Pass uses. Lives
+    // separately from mPasses so the legacy .glsl/.glslp run path
+    // stays byte-identical until the slang Run path comes online in
+    // Phase 3D-2.
+    struct SlangPass {
+        int programId = -1;
+        int outputFb = -1;
+        uint32_t lastWidth = 0;
+        uint32_t lastHeight = 0;
+        PostProcessPresetPass config;
+        PostProcessSlangArtifact artifact;
+    };
+
     std::vector<Pass> mPasses;
     std::vector<Alias> mAliases;
     std::vector<ExternalTexture> mExternalTextures;
+    std::vector<SlangPass> mSlangPasses;
     int mDstFb = -1;
     uint32_t mDstWidth = 0;
     uint32_t mDstHeight = 0;

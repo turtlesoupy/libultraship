@@ -155,4 +155,41 @@ struct PostProcessSource {
     std::vector<std::string> aliasNames;
 };
 
+// Per-backend stage source + binding plan for a single `.slang` pass,
+// flattened from a PostProcessSlangArtifact for handoff to the
+// rendering API. The chain converts (artifact + diagnostic name) into
+// this struct via PostProcessChain's internal helper and hands it to
+// the backend's CreatePostProcessSlangProgram.
+//
+// Distinct from PostProcessSource because the slang path has its own
+// vertex stage (authored by the slang shader, not the LUS stock stub)
+// and uses a UBO-keyed uniform model rather than loose uniforms with
+// the fixed LUS schema. Backends keep both surfaces side-by-side
+// until the legacy .glsl/.glslp surface retires (out of Phase 3 scope).
+//
+// Empty per-language slots mean "this backend isn't applicable" — the
+// GL backend reads vsGlsl/fsGlsl and ignores HLSL/MSL, etc.
+struct PostProcessSlangProgramSource {
+    std::string name;   // Diagnostic label.
+    std::string vsGlsl; // GLSL 330 core vertex source.
+    std::string fsGlsl; // GLSL 330 core fragment source.
+    std::string vsHlsl; // HLSL SM 5.0 vertex source.
+    std::string fsHlsl; // HLSL SM 5.0 fragment source.
+    std::string vsMsl;  // MSL 2.2 vertex source.
+    std::string fsMsl;  // MSL 2.2 fragment source.
+
+    // Total UBO bytes the runtime will upload per pass. Backends use
+    // this to allocate the per-program constant buffer / glBuffer at
+    // create time so the run-path memcpy has a fixed target.
+    uint32_t uboBytes = 0;
+
+    // Sampler binding names in declaration order (matches the order
+    // the transpiler emitted in the per-backend source). Slot i in
+    // the bound texture array maps to samplerNames[i]; the chain
+    // resolves each name to a texture id at run time. For Phase 3D-1
+    // backends only need the names to call glGetUniformLocation /
+    // D3DReflect / MTL argument lookup; nothing is bound yet.
+    std::vector<std::string> samplerNames;
+};
+
 } // namespace Fast
