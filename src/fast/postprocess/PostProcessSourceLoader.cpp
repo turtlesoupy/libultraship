@@ -185,7 +185,7 @@ std::string FormatFsBases(const std::vector<std::string>& fsBases) {
 // Build the diagnostic display name for an individual pass. Strips
 // any leading directory components and trailing extension so log
 // messages stay readable for shaders like
-// "shaders/crt-easymode-halation/blur_horiz.glsl".
+// "demo/multipass/blur_horiz.glsl".
 std::string ShortenPassName(const std::string& path) {
     const size_t slash = path.find_last_of('/');
     const size_t begin = (slash == std::string::npos) ? 0 : slash + 1;

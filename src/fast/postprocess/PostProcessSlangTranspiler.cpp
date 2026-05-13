@@ -40,11 +40,9 @@ bool EnsureGlslangInitialized() {
     return true;
 }
 
-// Some slang shaders in the wild omit the leading `#version 450`,
-// relying on RetroArch to inject it. Match that behavior: if the
-// source doesn't already declare a #version directive, prepend one.
-// The check looks for the literal `#version` token at the start of a
-// non-whitespace line.
+// Some public `.slang` files omit `#version 450`; prepend a default
+// so glslang accepts them. The check looks for the literal `#version`
+// token at the start of a non-whitespace line.
 std::string EnsureVersionDirective(const std::string& src) {
     size_t pos = 0;
     while (pos < src.size()) {
