@@ -6464,19 +6464,38 @@ void Interpreter::UpdatePostProcessFromCVars() {
         // and we haven't already established that this combo can't
         // load. Without the mPostProcessLoadFailed gate, a broken
         // preset would retry once per frame (60 Hz) and spam the log.
-        PostProcessShaderBundle bundle;
         bool loadedOk = false;
-        if (LoadPostProcessShader(name, bundle)) {
-            if (mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs,
-                                              bundle.externalTextures)) {
+
+        // Phase 3F: probe the slang load path first. .slangp / .slang
+        // files exist for this name only if the user (or a builtin)
+        // ships one — the loader logs at debug and returns false when
+        // neither is present, so the legacy probe below handles the
+        // common case.
+        PostProcessSlangShaderBundle slangBundle;
+        if (LoadPostProcessSlangShader(name, slangBundle)) {
+            if (mPostProcessChain.LoadSlangPasses(mRapi, slangBundle.artifacts,
+                                                   slangBundle.configs,
+                                                   slangBundle.diagnosticNames)) {
                 loadedOk = true;
             } else {
-                SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
+                SPDLOG_ERROR("Slang post-process shader '{}' loaded but backend "
+                             "rejected it; falling back to legacy probe", name);
             }
-        } else if (mPostProcessChain.IsActive()) {
-            // New shader name failed to load; unload the previous one
-            // rather than silently keeping a stale program live.
-            mPostProcessChain.UnloadShader(mRapi);
+        }
+        if (!loadedOk) {
+            PostProcessShaderBundle bundle;
+            if (LoadPostProcessShader(name, bundle)) {
+                if (mPostProcessChain.LoadPasses(mRapi, bundle.sources, bundle.configs,
+                                                  bundle.externalTextures)) {
+                    loadedOk = true;
+                } else {
+                    SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
+                }
+            } else if (mPostProcessChain.IsActive()) {
+                // New shader name failed to load; unload the previous
+                // one rather than silently keeping a stale program live.
+                mPostProcessChain.UnloadShader(mRapi);
+            }
         }
         mPostProcessLoadFailed = !loadedOk;
     }

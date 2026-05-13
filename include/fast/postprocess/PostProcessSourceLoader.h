@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "PostProcessPreset.h"
+#include "PostProcessSlangTranspiler.h"
 #include "PostProcessTypes.h"
 
 namespace Fast {
@@ -42,6 +43,21 @@ struct PostProcessShaderBundle {
     std::vector<PostProcessShaderExternalTexture> externalTextures;
 };
 
+// Phase 3F: bundle holding the per-pass slang artifacts ready to
+// hand to PostProcessChain::LoadSlangPasses. Distinct from
+// PostProcessShaderBundle because the chain Run path branches on
+// which one is loaded — slang uses authored VS, UBO uniforms, and
+// libretro semantic samplers, while the legacy path uses a stub
+// VS plus loose-uniform LUS schema.
+struct PostProcessSlangShaderBundle {
+    // Diagnostic name (the cvar value the user picked).
+    std::string name;
+    std::vector<PostProcessSlangArtifact> artifacts;
+    std::vector<PostProcessPresetPass>    configs;
+    // Per-pass display names for logging (e.g. "myshader[0/blur]").
+    std::vector<std::string> diagnosticNames;
+};
+
 // Resolve a post-process shader by short name and populate `out`.
 // Lookup order:
 //   1. Filesystem: `<user-data>/shaders/<name>.{glslp,glsl}`, where
@@ -68,6 +84,19 @@ struct PostProcessShaderBundle {
 // Returns true on success. On failure `out` is left in an unspecified
 // state and the reason is logged via SPDLOG_ERROR.
 bool LoadPostProcessShader(const std::string& name, PostProcessShaderBundle& out);
+
+// Phase 3F: resolve a slang post-process shader by short name. Same
+// candidate-roots / archive-fallback lookup as LoadPostProcessShader,
+// but probes `.slangp` first (multi-pass slang preset) and falls
+// back to `.slang` (single-pass authored shader). Returns true on
+// success; on failure `out` is left in an unspecified state and the
+// reason is logged.
+//
+// Implementation requires LUS_ENABLE_POSTPROCESS_TRANSPILER. With
+// the transpiler disabled at build time, the slang -> SPIR-V ->
+// backend pipeline can't run, and this function returns false with
+// a one-time log so the chain doesn't retry every frame.
+bool LoadPostProcessSlangShader(const std::string& name, PostProcessSlangShaderBundle& out);
 
 // Names of builtin (in-archive) shaders. Used by ports to populate a
 // menu picker without having to know about the resource manager.

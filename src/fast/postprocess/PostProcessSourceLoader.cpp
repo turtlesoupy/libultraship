@@ -15,6 +15,8 @@
 
 #include "fast/postprocess/PostProcessGlslNormalizer.h"
 #include "fast/postprocess/PostProcessPreset.h"
+#include "fast/postprocess/PostProcessSlangSource.h"
+#include "fast/postprocess/PostProcessSlangTranspiler.h"
 #include "fast/postprocess/PostProcessTranspiler.h"
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
@@ -242,6 +244,92 @@ PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl
     return src;
 }
 
+// Compile a raw .slang source string into a PostProcessSlangArtifact.
+// Returns true on success. On failure the artifact is left in an
+// unspecified state and the reason is logged.
+bool MakeSlangArtifact(const std::string& diagName, const std::string& rawSlang,
+                       PostProcessSlangArtifact& outArt) {
+    PostProcessSlangSource parsed;
+    std::string err;
+    if (!ParseSlangSource(rawSlang, parsed, err)) {
+        SPDLOG_ERROR("Slang post-process shader '{}' parse failed: {}", diagName, err);
+        return false;
+    }
+    if (!PostProcessSlangTranspiler::Compile(parsed, outArt, err)) {
+        SPDLOG_ERROR("Slang post-process shader '{}' compile failed: {}", diagName, err);
+        return false;
+    }
+    return true;
+}
+
+bool LoadSlangSinglePassBundle(const std::string& name,
+                               const std::vector<std::string>& fsBases,
+                               const std::string& arBase,
+                               PostProcessSlangShaderBundle& out) {
+    std::string raw;
+    if (!ReadShaderFile(fsBases, arBase, name + ".slang", raw)) {
+        return false;
+    }
+    PostProcessSlangArtifact art;
+    if (!MakeSlangArtifact(name, raw, art)) {
+        return false;
+    }
+    out.name = name;
+    out.artifacts.clear();
+    out.configs.clear();
+    out.diagnosticNames.clear();
+    out.artifacts.push_back(std::move(art));
+    out.configs.emplace_back(); // Default scale_type=source, scale=1.0.
+    out.diagnosticNames.push_back(name);
+    return true;
+}
+
+bool LoadSlangPresetBundle(const std::string& name,
+                           const std::vector<std::string>& fsBases,
+                           const std::string& arBase,
+                           PostProcessSlangShaderBundle& out) {
+    std::string presetText;
+    if (!ReadShaderFile(fsBases, arBase, name + ".slangp", presetText)) {
+        return false;
+    }
+    PostProcessPreset preset;
+    std::string err;
+    if (!ParseSlangPreset(presetText, std::string(), preset, err)) {
+        SPDLOG_ERROR("Slang post-process preset '{}': {}", name, err);
+        return false;
+    }
+
+    out.name = name;
+    out.artifacts.clear();
+    out.configs.clear();
+    out.diagnosticNames.clear();
+    out.artifacts.reserve(preset.passes.size());
+    out.configs.reserve(preset.passes.size());
+    out.diagnosticNames.reserve(preset.passes.size());
+
+    for (size_t i = 0; i < preset.passes.size(); ++i) {
+        const PostProcessPresetPass& passCfg = preset.passes[i];
+        std::string raw;
+        if (!ReadShaderFile(fsBases, arBase, passCfg.shaderPath, raw)) {
+            SPDLOG_ERROR("Slang preset '{}' pass {}: shader '{}' not found "
+                         "(searched filesystem {} and archive '{}')",
+                         name, i, passCfg.shaderPath,
+                         FormatFsBases(fsBases), arBase);
+            return false;
+        }
+        const std::string displayName =
+            name + "[" + std::to_string(i) + "/" + ShortenPassName(passCfg.shaderPath) + "]";
+        PostProcessSlangArtifact art;
+        if (!MakeSlangArtifact(displayName, raw, art)) {
+            return false;
+        }
+        out.artifacts.push_back(std::move(art));
+        out.configs.push_back(passCfg);
+        out.diagnosticNames.push_back(displayName);
+    }
+    return true;
+}
+
 bool LoadSinglePassBundle(const std::string& name, const std::vector<std::string>& fsBases,
                           const std::string& arBase, PostProcessShaderBundle& out) {
     std::string raw;
@@ -395,13 +483,46 @@ bool LoadPostProcessShader(const std::string& name, PostProcessShaderBundle& out
     return false;
 }
 
+bool LoadPostProcessSlangShader(const std::string& name,
+                                PostProcessSlangShaderBundle& out) {
+    if (name.empty()) {
+        return false;
+    }
+    const std::vector<std::string> fsBases = UserShaderRoots();
+    constexpr const char* kArBase = "shaders/postprocess";
+
+    // .slangp wins over .slang for the same reason .glslp wins over
+    // .glsl — a single-file .slang in a directory next to a .slangp
+    // is normally one of the preset's passes, not an independent
+    // shader. If both share a stem the preset is the more-explicit
+    // intent.
+    if (LoadSlangPresetBundle(name, fsBases, kArBase, out)) {
+        return true;
+    }
+    if (LoadSlangSinglePassBundle(name, fsBases, kArBase, out)) {
+        return true;
+    }
+    // Not finding either is the common case (user picked a .glslp
+    // shader; the interpreter falls through to the legacy loader).
+    // Log at debug, not error.
+    SPDLOG_DEBUG("Slang post-process shader '{}' not found "
+                 "(tried filesystem {} and archive '{}/{}.{{slangp,slang}}')",
+                 name, FormatFsBases(fsBases), kArBase, name);
+    return false;
+}
+
 std::vector<std::string> ListBuiltinPostProcessShaders() {
     // Mirrors what GenerateF3DO2R packages from
     // libultraship/src/fast/shaders/postprocess/. Hardcoded rather
     // than enumerated at runtime so the menu picker stays stable
     // across archive contents and so a port that ships a stripped
     // f3d.o2r still gets a usable default selection.
-    return { "scanlines", "crt-lottes" };
+    //
+    // `slang-scanlines` is the Phase 3F canary — picking it
+    // exercises the slang load path. Visually distinguishable from
+    // the legacy `scanlines` by a subtle blue cast on the dark
+    // bands.
+    return { "scanlines", "crt-lottes", "slang-scanlines" };
 }
 
 namespace {
@@ -427,6 +548,12 @@ void ScanShaderDir(const std::filesystem::path& root, const std::string& relPref
 
     UserPostProcessShaderFolder bucket;
     bucket.displayName = relPrefix.empty() ? std::string("(loose)") : relPrefix;
+    // We surface one entry per shader stem, with preference order
+    // .slangp > .slang > .glslp > .glsl — the loader probes in the
+    // same order, so the picker entry maps to whichever file the
+    // loader will actually consume.
+    std::vector<std::string> slangOnly;
+    std::vector<std::string> glslpOnly;
     std::vector<std::string> glslOnly;
 
     for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
@@ -453,26 +580,36 @@ void ScanShaderDir(const std::filesystem::path& root, const std::string& relPref
             continue;
         }
         const std::string shaderRef = relPrefix.empty() ? stem : (relPrefix + "/" + stem);
-        if (ext == ".glslp") {
+        if (ext == ".slangp") {
             bucket.shaderNames.push_back(shaderRef);
+        } else if (ext == ".slang") {
+            slangOnly.push_back(shaderRef);
+        } else if (ext == ".glslp") {
+            glslpOnly.push_back(shaderRef);
         } else if (ext == ".glsl") {
             glslOnly.push_back(shaderRef);
         }
     }
 
-    // Merge .glsl entries that don't have a sibling .glslp.
-    for (const std::string& gl : glslOnly) {
-        bool covered = false;
-        for (const std::string& existing : bucket.shaderNames) {
-            if (existing == gl) {
-                covered = true;
-                break;
+    // Merge each lower-priority bucket only if its name isn't
+    // already covered by a higher-priority extension.
+    auto mergeIfNew = [&](const std::vector<std::string>& src) {
+        for (const std::string& name : src) {
+            bool covered = false;
+            for (const std::string& existing : bucket.shaderNames) {
+                if (existing == name) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                bucket.shaderNames.push_back(name);
             }
         }
-        if (!covered) {
-            bucket.shaderNames.push_back(gl);
-        }
-    }
+    };
+    mergeIfNew(slangOnly);
+    mergeIfNew(glslpOnly);
+    mergeIfNew(glslOnly);
 
     if (!bucket.shaderNames.empty()) {
         std::sort(bucket.shaderNames.begin(), bucket.shaderNames.end());
