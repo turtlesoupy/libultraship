@@ -112,6 +112,22 @@ class PostProcessChain {
         return mLoadedName;
     }
 
+    // Number of compiled passes currently live in the chain. Reports
+    // both legacy and slang flavors — only one is active at a time, so
+    // the sum collapses to whichever was loaded last.
+    size_t GetLoadedPassCount() const {
+        return mPasses.size() + mSlangPasses.size();
+    }
+
+    // Which load path produced the active chain. "none" when nothing
+    // is loaded, "legacy" for .glsl / .glslp, "slang" for .slang /
+    // .slangp.
+    const char* GetLoadedFlavor() const {
+        if (!mSlangPasses.empty()) return "slang";
+        if (!mPasses.empty())      return "legacy";
+        return "none";
+    }
+
   private:
     struct Pass {
         int programId = -1;

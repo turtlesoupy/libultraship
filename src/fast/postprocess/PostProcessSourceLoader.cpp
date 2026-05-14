@@ -7,9 +7,11 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <system_error>
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <stb_image.h>
 
@@ -156,15 +158,30 @@ bool ReadShaderBinaryFile(const std::vector<std::string>& fsBases, const std::st
 
 // Read a file by trying `<fsBase>/<rel>` for each entry in `fsBases` in
 // order, then archive `<arBase>/<rel>`. Returns true and populates
-// outText on the first success.
+// outText on the first success. `outResolvedPath` (optional) receives
+// the resolved disk-or-archive location of the hit — useful for
+// SPDLOG_INFO at the load entry point so users can confirm which
+// shader file actually loaded after a picker selection.
 bool ReadShaderFile(const std::vector<std::string>& fsBases, const std::string& arBase,
-                    const std::string& rel, std::string& outText) {
+                    const std::string& rel, std::string& outText,
+                    std::string* outResolvedPath = nullptr) {
     for (const std::string& fsBase : fsBases) {
-        if (ReadFilesystemFile(JoinPath(fsBase, rel), outText)) {
+        const std::string candidate = JoinPath(fsBase, rel);
+        if (ReadFilesystemFile(candidate, outText)) {
+            if (outResolvedPath != nullptr) {
+                *outResolvedPath = "fs:" + candidate;
+            }
             return true;
         }
     }
-    return ReadArchiveFile(JoinPath(arBase, rel), outText);
+    const std::string arPath = JoinPath(arBase, rel);
+    if (ReadArchiveFile(arPath, outText)) {
+        if (outResolvedPath != nullptr) {
+            *outResolvedPath = "archive:" + arPath;
+        }
+        return true;
+    }
+    return false;
 }
 
 // Render a fsBases list for log messages: "'a','b'" — caller may
@@ -240,6 +257,45 @@ PostProcessSource MakeSource(const std::string& displayName, std::string rawGlsl
     std::string err;
     if (!PostProcessTranspiler::SynthesizeMissing(src, err)) {
         SPDLOG_WARN("Post-process shader '{}' could not be transpiled: {}", displayName, err);
+
+        // Publish the failure so the in-game diagnostics panel can show
+        // why the shader didn't load without the user having to dig
+        // through the log.
+        Fast::internal::SetPostProcessRuntimeError(
+            std::string("transpile failed: ") + err);
+
+        // Inspect-on-failure: dump the post-normalize source next to
+        // the shader file (and, if the user shader-data dir resolves,
+        // also in a /tmp-style scratch). Filename mirrors the shader's
+        // short name so it's trivially correlated. Best-effort — if
+        // the write fails we just skip it; the log already has the
+        // parse error.
+        try {
+            std::string sanitized = displayName;
+            for (char& c : sanitized) {
+                if (c == '/' || c == '\\') c = '_';
+            }
+            const std::vector<std::string> roots = UserShaderRoots();
+            for (const std::string& root : roots) {
+                std::filesystem::path dumpDir = std::filesystem::path(root) / "_failed";
+                std::error_code ec;
+                std::filesystem::create_directories(dumpDir, ec);
+                if (ec) continue;
+                const std::filesystem::path dumpPath = dumpDir / (sanitized + ".normalized.glsl");
+                std::ofstream out(dumpPath, std::ios::binary | std::ios::trunc);
+                if (out.is_open()) {
+                    out << "// Normalized output sent to glslang for '" << displayName << "'.\n";
+                    out << "// Transpile error follows:\n";
+                    out << "// " << err << "\n";
+                    out << "// ----- 8< -----\n";
+                    out << src.glsl;
+                    SPDLOG_WARN("Post-process: normalized source dumped to {}", dumpPath.string());
+                    break;
+                }
+            }
+        } catch (...) {
+            // Dump is best-effort. Ignore.
+        }
     }
     return src;
 }
@@ -333,9 +389,22 @@ bool LoadSlangPresetBundle(const std::string& name,
 bool LoadSinglePassBundle(const std::string& name, const std::vector<std::string>& fsBases,
                           const std::string& arBase, PostProcessShaderBundle& out) {
     std::string raw;
-    if (!ReadShaderFile(fsBases, arBase, name + ".glsl", raw)) {
+    std::string resolved;
+    if (!ReadShaderFile(fsBases, arBase, name + ".glsl", raw, &resolved)) {
         return false;
     }
+    size_t lineCount = 1;
+    for (char c : raw) {
+        if (c == '\n') ++lineCount;
+    }
+    const bool hasVertex   = raw.find("#ifdef VERTEX") != std::string::npos ||
+                             raw.find("defined(VERTEX)") != std::string::npos;
+    const bool hasFragment = raw.find("#ifdef FRAGMENT") != std::string::npos ||
+                             raw.find("defined(FRAGMENT)") != std::string::npos;
+    SPDLOG_INFO("Post-process: single-pass '{}.glsl' resolved to '{}' ({} bytes, {} lines, vs_half={}, fs_half={})",
+                name, resolved, raw.size(), lineCount,
+                hasVertex ? "yes" : "no", hasFragment ? "yes" : "no");
+
     out.name = name;
     out.sources.clear();
     out.configs.clear();
@@ -351,9 +420,12 @@ bool LoadSinglePassBundle(const std::string& name, const std::vector<std::string
 bool LoadPresetBundle(const std::string& name, const std::vector<std::string>& fsBases,
                       const std::string& arBase, PostProcessShaderBundle& out) {
     std::string presetText;
-    if (!ReadShaderFile(fsBases, arBase, name + ".glslp", presetText)) {
+    std::string presetResolved;
+    if (!ReadShaderFile(fsBases, arBase, name + ".glslp", presetText, &presetResolved)) {
         return false;
     }
+    SPDLOG_INFO("Post-process: preset '{}.glslp' resolved to '{}' ({} bytes)",
+                name, presetResolved, presetText.size());
     PostProcessPreset preset;
     std::string err;
     // baseDir is informational; the actual lookup happens against
@@ -444,12 +516,15 @@ bool LoadPresetBundle(const std::string& name, const std::vector<std::string>& f
     for (size_t i = 0; i < preset.passes.size(); ++i) {
         const PostProcessPresetPass& passCfg = preset.passes[i];
         std::string raw;
-        if (!ReadShaderFile(fsBases, arBase, passCfg.shaderPath, raw)) {
+        std::string passResolved;
+        if (!ReadShaderFile(fsBases, arBase, passCfg.shaderPath, raw, &passResolved)) {
             SPDLOG_ERROR("Post-process preset '{}' pass {}: shader '{}' not found "
                          "(searched filesystem {} and archive '{}')",
                          name, i, passCfg.shaderPath, FormatFsBases(fsBases), arBase);
             return false;
         }
+        SPDLOG_INFO("Post-process: preset '{}' pass {} shader '{}' resolved to '{}' ({} bytes)",
+                    name, i, passCfg.shaderPath, passResolved, raw.size());
         const std::string displayName =
             name + "[" + std::to_string(i) + "/" + ShortenPassName(passCfg.shaderPath) + "]";
         out.sources.push_back(MakeSource(displayName, std::move(raw), aliasNames));
@@ -518,16 +593,13 @@ std::vector<std::string> ListBuiltinPostProcessShaders() {
     // across archive contents and so a port that ships a stripped
     // f3d.o2r still gets a usable default selection.
     //
-    // `slang-scanlines` is the Phase 3F canary — picking it
-    // exercises the slang load path. Visually distinguishable from
-    // the legacy `scanlines` by a subtle blue cast on the dark
-    // bands.
-    //
-    // `slang-persistence` is the Phase 3E canary — exercises the
-    // game-FB history ring via the `OriginalHistory1` semantic.
-    // Visible as a mild motion-trail / persistence effect when the
-    // game moves.
-    return { "scanlines", "crt-lottes", "slang-scanlines", "slang-persistence" };
+    // Limited to the two CC0 single-pass shaders we ship and verify
+    // each build. The Phase 3 slang canaries (`slang-scanlines`,
+    // `slang-persistence`) are intentionally excluded — they exercise
+    // a code path that isn't reliable on this branch yet (the slang
+    // stage splitter rejects `#version` lines that aren't at file
+    // top, which the bundled samples don't currently honor).
+    return { "scanlines", "crt-lottes" };
 }
 
 namespace {
@@ -673,5 +745,139 @@ std::vector<UserPostProcessShaderFolder> ListUserPostProcessShaders() {
     }
     return folders;
 }
+
+namespace {
+
+// Probe each user-shader root for `<name>.lus.json` and return the
+// first absolute path that exists, or empty when no sidecar is
+// installed. `name` may contain a `subdir/stem` separator since the
+// picker stores shader refs that way for shaders below the root.
+std::string FindSidecarPath(const std::string& name) {
+    const std::vector<std::string> roots = UserShaderRoots();
+    for (const std::string& root : roots) {
+        const std::string candidate = JoinPath(root, name) + ".lus.json";
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec) && std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return std::string();
+}
+
+bool IsBuiltinShader(const std::string& name) {
+    const std::vector<std::string> builtins = ListBuiltinPostProcessShaders();
+    for (const std::string& b : builtins) {
+        if (b == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+PostProcessShaderInfo GetPostProcessShaderInfo(const std::string& name) {
+    PostProcessShaderInfo info;
+
+    // Bundled shaders ship with neutral resolution scaling — the LUS
+    // CC0 originals don't ratio TextureSize / InputSize, so they
+    // always render correctly regardless of LowResMode.
+    if (IsBuiltinShader(name)) {
+        info.compat = PostProcessCompat::Any;
+        return info;
+    }
+
+    const std::string sidecarPath = FindSidecarPath(name);
+    if (sidecarPath.empty()) {
+        // No sidecar — default to Native so the picker warns rather
+        // than silently shipping a small-corner render.
+        return info;
+    }
+
+    std::string text;
+    if (!ReadFilesystemFile(sidecarPath, text)) {
+        SPDLOG_WARN("Post-process: sidecar {} could not be opened — treating as no sidecar (compat=native)", sidecarPath);
+        return info;
+    }
+
+    try {
+        const nlohmann::json json = nlohmann::json::parse(text);
+        info.fromSidecar = true;
+        if (json.contains("compat") && json["compat"].is_string()) {
+            const std::string compat = json["compat"].get<std::string>();
+            if (compat == "any") {
+                info.compat = PostProcessCompat::Any;
+            } else if (compat == "native") {
+                info.compat = PostProcessCompat::Native;
+            } else {
+                SPDLOG_WARN("Post-process: sidecar {} declares unknown compat \"{}\" — treating as native",
+                            sidecarPath, compat);
+            }
+        }
+        if (json.contains("label") && json["label"].is_string()) {
+            info.label = json["label"].get<std::string>();
+        }
+        if (json.contains("license") && json["license"].is_string()) {
+            info.license = json["license"].get<std::string>();
+        }
+    } catch (const std::exception& e) {
+        SPDLOG_WARN("Post-process: failed to parse sidecar {}: {} — treating as no sidecar", sidecarPath, e.what());
+        info = PostProcessShaderInfo();
+    }
+
+    return info;
+}
+
+namespace {
+
+// Runtime diagnostics state. Protected by a single mutex; the writer
+// is the renderer thread (chain load / unload), the reader is the UI
+// thread (menu draw). Both happen at human-speed frequencies so a
+// global lock here is fine.
+std::mutex                       g_runtimeDiagMutex;
+PostProcessRuntimeDiagnostics    g_runtimeDiag;
+
+} // namespace
+
+PostProcessRuntimeDiagnostics GetPostProcessRuntimeDiagnostics() {
+    std::lock_guard<std::mutex> lock(g_runtimeDiagMutex);
+    return g_runtimeDiag;
+}
+
+namespace internal {
+
+void SetPostProcessRuntimeActive(const std::string& name, const std::string& flavor,
+                                 size_t passCount, const std::string& resolvedPath) {
+    std::lock_guard<std::mutex> lock(g_runtimeDiagMutex);
+    g_runtimeDiag.active       = true;
+    g_runtimeDiag.name         = name;
+    g_runtimeDiag.flavor       = flavor;
+    g_runtimeDiag.passCount    = passCount;
+    g_runtimeDiag.resolvedPath = resolvedPath;
+    g_runtimeDiag.lastError.clear();
+}
+
+void SetPostProcessRuntimeInactive() {
+    std::lock_guard<std::mutex> lock(g_runtimeDiagMutex);
+    g_runtimeDiag.active = false;
+    g_runtimeDiag.name.clear();
+    g_runtimeDiag.flavor.clear();
+    g_runtimeDiag.passCount = 0;
+    g_runtimeDiag.resolvedPath.clear();
+    // Preserve lastError so the menu can still show why the previous
+    // load failed even after we tore the chain down.
+}
+
+void SetPostProcessRuntimeError(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(g_runtimeDiagMutex);
+    g_runtimeDiag.lastError = msg;
+}
+
+void SetPostProcessRuntimeResolvedPath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_runtimeDiagMutex);
+    g_runtimeDiag.resolvedPath = path;
+}
+
+} // namespace internal
 
 } // namespace Fast

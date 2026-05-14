@@ -312,12 +312,49 @@ bool PostProcessChain::LoadPasses(GfxRenderingAPI* rapi,
     mAliases = std::move(stagedAliases);
     mExternalTextures = std::move(stagedTextures);
     mLoadedName = sources.front().name; // Preset / shader display name.
+
+    // Diagnostic surface: one INFO line per successful chain load that
+    // enumerates each pass so users debugging "the shader looks wrong"
+    // can confirm what actually compiled and how it's chained. Tests
+    // in docs/crt_shader_testing_protocol.md key off these lines.
+    SPDLOG_INFO("Post-process chain loaded (legacy/.glsl): '{}' — {} pass(es), {} alias(es), {} external texture(s)",
+                mLoadedName, mPasses.size(), mAliases.size(), mExternalTextures.size());
+    Fast::internal::SetPostProcessRuntimeActive(mLoadedName, "legacy", mPasses.size(),
+                                                /*resolvedPath=*/"");
+    for (size_t i = 0; i < mPasses.size(); ++i) {
+        const PostProcessPresetPass& cfg = mPasses[i].config;
+        auto scaleStr = [](PostProcessScaleType t) -> const char* {
+            switch (t) {
+                case PostProcessScaleType::Source:   return "source";
+                case PostProcessScaleType::Viewport: return "viewport";
+                case PostProcessScaleType::Absolute: return "absolute";
+            }
+            return "?";
+        };
+        const char* fmt = "default";
+        if (cfg.floatFramebuffer)      fmt = "float16";
+        else if (cfg.srgbFramebuffer)  fmt = "srgb";
+        SPDLOG_INFO("  pass {}: prog={} scaleX={}({:.3f}) scaleY={}({:.3f}) filter_linear={} wrap={} mipmap_input={} alias='{}' fb={} fmt={}",
+                    i, mPasses[i].programId,
+                    scaleStr(cfg.scaleTypeX), cfg.scaleX,
+                    scaleStr(cfg.scaleTypeY), cfg.scaleY,
+                    cfg.filterLinear ? "true" : "false",
+                    static_cast<int>(cfg.wrapMode),
+                    cfg.mipmapInput ? "true" : "false",
+                    cfg.alias,
+                    mPasses[i].outputFb,
+                    fmt);
+    }
     return true;
 }
 
 void PostProcessChain::UnloadShader(GfxRenderingAPI* rapi) {
     if (rapi == nullptr) {
         return;
+    }
+    if (!mLoadedName.empty()) {
+        SPDLOG_INFO("Post-process chain: unloading '{}'", mLoadedName);
+        Fast::internal::SetPostProcessRuntimeInactive();
     }
     for (auto& p : mPasses) {
         if (p.programId >= 0 && mBackendSupported) {
@@ -469,6 +506,19 @@ bool PostProcessChain::LoadSlangPasses(GfxRenderingAPI* rapi,
     mFrameIndex = 0;
     if (!diagnosticNames.empty()) {
         mLoadedName = diagnosticNames.front();
+    }
+
+    SPDLOG_INFO("Post-process chain loaded (.slang): '{}' — {} pass(es), {} history slot(s)",
+                mLoadedName, mSlangPasses.size(), mOriginalHistoryFbs.size());
+    Fast::internal::SetPostProcessRuntimeActive(mLoadedName, "slang", mSlangPasses.size(),
+                                                /*resolvedPath=*/"");
+    for (size_t i = 0; i < mSlangPasses.size(); ++i) {
+        const PostProcessPresetPass& cfg = mSlangPasses[i].config;
+        SPDLOG_INFO("  slang pass {}: prog={} alias='{}' filter_linear={} fb={} feedback_fb={}",
+                    i, mSlangPasses[i].programId, cfg.alias,
+                    cfg.filterLinear ? "true" : "false",
+                    mSlangPasses[i].outputFb,
+                    mSlangPasses[i].feedbackFb);
     }
     return true;
 }

@@ -184,6 +184,169 @@ constexpr const char* kPreamble =
     "in vec2 vTexCoord;\n"
     "out vec4 fragColor;\n";
 
+// Extract `<varying_name> = <expr>;` assignments out of the VERTEX
+// branch's main() so we can inline them into the FRAGMENT half as
+// `#define <name> (<expr>)`. The libretro single-file convention has
+// the VS compute simple uniform-derived varyings (e.g.
+// `onex = vec2(SourceSize.z, 0.0)`) and ship them across to the FS
+// via `COMPAT_VARYING vec2 onex;`. Our pipeline has a fixed stock VS
+// that only emits vTexCoord, so without this fixup any FS that reads
+// such a varying fails to compile (`undeclared identifier`).
+//
+// Limitations the caller should be aware of:
+//   * Assignments that target a swizzle (`TEX0.xy = TexCoord.xy;`)
+//     are skipped — `TEX0` is already remapped to vTexCoord and we
+//     can't macro-define a swizzle target. The FS-side varying line
+//     for that target gets stripped by the schema rule above, which
+//     is the right behavior here.
+//   * Expressions that read VS-only attributes (VertexCoord, COLOR,
+//     TexCoord) are kept verbatim and will fail at FS compile time
+//     because those identifiers don't exist there. We can't fix this
+//     without a full GLSL parser — when it happens, the failure is
+//     surfaced via the normalized-source dump in MakeSource().
+//   * Multi-statement varying derivations (intermediate locals, if /
+//     for blocks) aren't reconstructed. The dump-on-failure path is
+//     the user-visible escape hatch.
+struct VsVaryingAssignment {
+    std::string name;
+    std::string type; // Informational; the `#define` doesn't carry it.
+    std::string expr;
+};
+
+void ExtractVsVaryings(const std::string& src,
+                       std::vector<VsVaryingAssignment>& out) {
+    out.clear();
+
+    // Step 1 — locate the VERTEX block.
+    const size_t vsStart = src.find("#if defined(VERTEX)");
+    const size_t vsStartAlt = src.find("#ifdef VERTEX");
+    size_t vsBegin = std::min(vsStart, vsStartAlt);
+    if (vsBegin == std::string::npos) {
+        return;
+    }
+    // VS block ends at the matching `#elif defined(FRAGMENT)`, the
+    // legacy `#elif defined(VERTEX)` flip variant, or a top-level
+    // `#endif`. We scan forward and take the earliest match —
+    // single-file libretro shaders never nest VERTEX/FRAGMENT blocks
+    // so a flat search is fine.
+    const size_t fsMarker  = src.find("#elif defined(FRAGMENT)", vsBegin);
+    const size_t endMarker = src.find("#endif", vsBegin);
+    size_t vsEnd = std::min(fsMarker, endMarker);
+    if (vsEnd == std::string::npos) {
+        vsEnd = src.size();
+    }
+    const std::string vsBlock = src.substr(vsBegin, vsEnd - vsBegin);
+
+    // Step 2 — collect the names of every COMPAT_VARYING declared in
+    // the VS block. We use this set to filter assignments later so we
+    // don't mistakenly inline a local-variable assignment that happens
+    // to share an identifier with something else.
+    std::vector<std::string> declaredVaryings;
+    std::vector<std::string> declaredTypes;
+    {
+        std::istringstream in(vsBlock);
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t firstNonWs = line.find_first_not_of(" \t");
+            if (firstNonWs == std::string::npos) continue;
+            if (line.compare(firstNonWs, 14, "COMPAT_VARYING") != 0) continue;
+            // Parse "COMPAT_VARYING <type> <name>;"
+            size_t pos = firstNonWs + 14;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+            size_t typeBegin = pos;
+            while (pos < line.size() && IsIdChar(line[pos])) ++pos;
+            const std::string type = line.substr(typeBegin, pos - typeBegin);
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+            size_t nameBegin = pos;
+            while (pos < line.size() && IsIdChar(line[pos])) ++pos;
+            const std::string name = line.substr(nameBegin, pos - nameBegin);
+            if (!name.empty() && !type.empty()) {
+                declaredVaryings.push_back(name);
+                declaredTypes.push_back(type);
+            }
+        }
+    }
+    if (declaredVaryings.empty()) {
+        return;
+    }
+
+    // Step 3 — find void main() { ... } inside the VS block. We tolerate
+    // formatting variance (`void  main()`, newlines before `{`).
+    const size_t mainKw = vsBlock.find("void main");
+    if (mainKw == std::string::npos) {
+        return;
+    }
+    const size_t openBrace = vsBlock.find('{', mainKw);
+    if (openBrace == std::string::npos) {
+        return;
+    }
+    // Walk forward tracking brace depth to find the matching close.
+    int depth = 0;
+    size_t closeBrace = std::string::npos;
+    for (size_t i = openBrace; i < vsBlock.size(); ++i) {
+        const char c = vsBlock[i];
+        if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                closeBrace = i;
+                break;
+            }
+        }
+    }
+    if (closeBrace == std::string::npos) {
+        return;
+    }
+    const std::string mainBody = vsBlock.substr(openBrace + 1, closeBrace - openBrace - 1);
+
+    // Step 4 — line-by-line: look for `<name> = <expr>;` where <name>
+    // is one of our declared varyings (whole-word match, no swizzle).
+    std::istringstream bodyIn(mainBody);
+    std::string line;
+    while (std::getline(bodyIn, line)) {
+        const size_t firstNonWs = line.find_first_not_of(" \t");
+        if (firstNonWs == std::string::npos) continue;
+        // Identifier on LHS.
+        size_t pos = firstNonWs;
+        while (pos < line.size() && IsIdChar(line[pos])) ++pos;
+        if (pos == firstNonWs) continue;
+        const std::string lhs = line.substr(firstNonWs, pos - firstNonWs);
+        // Skip swizzle / member access — those aren't macro-able.
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+        if (pos >= line.size() || line[pos] != '=') continue;
+        // Be defensive against `==` and compound-assign operators
+        // (`+=`, `*=`, etc.) — we only want a plain `=`.
+        if (pos + 1 < line.size() && line[pos + 1] == '=') continue;
+        // Also skip if the previous non-whitespace char is one of the
+        // compound-assign operator-starters (the loop above already
+        // skipped whitespace, so the immediate char before pos in the
+        // original line is what matters).
+        ++pos; // step past '='
+        // Right-hand side runs until the trailing semicolon.
+        const size_t semi = line.find(';', pos);
+        if (semi == std::string::npos) continue;
+        // Trim leading/trailing whitespace on the expression.
+        size_t exprBegin = pos;
+        while (exprBegin < semi && (line[exprBegin] == ' ' || line[exprBegin] == '\t')) ++exprBegin;
+        size_t exprEnd = semi;
+        while (exprEnd > exprBegin && (line[exprEnd - 1] == ' ' || line[exprEnd - 1] == '\t')) --exprEnd;
+        if (exprBegin >= exprEnd) continue;
+        const std::string expr = line.substr(exprBegin, exprEnd - exprBegin);
+
+        // Match against the declared-varying list.
+        for (size_t i = 0; i < declaredVaryings.size(); ++i) {
+            if (declaredVaryings[i] == lhs) {
+                VsVaryingAssignment va;
+                va.name = lhs;
+                va.type = declaredTypes[i];
+                va.expr = expr;
+                out.push_back(std::move(va));
+                break;
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::string NormalizeUserGlsl(const std::string& src) {
@@ -192,6 +355,16 @@ std::string NormalizeUserGlsl(const std::string& src) {
 
 std::string NormalizeUserGlsl(const std::string& src,
                               const std::vector<std::string>& aliasNames) {
+    // Step 0 — pull VS-half varying assignments out of the original
+    // source BEFORE any identifier rewrites. Doing this on the raw
+    // text means we work against the libretro naming convention
+    // (`SourceSize` / `OutputSize` / etc.) the user wrote, which is
+    // identical to our preamble's identifier set — so the
+    // `#define`s we emit reference the same uniforms our preamble
+    // declares, and there's nothing further to translate.
+    std::vector<VsVaryingAssignment> vsVaryings;
+    ExtractVsVaryings(src, vsVaryings);
+
     // Step 1 — rewrite libretro / legacy identifier names to our schema.
     // Done as a whole-buffer pass before line-walking so that downstream
     // strip decisions see canonical names regardless of which alias the
@@ -278,6 +451,29 @@ std::string NormalizeUserGlsl(const std::string& src,
     std::string normalized;
     normalized.reserve(body.size() + 512);
     normalized += kPreamble;
+    // Inline VS-half varying assignments as #define macros. The VS
+    // computed these per-vertex and shipped them across the rasterizer
+    // as varyings; the FS reads them via `COMPAT_VARYING <type>
+    // <name>;` declarations that we strip below to avoid colliding
+    // with our preamble. Re-introducing them as macros gives the FS
+    // the same per-pixel value the per-vertex / per-pixel
+    // interpolation would have produced when the expression is
+    // viewport-uniform (the libretro convention for these varyings).
+    // Inserted before the alias declarations so a user shader doing
+    // `<varying>Size` resolution doesn't shadow our preamble's
+    // alias-Size uniform.
+    if (!vsVaryings.empty()) {
+        normalized += "// VS->FS varying inlines (LUS PostProcessGlslNormalizer).\n";
+        for (const VsVaryingAssignment& va : vsVaryings) {
+            // Wrap the expression in parens so subsequent member access
+            // (`onex.x`) parses correctly as `(expr).x`.
+            normalized += "#define ";
+            normalized += va.name;
+            normalized += " (";
+            normalized += va.expr;
+            normalized += ")\n";
+        }
+    }
     // Append per-alias sampler declarations after the canonical
     // preamble so they share the schema's strip / re-inject contract.
     // Names come from the .glslp `aliasN` keys (plus any

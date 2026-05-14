@@ -6478,8 +6478,10 @@ void Interpreter::UpdatePostProcessFromCVars() {
                                                    slangBundle.diagnosticNames)) {
                 loadedOk = true;
             } else {
-                SPDLOG_ERROR("Slang post-process shader '{}' loaded but backend "
-                             "rejected it; falling back to legacy probe", name);
+                const std::string err = fmt::format(
+                    "Slang post-process shader '{}' loaded but backend rejected it", name);
+                SPDLOG_ERROR("{}; falling back to legacy probe", err);
+                Fast::internal::SetPostProcessRuntimeError(err);
             }
         }
         if (!loadedOk) {
@@ -6489,12 +6491,20 @@ void Interpreter::UpdatePostProcessFromCVars() {
                                                   bundle.externalTextures)) {
                     loadedOk = true;
                 } else {
-                    SPDLOG_ERROR("Post-process shader '{}' loaded but backend rejected it; disabling", name);
+                    const std::string err = fmt::format(
+                        "Post-process shader '{}' loaded but backend rejected it; disabling", name);
+                    SPDLOG_ERROR("{}", err);
+                    Fast::internal::SetPostProcessRuntimeError(err);
                 }
-            } else if (mPostProcessChain.IsActive()) {
-                // New shader name failed to load; unload the previous
-                // one rather than silently keeping a stale program live.
-                mPostProcessChain.UnloadShader(mRapi);
+            } else {
+                const std::string err = fmt::format(
+                    "Post-process shader '{}' not found on disk or in archive", name);
+                Fast::internal::SetPostProcessRuntimeError(err);
+                if (mPostProcessChain.IsActive()) {
+                    // New shader name failed to load; unload the previous
+                    // one rather than silently keeping a stale program live.
+                    mPostProcessChain.UnloadShader(mRapi);
+                }
             }
         }
         mPostProcessLoadFailed = !loadedOk;
