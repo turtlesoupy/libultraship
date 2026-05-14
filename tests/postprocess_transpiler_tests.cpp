@@ -5,8 +5,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 #include "fast/postprocess/PostProcessGlslNormalizer.h"
 #include "fast/postprocess/PostProcessTranspiler.h"
@@ -326,6 +329,93 @@ void main() {
         pos += 1;
     }
     EXPECT_EQ(count, 1u) << "preamble + user declarations should not duplicate";
+}
+
+// Optional: point LUS_TEST_USER_SHADER_DIR at a directory and the
+// suite walks every `.glsl` directly inside it (non-recursive),
+// normalizing + transpiling each. The test is informational — it
+// always passes — but it dumps a per-file PASS/FAIL summary plus
+// the aggregate reject percentage so a CI run can flag regressions
+// when the normalizer changes.
+//
+// Usage:
+//   LUS_TEST_USER_SHADER_DIR=/path/to/libretro/glsl-shaders \
+//     ./build/libultraship/tests/lus_tests \
+//     --gtest_filter=PostProcessTranspiler.AcceptsUserSuppliedShaderDirectory
+//
+// We deliberately don't fail on rejects because (a) some inputs
+// genuinely require multi-pass support we haven't shipped yet and
+// (b) the percentage is what matters across the corpus, not any one
+// shader. Use the normalizer-tests file for hard regression assertions
+// on specific shader shapes.
+TEST(PostProcessTranspiler, AcceptsUserSuppliedShaderDirectory) {
+    const char* dir = std::getenv("LUS_TEST_USER_SHADER_DIR");
+    if (!dir || dir[0] == '\0') {
+        GTEST_SKIP() << "LUS_TEST_USER_SHADER_DIR not set";
+    }
+    std::filesystem::path root(dir);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+        GTEST_SKIP() << "LUS_TEST_USER_SHADER_DIR is not a directory: " << dir;
+    }
+
+    size_t total = 0;
+    size_t passed = 0;
+    std::vector<std::string> failures;
+
+    for (auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        const auto& path = entry.path();
+        if (path.extension() != ".glsl") continue;
+        ++total;
+
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            failures.push_back(path.filename().string() + " : open failed");
+            continue;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        const std::string raw = ss.str();
+        const std::string norm = Fast::NormalizeUserGlsl(raw);
+
+        Fast::PostProcessSource src;
+        src.name = path.stem().string();
+        src.glsl = norm;
+        std::string err;
+        if (Fast::PostProcessTranspiler::SynthesizeMissing(src, err)) {
+            ++passed;
+        } else {
+            // Trim the error to a single line so the summary stays
+            // legible. Most glslang errors are noisy — the first line
+            // (parse-error location + symbol) is enough to triage.
+            std::string firstLine = err.substr(0, err.find('\n'));
+            failures.push_back(path.filename().string() + " : " + firstLine);
+        }
+    }
+
+    if (total == 0) {
+        GTEST_SKIP() << "no .glsl files in " << dir;
+    }
+
+    const double passRate = (100.0 * static_cast<double>(passed)) /
+                             static_cast<double>(total);
+    std::cerr << "[corpus] " << passed << " / " << total
+              << " shaders transpiled (" << passRate << "%)\n";
+    if (!failures.empty()) {
+        // Cap the dump to keep CI logs sane — first 25 are usually
+        // representative.
+        const size_t cap = std::min<size_t>(failures.size(), 25);
+        std::cerr << "[corpus] failures (showing " << cap << " of "
+                  << failures.size() << "):\n";
+        for (size_t i = 0; i < cap; ++i) {
+            std::cerr << "  - " << failures[i] << "\n";
+        }
+    }
+    // Informational: never fail. Use the normalizer-tests file for
+    // hard regression assertions.
+    SUCCEED();
 }
 
 TEST(PostProcessTranspiler, RejectsEmptyGlsl) {

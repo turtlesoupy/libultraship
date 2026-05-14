@@ -169,14 +169,71 @@ bool LineStartMatchesAlias(const std::string& trimmed,
     return false;
 }
 
+// Extract the identifier from a `uniform sampler2D <name> [;|=...]`
+// line. The caller has already verified the prefix; this helper just
+// reads the identifier token. Returns empty when the syntax doesn't
+// match (e.g. weirdly punctuated lines), in which case the caller
+// leaves the line untouched and lets glslang produce the diagnostic.
+std::string ExtractUniformSamplerName(const std::string& trimmed) {
+    constexpr const char* kPrefix = "uniform sampler2D ";
+    constexpr size_t kPrefixLen = 18;
+    if (trimmed.size() <= kPrefixLen) return std::string();
+    if (trimmed.compare(0, kPrefixLen, kPrefix) != 0) return std::string();
+    size_t pos = kPrefixLen;
+    while (pos < trimmed.size() && (trimmed[pos] == ' ' || trimmed[pos] == '\t')) {
+        ++pos;
+    }
+    const size_t nameBegin = pos;
+    while (pos < trimmed.size()) {
+        const char c = trimmed[pos];
+        const bool isId = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_';
+        if (!isId) break;
+        ++pos;
+    }
+    if (pos == nameBegin) return std::string();
+    return trimmed.substr(nameBegin, pos - nameBegin);
+}
+
 // Rewrite the user GLSL into a Vulkan-targeted form: strip user
-// `#version` / schema declarations, prepend binding-explicit replacements.
+// `#version` / schema declarations, prepend binding-explicit
+// replacements. Any user-declared `uniform sampler2D <name>;` that
+// isn't a schema or alias name is auto-promoted to a binding-
+// explicit declaration at the next free slot — glslang's Vulkan
+// environment requires every sampler to carry `layout(binding=N)`
+// or it rejects the shader, so leaving an unprefixed user sampler
+// in place reduces a render-time visual issue (a sampler nobody
+// binds returns zero) into a hard load failure. Libretro single-
+// file shaders frequently declare history-style samplers
+// (`PassPrev3Texture`, `LUT0`, mask textures) that we don't have a
+// binding for; auto-binding lets the shader compile and surface
+// the absence as a visual artifact instead.
 std::string PreprocessForVulkan(const std::string& src,
                                 const std::vector<std::string>& aliasNames) {
     std::istringstream in(src);
     std::string line;
     std::vector<std::string> body;
     body.reserve(src.size() / 32 + 16);
+    // Names of unknown user samplers, in source declaration order.
+    // De-duplicated so a shader that double-declares the same name
+    // doesn't get two binding slots assigned (it'll still error out
+    // inside glslang for the second declaration, but with a better
+    // message than "no binding").
+    std::vector<std::string> userSamplers;
+    auto isAlreadyKnown = [&](const std::string& name) -> bool {
+        for (const std::string& a : aliasNames) {
+            if (a == name) return true;
+        }
+        for (const std::string& u : userSamplers) {
+            if (u == name) return true;
+        }
+        // Schema sampler names — Source / Original — are stripped
+        // before we reach this check, so they won't appear here. Listed
+        // for safety in case a future schema rule changes.
+        if (name == "Source" || name == "Original") return true;
+        return false;
+    };
+
     while (std::getline(in, line)) {
         const size_t firstNonWs = line.find_first_not_of(" \t");
         if (firstNonWs != std::string::npos &&
@@ -190,6 +247,17 @@ std::string PreprocessForVulkan(const std::string& src,
         }
         if (LineStartMatchesAlias(trimmed, aliasNames)) {
             continue;
+        }
+        // Unknown `uniform sampler2D <name>;`: capture the name and
+        // drop the line; we re-emit it with an explicit binding
+        // alongside the alias declarations below.
+        if (trimmed.size() > 18 &&
+            trimmed.compare(0, 18, "uniform sampler2D ") == 0) {
+            const std::string name = ExtractUniformSamplerName(trimmed);
+            if (!name.empty() && !isAlreadyKnown(name)) {
+                userSamplers.push_back(name);
+                continue;
+            }
         }
         body.push_back(line);
     }
@@ -208,6 +276,18 @@ std::string PreprocessForVulkan(const std::string& src,
         out += std::to_string(3 + i);
         out += ") uniform sampler2D ";
         out += alias;
+        out += ";\n";
+    }
+    // Unknown user samplers (libretro history-style references etc.)
+    // land after the alias block. The runtime never binds anything
+    // here in Phase 1, so the sampler returns zero — a missing-data
+    // visual artifact rather than a load failure.
+    const size_t userBindingBase = 3 + aliasNames.size();
+    for (size_t i = 0; i < userSamplers.size(); ++i) {
+        out += "layout(set=0, binding=";
+        out += std::to_string(userBindingBase + i);
+        out += ") uniform sampler2D ";
+        out += userSamplers[i];
         out += ";\n";
     }
     for (const auto& l : body) {

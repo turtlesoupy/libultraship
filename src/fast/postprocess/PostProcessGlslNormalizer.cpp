@@ -224,16 +224,78 @@ void ExtractVsVaryings(const std::string& src,
     if (vsBegin == std::string::npos) {
         return;
     }
-    // VS block ends at the matching `#elif defined(FRAGMENT)`, the
-    // legacy `#elif defined(VERTEX)` flip variant, or a top-level
-    // `#endif`. We scan forward and take the earliest match —
-    // single-file libretro shaders never nest VERTEX/FRAGMENT blocks
-    // so a flat search is fine.
-    const size_t fsMarker  = src.find("#elif defined(FRAGMENT)", vsBegin);
-    const size_t endMarker = src.find("#endif", vsBegin);
-    size_t vsEnd = std::min(fsMarker, endMarker);
-    if (vsEnd == std::string::npos) {
-        vsEnd = src.size();
+    // VS block ends at the matching `#elif defined(FRAGMENT)` at the
+    // SAME nesting depth, or at the matching outer `#endif` that
+    // closes the `#if defined(VERTEX)` opener. Real libretro shaders
+    // (crt-geom, crt-hyllian, broadcast, …) nest `#if __VERSION__ >=
+    // 130 ... #endif` and `#ifdef GL_ES ... #endif` inside the VS
+    // block; a depth-blind first-`#endif` search would close at the
+    // first inner `#endif` and miss every COMPAT_VARYING declaration
+    // (which sit between the inner blocks and the FS marker), so
+    // ExtractVsVaryings would silently produce no `#define` macros
+    // and the FS would fail to compile against the stripped
+    // varyings. Track preprocessor depth line-by-line and stop at
+    // depth 0.
+    size_t vsEnd = src.size();
+    {
+        int depth = 1; // Past the `#if defined(VERTEX)` line.
+        size_t cursor = vsBegin;
+        // Advance cursor past the opening directive's line.
+        const size_t firstNl = src.find('\n', vsBegin);
+        cursor = (firstNl == std::string::npos) ? src.size() : firstNl + 1;
+        while (cursor < src.size()) {
+            const size_t nextNl = src.find('\n', cursor);
+            const size_t lineEnd = (nextNl == std::string::npos) ? src.size() : nextNl;
+            // Find the first non-whitespace char on this line and check
+            // whether it begins a preprocessor directive that affects
+            // depth.
+            size_t scan = cursor;
+            while (scan < lineEnd && (src[scan] == ' ' || src[scan] == '\t')) {
+                ++scan;
+            }
+            if (scan < lineEnd && src[scan] == '#') {
+                ++scan;
+                while (scan < lineEnd && (src[scan] == ' ' || src[scan] == '\t')) {
+                    ++scan;
+                }
+                auto matchesKw = [&](const char* kw) -> bool {
+                    const size_t n = std::strlen(kw);
+                    if (scan + n > lineEnd) return false;
+                    if (src.compare(scan, n, kw) != 0) return false;
+                    if (scan + n == lineEnd) return true;
+                    const char c = src[scan + n];
+                    return !IsIdChar(c);
+                };
+                // Order matters: `#ifdef`/`#ifndef`/`#if` must be
+                // checked from longest to shortest so the prefix match
+                // doesn't false-positive shorter keywords.
+                if (matchesKw("ifdef") || matchesKw("ifndef") || matchesKw("if")) {
+                    ++depth;
+                } else if (matchesKw("endif")) {
+                    --depth;
+                    if (depth == 0) {
+                        vsEnd = cursor;
+                        break;
+                    }
+                } else if (depth == 1 && matchesKw("elif")) {
+                    // `#elif` at the same level as the opener — this
+                    // is the FRAGMENT branch starting (or, in the
+                    // legacy single-file convention, a flip-VERTEX
+                    // case). Either way, the VS body ends here.
+                    vsEnd = cursor;
+                    break;
+                } else if (depth == 1 && matchesKw("else")) {
+                    // `#else` at the opener's level closes the VS
+                    // body — the FS body begins on the next line.
+                    vsEnd = cursor;
+                    break;
+                }
+            }
+            if (nextNl == std::string::npos) {
+                break;
+            }
+            cursor = nextNl + 1;
+        }
     }
     const std::string vsBlock = src.substr(vsBegin, vsEnd - vsBegin);
 
@@ -355,16 +417,6 @@ std::string NormalizeUserGlsl(const std::string& src) {
 
 std::string NormalizeUserGlsl(const std::string& src,
                               const std::vector<std::string>& aliasNames) {
-    // Step 0 — pull VS-half varying assignments out of the original
-    // source BEFORE any identifier rewrites. Doing this on the raw
-    // text means we work against the libretro naming convention
-    // (`SourceSize` / `OutputSize` / etc.) the user wrote, which is
-    // identical to our preamble's identifier set — so the
-    // `#define`s we emit reference the same uniforms our preamble
-    // declares, and there's nothing further to translate.
-    std::vector<VsVaryingAssignment> vsVaryings;
-    ExtractVsVaryings(src, vsVaryings);
-
     // Step 1 — rewrite libretro / legacy identifier names to our schema.
     // Done as a whole-buffer pass before line-walking so that downstream
     // strip decisions see canonical names regardless of which alias the
@@ -417,6 +469,22 @@ std::string NormalizeUserGlsl(const std::string& src,
     RewriteIdentifier(body, "texture2D", "texture");
     RewriteIdentifier(body, "texture3D", "texture");
     RewriteIdentifier(body, "textureCube", "texture");
+
+    // Step 1.5 — pull VS-half varying assignments out of the
+    // POST-REWRITE body. Running this on the rewritten buffer means
+    // each emitted `#define <name> (<expr>)` references the same
+    // identifier names the FS body sees after rewrite (`SourceSize`,
+    // `vTexCoord`, `Source`, ...), so when the FS expands the macro
+    // it never names an identifier that was renamed away.
+    //
+    // Edge case: if the user declared `COMPAT_VARYING vec2 TextureSize;`
+    // (i.e. `TextureSize` as a per-vertex varying, not a uniform), the
+    // rewrite turned it into `COMPAT_VARYING vec2 SourceSize;`. The
+    // resulting `#define SourceSize (...)` shadows the preamble's
+    // `uniform vec2 SourceSize;` for FS reads — which is the desired
+    // behaviour, because the shader expected the VS-computed value.
+    std::vector<VsVaryingAssignment> vsVaryings;
+    ExtractVsVaryings(body, vsVaryings);
 
     // Step 2 — walk lines, drop our own future preamble's worth of
     // declarations plus user `#version` / `#pragma parameter` directives.
