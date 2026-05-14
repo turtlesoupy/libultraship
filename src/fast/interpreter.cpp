@@ -5019,19 +5019,32 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
      * conservative to avoid false-rejecting valid pushes from subsystems
      * that haven't been hooked into the registry yet. */
     {
+        /* DL push bounds check. Reject pushes that would lead the walker
+         * into a registered range it just walked past (variant 5 — runaway
+         * DL without a gsSPEndDisplayList terminator). We deliberately do
+         * NOT reject sub-N64-segment addresses (subAddr <= 0x0FFFFFFFu)
+         * here: SSB64 routinely emits `gsSPDisplayList(0x012792c0)`-style
+         * segment-relative references where the segment isn't bound for
+         * this frame (e.g. segment 1 is bound only by lbtransition for
+         * VS-results photocopy). SegAddr returns raw w1 in those cases,
+         * and rejecting the push silently drops legitimate sub-DLs across
+         * the entire scene. The walker handles unresolved cmds via
+         * gfx_step's deref + variant-4's separate ASan diag path; the
+         * cost of an occasional bad-cmd deref on Linux/glibc is one
+         * SIGSEGV per crash, which the WALKED_PAST guard plus the
+         * gcDrawMObjForDObj G_ENDDL terminator (decomp side) avoid in
+         * the cases we've measured. */
         uintptr_t subAddr = (uintptr_t)subGFX;
-        bool reject = (subAddr <= 0x0FFFFFFF) ||
-                      (sDLBoundsCheck && sDLBoundsCheck(subAddr) == kDLBoundsWalkedPast);
-        if (reject) {
+        if (sDLBoundsCheck && sDLBoundsCheck(subAddr) == kDLBoundsWalkedPast) {
             static int sRejectCount = 0;
             if (sRejectCount < 10) {
                 sRejectCount++;
-                SPDLOG_WARN("gfx_dl_handler: rejecting DL push outside any "
+                SPDLOG_WARN("gfx_dl_handler: rejecting DL push just past a "
                             "registered range (w1=0x{:x}, subGFX=0x{:x}) — "
                             "would have walked into unmapped memory",
                             (unsigned long long)cmd->words.w1,
                             (unsigned long long)subAddr);
-                Fast::DumpDLDiag(subGFX, "gfx_dl_handler: bounds-rejected");
+                Fast::DumpDLDiag(subGFX, "gfx_dl_handler: walked-past");
             }
             return false;
         }
