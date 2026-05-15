@@ -455,6 +455,10 @@ struct DiagSegWrite {
     uint64_t frame;
 };
 struct DiagDLPush {
+    void* caller_addr;          /* F3DGfx* of the calling instruction — tells us
+                                 * which DL contains the bad bytes (heap vs reloc
+                                 * file vs stale memory). Critical for tracing
+                                 * stale-DL crashes back to the writing code path. */
     uintptr_t caller_w0;
     uintptr_t caller_w1;
     void* callee;
@@ -484,6 +488,7 @@ static inline void diagRecordSegWrite(int segNum, uintptr_t oldVal, uintptr_t ne
 static inline void diagRecordDLPush(F3DGfx* caller, F3DGfx* callee, F3DGfx* normalized,
                                     const char* where) {
     sDiagDLPushes[sDiagDLPushesIdx] = {
+        (void*)caller,
         caller ? (uintptr_t)caller->words.w0 : 0,
         caller ? (uintptr_t)caller->words.w1 : 0,
         (void*)callee, (void*)normalized, where, 0, sDiagFrame
@@ -530,9 +535,48 @@ static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
         size_t k = (sDiagDLPushesIdx + i) % DIAG_RING;
         const auto& e = sDiagDLPushes[k];
         if (!e.where) continue;
+        char callerCls[160];
+        diagClassify((uintptr_t)e.caller_addr, callerCls, sizeof(callerCls));
         diagClassify((uintptr_t)e.callee_normalized, clsbuf, sizeof(clsbuf));
-        SPDLOG_CRITICAL("  [frame={}] caller w0={:#x} w1={:#x} callee={} norm={} class={} ({})",
-                        e.frame, e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, clsbuf, e.where);
+        SPDLOG_CRITICAL("  [frame={}] caller_addr={} caller_class={} w0={:#x} w1={:#x} callee={} norm={} callee_class={} ({})",
+                        e.frame, e.caller_addr, callerCls,
+                        e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, clsbuf, e.where);
+    }
+    /* cmd_stack: chain of currently-executing DLs (top is innermost). The top
+     * entry is the DL whose bytes the walker was reading when the crash hit —
+     * if it's in stale memory (post-terminator heap leftovers, recycled
+     * arena), classifier will say so.
+     *
+     * gfx_path: parallel chain of caller F3DGfx* — each entry is the *address*
+     * of the G_DL command that pushed onto cmd_stack. Combined, these give
+     * the full back-trace through nested DL calls. */
+    if (auto inst = mInstance.lock()) {
+        SPDLOG_CRITICAL("-- exec cmd_stack (top is current DL, oldest at bottom) --");
+        std::stack<F3DGfx*> tmp = g_exec_stack.cmd_stack;
+        size_t depth = 0;
+        while (!tmp.empty()) {
+            F3DGfx* p = tmp.top();
+            tmp.pop();
+            diagClassify((uintptr_t)p, clsbuf, sizeof(clsbuf));
+            SPDLOG_CRITICAL("  [depth={}] cmd={} class={}", depth, (void*)p, clsbuf);
+            ++depth;
+            if (depth > 64) {
+                SPDLOG_CRITICAL("  ... (truncated)");
+                break;
+            }
+        }
+        SPDLOG_CRITICAL("-- gfx_path (caller F3DGfx* per nesting level, oldest first) --");
+        for (size_t i = 0; i < g_exec_stack.gfx_path.size() && i < 64; ++i) {
+            const F3DGfx* p = g_exec_stack.gfx_path[i];
+            diagClassify((uintptr_t)p, clsbuf, sizeof(clsbuf));
+            uintptr_t w0 = 0, w1 = 0;
+            if (p != nullptr) {
+                w0 = (uintptr_t)p->words.w0;
+                w1 = (uintptr_t)p->words.w1;
+            }
+            SPDLOG_CRITICAL("  [lvl={}] caller={} class={} w0={:#x} w1={:#x}",
+                            i, (const void*)p, clsbuf, w0, w1);
+        }
     }
     SPDLOG_CRITICAL("==== END DIAG ====");
 }
