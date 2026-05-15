@@ -375,6 +375,11 @@ static UcodeHandlers ucode_handler_index = ucode_f3dex2;
 /* GBI trace callback — forward declaration (defined near g_exec_stack below) */
 static GbiTraceCallbackFn sGbiTraceCallback = nullptr;
 
+/* Hi-res texture pack hook — set by gfx_register_hires_hook(). NULL until
+ * the host registers; see ImportTexture for the call site and the docblock
+ * on GfxHiResHookFn (interpreter.h) for semantics. */
+GfxHiResHookFn gHiResHook = nullptr;
+
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
     F3DEX2_G_CULL_FRONT,     F3DEX2_G_CULL_BACK, F3DEX2_G_CULL_BOTH,
@@ -1407,6 +1412,21 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("RGBA16", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    // Hi-res texture pack hook (port-side). Host hashes the decoded RGBA8
+    // and substitutes a higher-resolution buffer if the pack contains one.
+    // Skipped on importReplacement uploads (LUS's own alt-asset path).
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_RGBA, G_IM_SIZ_16b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1460,6 +1480,18 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
             mTexUploadBuffer[4 * i + 2] = addr[4 * srcIdx + 2];
             mTexUploadBuffer[4 * i + 3] = addr[4 * srcIdx + 3];
             i++;
+        }
+    }
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_RGBA, G_IM_SIZ_32b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
         }
     }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
@@ -1518,6 +1550,18 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
         }
     }
 
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_IA, G_IM_SIZ_4b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1563,6 +1607,18 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         }
     }
 
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_IA, G_IM_SIZ_8b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1613,6 +1669,18 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
         }
     }
 
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_IA, G_IM_SIZ_16b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1668,6 +1736,18 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         }
     }
 
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_I, G_IM_SIZ_4b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1708,6 +1788,18 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
         }
     }
 
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_I, G_IM_SIZ_8b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1806,6 +1898,18 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("CI4", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_CI, G_IM_SIZ_4b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1902,6 +2006,18 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
 
     Ssb64RenderDiagLogUpload("CI8", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
+    if (!importReplacement) {
+        if (GfxHiResHookFn hook = gHiResHook) {
+            const uint8_t* packBuf = nullptr;
+            uint16_t packW = 0, packH = 0;
+            if (hook(G_IM_FMT_CI, G_IM_SIZ_8b, mTexUploadBuffer, (uint16_t)width, (uint16_t)height,
+                     &packBuf, &packW, &packH)
+                && packBuf != nullptr && packW > 0 && packH > 0) {
+                mRapi->UploadTexture(packBuf, packW, packH);
+                return;
+            }
+        }
+    }
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -6929,4 +7045,8 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
 
 extern "C" void gfx_texture_cache_clear() {
     Fast::mInstance.lock().get()->TextureCacheClear();
+}
+
+extern "C" void gfx_register_hires_hook(GfxHiResHookFn callback) {
+    Fast::gHiResHook = callback;
 }

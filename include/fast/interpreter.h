@@ -668,3 +668,32 @@ extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t 
  * Set to NULL to disable. */
 typedef void (*GbiTraceCallbackFn)(uintptr_t w0, uintptr_t w1, int dl_depth);
 extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback);
+
+/* Hi-res texture pack hook. Fires once per cache-miss texture upload, after
+ * the format-specific N64 decode has produced a tightly-packed RGBA8 buffer
+ * (mTexUploadBuffer) of `width * height * 4` bytes that the GPU is about to
+ * receive. The host may hash the decoded pixels and substitute a pre-decoded
+ * RGBA8 replacement at any resolution; the interpreter then uploads that
+ * buffer instead of the original.
+ *
+ * Hashing post-decode (rather than over the raw N64 source bytes) makes the
+ * key independent of source byte layout — Sprite-fixup, Bitmap-fixup, raw
+ * paths, and CI-with-palette all collapse to the same RGBA8 image and the
+ * same hash. The offline pack-conversion tool computes the same CRC32-IEEE
+ * over the decoded pixels to name pack PNGs, so a runtime hit ⇔ matching PNG.
+ *
+ * fmt: G_IM_FMT_*  (RGBA=0, YUV=1, CI=2, IA=3, I=4) — informational only;
+ *   the decoded RGBA8 alone is the hash input.
+ * siz: G_IM_SIZ_*  (4b=0, 8b=1, 16b=2, 32b=3) — informational only.
+ * rgba8: pointer to the decoded RGBA8 buffer (mTexUploadBuffer). Layout is
+ *   tightly packed, row-major, 4 bytes per pixel, `width * height * 4` total.
+ * width / height: pixel dimensions of the decoded buffer.
+ * On hit, hook owns *outBuf and guarantees it stays valid through the
+ *   immediately-following synchronous UploadTexture call. outW / outH carry
+ *   the substitute dimensions. Returns true.
+ * On miss/disabled, returns false; the decoded N64 pixels upload unchanged.
+ */
+typedef bool (*GfxHiResHookFn)(uint8_t fmt, uint8_t siz,
+                               const uint8_t* rgba8, uint16_t width, uint16_t height,
+                               const uint8_t** outBuf, uint16_t* outW, uint16_t* outH);
+extern "C" void gfx_register_hires_hook(GfxHiResHookFn callback);
