@@ -1657,12 +1657,21 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     if (slot.frameDirectionLocation >= 0) {
         glUniform1f(slot.frameDirectionLocation, 1.0f);
     }
-    // FlipY uniform lives on the vertex shader; re-resolve each frame in
-    // case the source FB changed between mGameFb (invertY=true) and
-    // mGameFbMsaaResolved (invertY=false).
+    // FlipY uniform on the vertex shader compensates for the V-axis
+    // mismatch between source FBO sampling and ImGui::Image's default
+    // UV interpretation (which treats V=0 as the top of the displayed
+    // quad). Both mGameFb (rendered with invertY=true, game-top at
+    // pixel-bottom = V=0) and mGameFbMsaaResolved (MSAA-blitted from
+    // mGameFb, same pixel layout) already have game-top at V=0, so
+    // the post-process pass writes them passthrough — bottom vertex
+    // of the fullscreen tri samples V=0 (game-top) and lands at
+    // GL-pixel-bottom of mDstFb, which is V=0 when ImGui samples mDstFb.
+    // Standard-orientation source FBs (V=0 = image-bottom) would need
+    // FlipY=1; none of the inputs the chain currently runs on are of
+    // that flavour, so the uniform is wired to 0.
     GLint flipYLoc = glGetUniformLocation(slot.program, "FlipY");
     if (flipYLoc >= 0) {
-        glUniform1i(flipYLoc, srcFbInfo.invertY ? 1 : 0);
+        glUniform1i(flipYLoc, 0);
     }
 
     EnsurePostProcessVao();

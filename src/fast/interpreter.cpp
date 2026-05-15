@@ -6554,6 +6554,13 @@ void Interpreter::ComposeFinalFrame() {
         params.frameDeltaSeconds = 0.0f;
         const int outFb = mPostProcessChain.Run(mRapi, srcFb, params);
         mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(outFb);
+        // Re-bind the swap-chain FB so the ImGui dispatch that follows
+        // (gui->EndDraw -> ImGui_ImplOpenGL3_RenderDrawData) targets
+        // FB 0 rather than the chain's intermediate output FB that
+        // RunPostProcess left bound. Without this, the GUI draws into
+        // the off-screen post-process FBO and the on-screen back buffer
+        // never receives the menu / Image draws.
+        mRapi->StartDrawToFramebuffer(0, 1);
     } else if (srcFb >= 0) {
         mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(srcFb);
     }
