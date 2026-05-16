@@ -1911,6 +1911,22 @@ void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int o
     vp.MaxDepth = 1.0f;
     mContext->RSSetViewports(1, &vp);
 
+    // The regular draw path's cached rasterizer state has
+    // ScissorEnable=TRUE (see DrawTriangles), and the last RSSetScissorRects
+    // call set a rect in the *game framebuffer* coordinate space. We don't
+    // own/replace the rasterizer state here, so without re-setting the
+    // scissor the fullscreen post-process triangle is clipped to that stale
+    // game-FB rect on the differently-sized mDstFb — typically clipping it
+    // away entirely and leaving mDstFb black. Set a scissor that covers the
+    // full destination so the pass is unclipped (matches the GL/Metal
+    // post-process paths, which set/disable scissor explicitly).
+    D3D11_RECT ppScissor{};
+    ppScissor.left = 0;
+    ppScissor.top = 0;
+    ppScissor.right = (LONG)dstTex.width;
+    ppScissor.bottom = (LONG)dstTex.height;
+    mContext->RSSetScissorRects(1, &ppScissor);
+
     // Fullscreen triangle has no input data.
     mContext->IASetInputLayout(nullptr);
     UINT stride = 0;
@@ -2213,6 +2229,16 @@ void GfxRenderingAPIDX11::RunPostProcessSlang(int progId, int dstFb,
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     mContext->RSSetViewports(1, &vp);
+
+    // See RunPostProcess: the inherited rasterizer state has
+    // ScissorEnable=TRUE with a stale game-FB scissor rect. Cover the
+    // full destination so the slang pass isn't clipped to black.
+    D3D11_RECT ppScissor{};
+    ppScissor.left = 0;
+    ppScissor.top = 0;
+    ppScissor.right = (LONG)dstTex.width;
+    ppScissor.bottom = (LONG)dstTex.height;
+    mContext->RSSetScissorRects(1, &ppScissor);
 
     // Bind the slang vertex buffer + input layout.
     UINT stride = 6 * sizeof(float); // vec4 + vec2 = 24

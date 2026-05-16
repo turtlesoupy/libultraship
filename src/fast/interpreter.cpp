@@ -6299,20 +6299,36 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || mPostProcessChain.IsActive()) {
+    const bool viewportMatches = ViewportMatchesRendererResolution();
+    if (!viewportMatches || mMsaaLevel > 1 || mPostProcessChain.IsActive()) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
-            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
-                                               true, true, true);
+        // Track the dimensions mGameFb is sized to so the MSAA resolve
+        // target below can match exactly — ResolveSubresource requires
+        // identical source/destination dimensions.
+        uint32_t gameFbW, gameFbH;
+        if (!viewportMatches) {
+            gameFbW = mCurDimensions.width;
+            gameFbH = mCurDimensions.height;
+            mRapi->UpdateFramebufferParameters(mGameFb, gameFbW, gameFbH, mMsaaLevel, true, true, true, true);
         } else {
             // MSAA framebuffer needs to be resolved to an equally sized target when complete, which must therefore
             // match the window size
-            mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
-                                               mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
+            gameFbW = mGfxCurrentWindowDimensions.width;
+            gameFbH = mGfxCurrentWindowDimensions.height;
+            mRapi->UpdateFramebufferParameters(mGameFb, gameFbW, gameFbH, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
-            mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
-                                               false, false, false, false);
+        // Allocate the single-sample resolve target whenever ComposeFinalFrame
+        // will consume it: that path resolves into mGameFbMsaaResolved (and
+        // samples it as the post-process Source) when MSAA is on AND either
+        // the viewport doesn't match the render resolution OR a post-process
+        // chain is active. The activation condition here must stay in lockstep
+        // with ComposeFinalFrame's — if the resolve target is missing when
+        // the chain runs, ResolveSubresource hits a null texture, the backend
+        // RunPostProcess early-returns on the null SRV, and the screen goes
+        // black (surfaced on Windows/D3D11 with MSAA + a bundled CRT shader,
+        // where viewport == render resolution is the default).
+        if (mMsaaLevel > 1 && (mPostProcessChain.IsActive() || !viewportMatches)) {
+            mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, gameFbW, gameFbH, 1, false, false, false, false);
         }
     } else {
         mRendersToFb = false;

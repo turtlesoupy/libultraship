@@ -349,11 +349,24 @@ bool CompileFragmentToSpirv(const std::string& vulkanSrc,
 // aligns with the clip-Y orientation the OpenGL/Metal stubs already use.
 // Resource declarations (Source / SourceSampler / cbuffer) are left to
 // the SPIRV-Cross fragment output that gets concatenated after this stub.
+//
+// VOut member ORDER is load-bearing: D3D11 links a VS output to the PS
+// input by matching hardware register INDEX, and FXC assigns those
+// indices in struct-declaration order (SV_Position is a system value
+// handled separately by the rasterizer). SPIRV-Cross emits the
+// fragment's input struct with the user varying first and SV_Position
+// last (e.g. `{ float2 vTexCoord : TEXCOORD0; float4 gl_FragCoord :
+// SV_Position; }`), so vTexCoord lands at register v0 there. This stub
+// must mirror that order — declaring SV_Position first pushes TEXCOORD0
+// to a different register than the SPIRV-Cross PS reads it from, so the
+// PS samples garbage UVs and the whole pass renders black on D3D11
+// (GL/Metal are unaffected because SPIRV-Cross generates *both* stages
+// for them and the signatures stay self-consistent).
 constexpr const char* kStockHlslVertex =
     "// Stock fullscreen-triangle vertex shader (LUS post-process).\n"
     "struct VOut {\n"
-    "    float4 position : SV_Position;\n"
     "    float2 vTexCoord : TEXCOORD0;\n"
+    "    float4 position : SV_Position;\n"
     "};\n"
     "\n"
     "VOut VSMain(uint vid : SV_VertexID) {\n"
@@ -394,23 +407,42 @@ bool TranspileHlsl(const std::vector<unsigned int>& spirv,
             compiler.set_decoration(ubo.id, spv::DecorationBinding, 0);
             compiler.set_name(ubo.id, "PostProcessUniforms");
         }
+        // Schema bindings: Source=0, Original=1, aliases=2+alias_index —
+        // these match the t*/s* slots the chain populates in
+        // extraBindings[] at run time. SPIRV-Cross splits each combined
+        // sampler into Texture2D + SamplerState sharing one numeric
+        // register index in their respective t*/s* spaces.
+        //
+        // Any sampler that is NOT a schema name (e.g. a libretro
+        // single-file shader's `bezel` / LUT sampler that would
+        // normally be supplied via a .glslp `textures` list) MUST still
+        // get a unique register. The HLSL backend hard-errors
+        // ("X4500: overlapping register semantics") if two resources
+        // collide on t0/s0, which rejected the whole shader on D3D11
+        // even though GL/Metal tolerate the collision and just leave
+        // the extra sampler reading undefined. Hand these unknown
+        // samplers sequential slots above the reserved schema range so
+        // the shader compiles and runs (the runtime never binds them,
+        // so they sample as the default black texture — same effective
+        // behaviour as GL/Metal).
+        uint32_t nextUnknownSlot = static_cast<uint32_t>(2 + aliasNames.size());
         for (auto& img : resources.sampled_images) {
-            // Per-sampler register assignment. SPIRV-Cross splits each
-            // combined sampler into Texture2D + SamplerState; both
-            // take the same numeric register index in their respective
-            // t* / s* spaces. Schema bindings: Source=0, Original=1.
-            // Aliases land at 2 + alias_index, matching the order the
-            // chain populates extraBindings[] at run time.
             const std::string& name = compiler.get_name(img.id);
-            uint32_t slot = 0;
-            if (name == "Original") {
+            uint32_t slot;
+            if (name == "Source") {
+                slot = 0;
+            } else if (name == "Original") {
                 slot = 1;
             } else {
+                slot = nextUnknownSlot; // default for non-schema samplers
                 for (size_t i = 0; i < aliasNames.size(); ++i) {
                     if (name == aliasNames[i]) {
                         slot = static_cast<uint32_t>(2 + i);
                         break;
                     }
+                }
+                if (slot == nextUnknownSlot) {
+                    ++nextUnknownSlot;
                 }
             }
             compiler.set_decoration(img.id, spv::DecorationDescriptorSet, 0);
