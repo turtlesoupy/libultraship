@@ -291,6 +291,44 @@ void GfxWindowBackendSDL2::Close() {
 }
 
 #ifdef _WIN32
+// Win32 refuses to let newly-launched processes steal the foreground; when
+// the game is started from Explorer (especially with startFullScreen=true,
+// where ShowWindow happens before the OS has decided we deserve focus),
+// the window ends up minimized to the taskbar with a flashing icon until
+// the user clicks it. Bypass the foreground lock with the standard
+// AttachThreadInput + topmost-toggle dance so the game actually appears
+// on screen with focus on launch.
+static void gfx_sdl_force_foreground_on_launch(SDL_Window* w) {
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(w, &wm)) return;
+    HWND hwnd = wm.info.win.window;
+
+    DWORD thisTid = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    BOOL attached = FALSE;
+    if (fgTid != 0 && fgTid != thisTid) {
+        attached = AttachThreadInput(thisTid, fgTid, TRUE);
+    }
+
+    AllowSetForegroundWindow(ASFW_ANY);
+    // Toggling HWND_TOPMOST → HWND_NOTOPMOST kicks the window above any
+    // existing topmost windows momentarily, then drops it back to normal
+    // z-order — the standard trick to defeat the foreground lock without
+    // permanently pinning the window above everything.
+    SetWindowPos(hwnd, HWND_TOPMOST,   0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+
+    if (attached) {
+        AttachThreadInput(thisTid, fgTid, FALSE);
+    }
+}
+
 static LRESULT CALLBACK gfx_sdl_wnd_proc(HWND h_wnd, UINT message, WPARAM w_param, LPARAM l_param) {
     switch (message) {
         case WM_GETDPISCALEDSIZE:
@@ -434,6 +472,16 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     }
 
     Ship::Context::GetInstance()->GetWindow()->GetGui()->Init(window_impl);
+
+#ifdef _WIN32
+    // Final step before scancode tables: claw foreground focus back so the
+    // window doesn't end up minimized in the taskbar (especially common when
+    // launching directly into fullscreen).
+    SDL_RaiseWindow(mWnd);
+    gfx_sdl_force_foreground_on_launch(mWnd);
+#else
+    SDL_RaiseWindow(mWnd);
+#endif
 
     for (size_t i = 0; i < std::size(lus_to_sdl_table); i++) {
         mSdlToLusTable[lus_to_sdl_table[i]] = i;

@@ -600,6 +600,32 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
         ToggleBorderlessWindowFullScreen(true, false);
     }
 
+    // Win32 refuses to let newly-launched processes steal the foreground.
+    // Without an explicit nudge, the freshly-created window (especially
+    // start_in_fullscreen) gets hidden behind the previously-focused app
+    // and only flashes its taskbar icon. The standard topmost-toggle
+    // + AttachThreadInput dance bypasses the foreground lock so the game
+    // actually appears on screen with focus on launch.
+    {
+        DWORD thisTid = GetCurrentThreadId();
+        HWND fg = GetForegroundWindow();
+        DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+        BOOL attached = FALSE;
+        if (fgTid != 0 && fgTid != thisTid) {
+            attached = AttachThreadInput(thisTid, fgTid, TRUE);
+        }
+        AllowSetForegroundWindow(ASFW_ANY);
+        SetWindowPos(h_wnd, HWND_TOPMOST,   0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetWindowPos(h_wnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        BringWindowToTop(h_wnd);
+        SetForegroundWindow(h_wnd);
+        SetActiveWindow(h_wnd);
+        SetFocus(h_wnd);
+        if (attached) {
+            AttachThreadInput(thisTid, fgTid, FALSE);
+        }
+    }
+
     DragAcceptFiles(h_wnd, TRUE);
 
     // Mouse init
