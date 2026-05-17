@@ -31,6 +31,7 @@ class Buffer;
 class RenderPipelineState;
 class CommandQueue;
 class Viewport;
+class Library;
 } // namespace MTL
 
 namespace CA {
@@ -68,6 +69,76 @@ struct ShaderProgramMetal {
     MTL::RenderPipelineState* pipeline_state_variants[9];
 };
 
+// Compiled post-process program. The pipeline state expects:
+//   - vertex function:   "postprocess_vertex" (uses [[vertex_id]] only)
+//   - fragment function: "postprocess_fragment"
+//   - fragment binding texture(0)=Source, sampler(0)=SourceSampler,
+//     buffer(0) = PostProcessUniformsMetal
+// Samplers are pulled from the backend-wide (filter, wrap) cache in
+// RunPostProcess so per-pass libretro filter_linearN / wrap_modeN
+// settings take effect; this struct no longer owns one.
+//
+// Metal pins the color-attachment pixel format into the pipeline state
+// at creation time, so when a pass writes into an sRGB / float FBO we
+// need a separately-built pipeline. The library / vs / fs MTL::Function
+// handles stay live so additional variants can be built lazily in
+// RunPostProcess; `pipelineVariants` caches the result keyed by
+// PostProcessFboFormat. The Default variant is built up front for
+// load-time validation + fast path.
+struct PostProcessProgramMetal {
+    MTL::Library* library;
+    MTL::Function* vsFn;
+    MTL::Function* fsFn;
+    MTL::RenderPipelineState* pipelineVariants[3]; // indexed by (int)PostProcessFboFormat
+    std::string name;
+};
+
+// Phase 3D-3: compiled slang post-process program for the Metal
+// backend. Distinct from PostProcessProgramMetal because:
+//   - The vertex stage is authored (uses [[stage_in]] vertex
+//     attributes), not a [[vertex_id]] stub.
+//   - The UBO size is per-program; we hold an MTL::Buffer sized
+//     to the slang artifact's declared bytes and refill each Run.
+//   - The slang VS gets its vertex data from a shared MTL::Buffer
+//     (mPostProcessSlangVbo) at vertex buffer index 30 — chosen
+//     so SPIRV-Cross's MSL emit of `constant UBO& global
+//     [[buffer(0)]]` keeps UBO at buffer 0 without colliding.
+//
+// The pipelineVariants[] cache works the same as the legacy
+// PostProcessProgramMetal: build Default up front, build sRGB /
+// Float16 lazily when first targeted by RunPostProcessSlang.
+struct PostProcessSlangProgramMetal {
+    // VS and FS each come from their own MTL::Library (SPIRV-Cross
+    // emits each stage as standalone MSL). Both libraries are
+    // retained for the slot's lifetime — releasing one while a
+    // function from it is still bound to a pipeline state is UB,
+    // even if the pipeline appears to retain the function.
+    MTL::Library* vsLibrary = nullptr;
+    MTL::Library* fsLibrary = nullptr;
+    MTL::Function* vsFn = nullptr;
+    MTL::Function* fsFn = nullptr;
+    MTL::RenderPipelineState* pipelineVariants[3] = {};
+    MTL::Buffer* ubo = nullptr;
+    uint32_t uboBytes = 0;
+    std::string name;
+    std::vector<std::string> samplerNames;
+};
+
+// Layout must match the `PostProcessUniforms` struct emitted by the
+// transpiler. The bundled hand-written MSL companions
+// (scanlines.msl / crt-lottes.msl) declare a shorter struct (no
+// originalSize) — MSL ignores the trailing bytes the runtime writes,
+// so the two layouts coexist as long as hand-written shaders only
+// read the prefix they declared.
+struct PostProcessUniformsMetal {
+    simd::float2 sourceSize;
+    simd::float2 outputSize;
+    simd::float2 inputSize;
+    simd::float2 originalSize;   // Phase 2D: game-FB dimensions.
+    simd::int1 frameCount;
+    simd::float1 frameDirection;
+};
+
 struct TextureDataMetal {
     MTL::Texture* texture;
     MTL::Texture* msaaTexture;
@@ -89,6 +160,20 @@ struct FramebufferMetal {
     bool mHasDepthBuffer;
     uint32_t mMsaaLevel;
     bool mRenderTarget;
+
+    // Post-process intermediates may override BGRA8Unorm with sRGB or
+    // float. `last` tracks what the underlying MTL::Texture is currently
+    // allocated as so UpdateFramebufferParameters can rebuild it when
+    // the chain switches formats.
+    PostProcessFboFormat mPostProcessFormat = PostProcessFboFormat::Default;
+    PostProcessFboFormat mLastPostProcessFormat = PostProcessFboFormat::Default;
+    // Phase 2.2: chain marks this FBO when a downstream
+    // mipmap_input pass needs to sample it through a mip chain.
+    // Metal texture mip count is fixed at creation, so the FBO's
+    // MTL::Texture must be re-allocated with mipmapLevelCount > 1
+    // at the next UpdateFramebufferParameters when this flag flips.
+    bool mPostProcessMipmapped = false;
+    bool mLastPostProcessMipmapped = false;
 
     // State
     bool mHasEndedEncoding;
@@ -121,7 +206,7 @@ struct CoordUniforms {
 
 class GfxRenderingAPIMetal final : public GfxRenderingAPI {
   public:
-    ~GfxRenderingAPIMetal() override = default;
+    ~GfxRenderingAPIMetal() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
@@ -146,6 +231,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void EndFrame() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
+    void DestroyFramebuffer(int fbId) override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                      bool can_extract_depth) override;
@@ -164,6 +250,24 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+
+    bool SupportsPostProcess() override;
+    int CreatePostProcessProgram(const PostProcessSource& src) override;
+    void DestroyPostProcessProgram(int progId) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                        const PostProcessParams& params) override;
+    void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) override;
+    void GeneratePostProcessMipmaps(int fb_id) override;
+    int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                       const uint8_t* rgba8) override;
+    void DestroyPostProcessStaticTexture(int textureId) override;
+    int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
+    void DestroyPostProcessSlangProgram(int progId) override;
+    void RunPostProcessSlang(int progId, int dstFb,
+                             const uint8_t* uboData, uint32_t uboBytes,
+                             const int* samplerFbIds, uint32_t samplerCount,
+                             const PostProcessParams& params) override;
 
     void NewFrame();
     void SetupFloatingFrame();
@@ -221,6 +325,34 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     bool mNonUniformThreadgroupSupported;
+
+    // Post-process programs allocated via CreatePostProcessProgram. Slots
+    // with pipeline==nullptr are empty (returned to the free list when
+    // DestroyPostProcessProgram clears them).
+    std::vector<PostProcessProgramMetal> mPostProcessPrograms;
+
+    // Sampler cache shared by all post-process programs, keyed by an
+    // encoded (filter, wrap) pair. Lookup happens per pass so libretro
+    // filter_linearN / wrap_modeN translate into a small bounded set of
+    // MTL::SamplerState objects.
+    std::unordered_map<uint32_t, MTL::SamplerState*> mPostProcessSamplers;
+
+    // Static textures uploaded for libretro `.glslp` external
+    // `textures = "..."` entries. Vector index = handle returned by
+    // CreatePostProcessStaticTexture. Empty slots (texture == nullptr)
+    // are reused.
+    std::vector<MTL::Texture*> mPostProcessStaticTextures;
+
+    // Phase 3D-3: slang post-process programs + shared vertex buffer.
+    // The VBO holds 3 vertices of {vec4 Position, vec2 TexCoord}
+    // interleaved (24 B stride, 72 B total) — created lazily on
+    // first slang Run and reused for every slang draw.
+    std::vector<PostProcessSlangProgramMetal> mPostProcessSlangPrograms;
+    MTL::Buffer* mPostProcessSlangVbo = nullptr;
+    // Vertex buffer slot the slang pipelines route their stage_in
+    // through. Picked high so it never collides with
+    // SPIRV-Cross's `[[buffer(0)]]` UBO binding.
+    static constexpr uint32_t kPostProcessSlangVertexBufferIndex = 30;
 };
 
 } // namespace Fast

@@ -839,6 +839,33 @@ int GfxRenderingAPIDX11::CreateFramebuffer() {
     return (int)index;
 }
 
+void GfxRenderingAPIDX11::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& fb = mFrameBuffers[fbId];
+    // .Reset() on the ComPtrs drops our refcount; D3D11 frees the
+    // underlying object when no more views reference it.
+    fb.render_target_view.Reset();
+    fb.depth_stencil_view.Reset();
+    fb.depth_stencil_srv.Reset();
+    // The color attachment lives in mTextures[fb.texture_id]; clear it
+    // too so the GPU memory frees with the rest of the slot. The
+    // texture_id slot itself stays tombstoned — D3D11's NewTexture() is
+    // monotonic and slot reuse isn't worth adding for the bookkeeping
+    // saving.
+    if (fb.texture_id < mTextures.size()) {
+        TextureData& tex = mTextures[fb.texture_id];
+        tex.texture.Reset();
+        tex.resource_view.Reset();
+        tex.sampler_state.Reset();
+        tex.width = 0;
+        tex.height = 0;
+    }
+    fb.has_depth_buffer = false;
+    fb.msaa_level = 0;
+}
+
 void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                       bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                       bool can_extract_depth) {
@@ -853,21 +880,44 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
         --msaa_level;
     }
 
-    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
+    const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
+    const bool mipmappedChanged = (fb.postProcessMipmapped != fb.lastPostProcessMipmapped);
+    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level ||
+                formatChanged || mipmappedChanged;
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
+            DXGI_FORMAT colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            switch (fb.postProcessFormat) {
+                case PostProcessFboFormat::Default:
+                    colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    break;
+                case PostProcessFboFormat::Srgb:
+                    colorFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                    break;
+                case PostProcessFboFormat::Float16:
+                    colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    break;
+            }
+            // Phase 2.2: when a downstream mipmap_input pass will
+            // sample this texture, allocate the full mip chain and
+            // tag with GENERATE_MIPS so ID3D11DeviceContext::
+            // GenerateMips fills it later. MSAA + mips is illegal
+            // in D3D11, so the mipmap flag implicitly forces
+            // msaa_level=1 — the chain only marks post-process
+            // intermediates anyway, which are already non-MSAA.
+            const bool mipmapped = fb.postProcessMipmapped && msaa_level <= 1;
             D3D11_TEXTURE2D_DESC texture_desc;
             texture_desc.Width = width;
             texture_desc.Height = height;
             texture_desc.Usage = D3D11_USAGE_DEFAULT;
             texture_desc.BindFlags =
                 (msaa_level <= 1 ? D3D11_BIND_SHADER_RESOURCE : 0) | (render_target ? D3D11_BIND_RENDER_TARGET : 0);
-            texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texture_desc.Format = colorFormat;
             texture_desc.CPUAccessFlags = 0;
-            texture_desc.MiscFlags = 0;
+            texture_desc.MiscFlags = mipmapped ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
             texture_desc.ArraySize = 1;
-            texture_desc.MipLevels = 1;
+            texture_desc.MipLevels = mipmapped ? 0 : 1; // 0 = full chain
             texture_desc.SampleDesc.Count = msaa_level;
             texture_desc.SampleDesc.Quality = 0;
 
@@ -896,6 +946,8 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
 
         tex.width = width;
         tex.height = height;
+        fb.lastPostProcessFormat = fb.postProcessFormat;
+        fb.lastPostProcessMipmapped = fb.postProcessMipmapped;
     }
 
     if (has_depth_buffer &&
@@ -1597,6 +1649,709 @@ static bool CaptureBackbufferToPNG_DX11(const char* path) {
         return false;
     }
     return true;
+}
+
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+//
+// D3D11 has an immediate context model (single global pipeline state), so
+// unlike Metal there's no enqueue-order question — draw calls execute in
+// submission order. The pass binds dst's RTV, src's SRV at t0, a shared
+// linear/clamp sampler at s0, and the post-process uniforms at b0; then
+// emits a fullscreen triangle synthesized from SV_VertexID with no input
+// layout. After the draw, the regular IA/VS/PS/blend state on the
+// immediate context is dirty — the next DrawTriangles call resets every
+// piece it cares about via the existing LoadShader / mLast* tracking
+// path, so we only have to invalidate `mLastShaderProgram` and the
+// resource-view cache.
+
+bool GfxRenderingAPIDX11::SupportsPostProcess() {
+    return true;
+}
+
+int GfxRenderingAPIDX11::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.hlsl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no HLSL source. The .glsl "
+                     "should have been transpiled by PostProcessTranspiler "
+                     "at load time — check earlier log for the parse error.",
+                     src.name);
+        return -1;
+    }
+
+#if DEBUG_D3D
+    UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    HRESULT hr = mD3dCompile(src.hlsl.data(), src.hlsl.size(), nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
+                             compileFlags, 0, vsBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': VSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+    errBlob.Reset();
+    hr = mD3dCompile(src.hlsl.data(), src.hlsl.size(), nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compileFlags, 0,
+                     psBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': PSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+
+    PostProcessProgramD3D11 slot;
+    hr = mDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                     slot.vertex_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': CreateVertexShader failed (hr=0x{:08X})", src.name, (uint32_t)hr);
+        return -1;
+    }
+    hr = mDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                    slot.pixel_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Post-process '{}': CreatePixelShader failed (hr=0x{:08X})", src.name, (uint32_t)hr);
+        return -1;
+    }
+    slot.name = src.name;
+    slot.aliasCount = static_cast<uint32_t>(src.aliasNames.size());
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        if (mPostProcessPrograms[i].vertex_shader.Get() == nullptr) {
+            mPostProcessPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    return (int)mPostProcessPrograms.size() - 1;
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    mPostProcessPrograms[progId] = PostProcessProgramD3D11{};
+}
+
+int GfxRenderingAPIDX11::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                        const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = rgba8;
+    init.SysMemPitch = width * 4u;
+    StaticTextureD3D11 slot;
+    if (FAILED(mDevice->CreateTexture2D(&td, &init, slot.texture.GetAddressOf()))) {
+        return -1;
+    }
+    if (FAILED(mDevice->CreateShaderResourceView(slot.texture.Get(), nullptr,
+                                                  slot.srv.GetAddressOf()))) {
+        slot.texture.Reset();
+        return -1;
+    }
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i].texture.Get() == nullptr) {
+            mPostProcessStaticTextures[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(std::move(slot));
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    mPostProcessStaticTextures[textureId] = StaticTextureD3D11{};
+}
+
+void GfxRenderingAPIDX11::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIDX11::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferDX11& fb = mFrameBuffers[fb_id];
+    if (fb.texture_id >= mTextures.size()) {
+        return;
+    }
+    ID3D11ShaderResourceView* srv = mTextures[fb.texture_id].resource_view.Get();
+    if (srv == nullptr) {
+        return;
+    }
+    // D3D11 requires the SRV's underlying texture to have been
+    // created with D3D11_RESOURCE_MISC_GENERATE_MIPS. The chain
+    // arranges that via SetPostProcessFramebufferMipmapped before
+    // UpdateFramebufferParameters; if the FBO wasn't tagged we
+    // silently no-op (matching the OpenGL behavior).
+    if (!fb.postProcessMipmapped) {
+        return;
+    }
+    mContext->GenerateMips(srv);
+}
+
+void GfxRenderingAPIDX11::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessFormat = fmt;
+}
+
+void GfxRenderingAPIDX11::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                         const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    const PostProcessProgramD3D11& slot = mPostProcessPrograms[progId];
+    if (slot.vertex_shader.Get() == nullptr) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFrameBuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& srcFbInfo = mFrameBuffers[srcFb];
+    FramebufferDX11& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.render_target_view.Get() == nullptr) {
+        return;
+    }
+    TextureData& srcTex = mTextures[srcFbInfo.texture_id];
+    TextureData& dstTex = mTextures[dstFbInfo.texture_id];
+    if (srcTex.resource_view.Get() == nullptr) {
+        // MSAA source can't be sampled; the interpreter should have resolved
+        // into a non-MSAA target before reaching this path.
+        return;
+    }
+
+    // Required cbuffer size: 40-byte prefix + 8 bytes per alias /
+    // external-texture `vec2 <name>Size` slot, padded to a multiple of
+    // 16 for D3D11 alignment. Grow mPostProcessCb on demand if the
+    // current shader needs a larger buffer than the last one.
+    const size_t aliasBytes = (size_t)slot.aliasCount * kPostProcessUniformsAliasStride;
+    const size_t neededBytes =
+        (kPostProcessUniformsPrefixBytes + aliasBytes + 15) & ~15u;
+    if (mPostProcessCb.Get() == nullptr || mPostProcessCbBytes < neededBytes) {
+        mPostProcessCb.Reset();
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.ByteWidth = (UINT)neededBytes;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ThrowIfFailed(mDevice->CreateBuffer(&bd, nullptr, mPostProcessCb.GetAddressOf()));
+        mPostProcessCbBytes = neededBytes;
+    }
+
+    PostProcessUniformsD3D11 uni{};
+    uni.SourceSize[0] = (float)params.srcWidth;
+    uni.SourceSize[1] = (float)params.srcHeight;
+    uni.OutputSize[0] = (float)params.dstWidth;
+    uni.OutputSize[1] = (float)params.dstHeight;
+    uni.InputSize[0] = (float)params.inputWidth;
+    uni.InputSize[1] = (float)params.inputHeight;
+    uni.OriginalSize[0] = (float)params.originalWidth;
+    uni.OriginalSize[1] = (float)params.originalHeight;
+    uni.FrameCount = (int)params.frameCount;
+    uni.FrameDirection = 1.0f;
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    ThrowIfFailed(mContext->Map(mPostProcessCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
+    auto* dst = static_cast<uint8_t*>(ms.pData);
+    std::memset(dst, 0, neededBytes);
+    std::memcpy(dst, &uni, sizeof(uni));
+    // Append each alias / external-texture `<name>Size` at the std140
+    // offset matching the transpiled cbuffer's tail. extraBindings[i]
+    // shares the same i-th order the transpiler used; if extraBindings
+    // is missing an entry for any reason, leave that slot at 1x1
+    // (already memset to 0; bump to 1 below so divisions don't NaN).
+    for (uint32_t i = 0; i < slot.aliasCount; ++i) {
+        float w = 1.0f;
+        float h = 1.0f;
+        if (i < params.extraBindingsCount) {
+            const auto& eb = params.extraBindings[i];
+            w = (float)eb.width;
+            h = (float)eb.height;
+        }
+        float* slotPtr = reinterpret_cast<float*>(
+            dst + kPostProcessUniformsPrefixBytes + (size_t)i * kPostProcessUniformsAliasStride);
+        slotPtr[0] = w;
+        slotPtr[1] = h;
+    }
+    mContext->Unmap(mPostProcessCb.Get(), 0);
+
+    // Bind destination as the sole render target, no depth.
+    ID3D11RenderTargetView* rtv = dstFbInfo.render_target_view.Get();
+    mContext->OMSetRenderTargets(1, &rtv, nullptr);
+
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)dstTex.width;
+    vp.Height = (float)dstTex.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &vp);
+
+    // The regular draw path's cached rasterizer state has
+    // ScissorEnable=TRUE (see DrawTriangles), and the last RSSetScissorRects
+    // call set a rect in the *game framebuffer* coordinate space. We don't
+    // own/replace the rasterizer state here, so without re-setting the
+    // scissor the fullscreen post-process triangle is clipped to that stale
+    // game-FB rect on the differently-sized mDstFb — typically clipping it
+    // away entirely and leaving mDstFb black. Set a scissor that covers the
+    // full destination so the pass is unclipped (matches the GL/Metal
+    // post-process paths, which set/disable scissor explicitly).
+    D3D11_RECT ppScissor{};
+    ppScissor.left = 0;
+    ppScissor.top = 0;
+    ppScissor.right = (LONG)dstTex.width;
+    ppScissor.bottom = (LONG)dstTex.height;
+    mContext->RSSetScissorRects(1, &ppScissor);
+
+    // Fullscreen triangle has no input data.
+    mContext->IASetInputLayout(nullptr);
+    UINT stride = 0;
+    UINT offset = 0;
+    ID3D11Buffer* nullVbo = nullptr;
+    mContext->IASetVertexBuffers(0, 1, &nullVbo, &stride, &offset);
+    mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    mContext->VSSetShader(slot.vertex_shader.Get(), nullptr, 0);
+    mContext->PSSetShader(slot.pixel_shader.Get(), nullptr, 0);
+
+    // Disable blending so the fragment's alpha=1 lands intact.
+    const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+    // No depth/stencil state needed (no DSV bound).
+
+    // Source (this pass's input) at t0, Original (game FB) at t1.
+    // Shaders that don't reference Original simply ignore the binding;
+    // pass 0 callers pass srcFb == originalFb so it's a no-op there.
+    ID3D11ShaderResourceView* originalSrv = srcTex.resource_view.Get();
+    if (originalFb >= 0 && (size_t)originalFb < mFrameBuffers.size()) {
+        FramebufferDX11& origFbInfo = mFrameBuffers[originalFb];
+        if (origFbInfo.texture_id < mTextures.size()) {
+            ID3D11ShaderResourceView* maybe =
+                mTextures[origFbInfo.texture_id].resource_view.Get();
+            if (maybe != nullptr) {
+                originalSrv = maybe;
+            }
+        }
+    }
+    // Slot 0 (Source) sampler comes from the producer pass's
+    // libretro filter_linearN / wrap_modeN, encoded as a small cache
+    // key. Slot 1 (Original) stays at the default linear / clamp-to-edge
+    // because .glslp has no per-pass override for it.
+    auto wrapModeToD3D = [](PostProcessWrapMode m) -> D3D11_TEXTURE_ADDRESS_MODE {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return D3D11_TEXTURE_ADDRESS_CLAMP;
+            case PostProcessWrapMode::ClampToBorder:  return D3D11_TEXTURE_ADDRESS_BORDER;
+            case PostProcessWrapMode::Repeat:         return D3D11_TEXTURE_ADDRESS_WRAP;
+            case PostProcessWrapMode::MirroredRepeat: return D3D11_TEXTURE_ADDRESS_MIRROR;
+        }
+        return D3D11_TEXTURE_ADDRESS_CLAMP;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> ID3D11SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second.Get();
+        }
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                           : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        const D3D11_TEXTURE_ADDRESS_MODE addr = wrapModeToD3D(wrap);
+        sd.AddressU = addr;
+        sd.AddressV = addr;
+        sd.AddressW = addr;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        // Border color stays at zeroed RGBA (matches GL's transparent-
+        // black default for CLAMP_TO_BORDER).
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sd, sampler.GetAddressOf()));
+        ID3D11SamplerState* raw = sampler.Get();
+        mPostProcessSamplers.emplace(key, std::move(sampler));
+        return raw;
+    };
+    ID3D11SamplerState* srcSamp = getSampler(params.srcFilterLinear, params.srcWrapMode);
+    ID3D11SamplerState* origSamp = getSampler(true, PostProcessWrapMode::ClampToEdge);
+
+    // Alias / external-texture bindings at slots 2..N+1. Cap at 8
+    // total PS resource slots so we stay well under the D3D11 input
+    // resource limit (128) and don't need a dynamic buffer.
+    constexpr size_t kMaxPostProcessSlots = 8;
+    ID3D11ShaderResourceView* extraSrvs[kMaxPostProcessSlots] = {};
+    ID3D11SamplerState* extraSamps[kMaxPostProcessSlots] = {};
+    extraSrvs[0] = srcTex.resource_view.Get();
+    extraSrvs[1] = originalSrv;
+    extraSamps[0] = srcSamp;
+    extraSamps[1] = origSamp;
+    size_t totalSlots = 2;
+    for (size_t i = 0; i < params.extraBindingsCount && totalSlots < kMaxPostProcessSlots; ++i) {
+        const auto& eb = params.extraBindings[i];
+        ID3D11ShaderResourceView* srv = originalSrv; // defensive fallback
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size()) {
+            ID3D11ShaderResourceView* maybe =
+                mPostProcessStaticTextures[eb.staticTextureId].srv.Get();
+            if (maybe != nullptr) {
+                srv = maybe;
+            }
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size()) {
+            const FramebufferDX11& f = mFrameBuffers[eb.sourceFb];
+            if (f.texture_id < mTextures.size()) {
+                ID3D11ShaderResourceView* maybe = mTextures[f.texture_id].resource_view.Get();
+                if (maybe != nullptr) {
+                    srv = maybe;
+                }
+            }
+        }
+        extraSrvs[totalSlots] = srv;
+        extraSamps[totalSlots] = getSampler(eb.filterLinear, eb.wrapMode);
+        ++totalSlots;
+    }
+    mContext->PSSetShaderResources(0, (UINT)totalSlots, extraSrvs);
+    mContext->PSSetSamplers(0, (UINT)totalSlots, extraSamps);
+    ID3D11Buffer* cb = mPostProcessCb.Get();
+    mContext->VSSetConstantBuffers(0, 1, &cb);
+    mContext->PSSetConstantBuffers(0, 1, &cb);
+
+    mContext->Draw(3, 0);
+
+    // Invalidate the per-context state caches used by the regular draw
+    // path so the next DrawTriangles call rebinds everything that matters
+    // (shader, layout, blend, SRVs at slots 0/1, primitive topology).
+    mLastShaderProgram = nullptr;
+    for (size_t i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastBlendState.Reset();
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    mLastVertexBufferStride = 0;
+
+    // Detach the SRVs so a subsequent pass that wants to render into
+    // any of these textures doesn't trip the RTV-and-SRV-bound warning.
+    // Includes the alias slots since they may bind earlier-pass FBOs
+    // that a later pass writes into via a re-resolve (rare, but the
+    // chain doesn't guarantee otherwise).
+    ID3D11ShaderResourceView* nullSrvs[kMaxPostProcessSlots] = {};
+    mContext->PSSetShaderResources(0, (UINT)totalSlots, nullSrvs);
+}
+
+// Phase 3D-3: compile a slang program (authored VS + FS) for the
+// D3D11 backend. SPIRV-Cross emits the slang VS attributes at
+// TEXCOORD0 (vec4 Position) + TEXCOORD1 (vec2 TexCoord) with default
+// options, and the chain provides matching interleaved vertex data
+// via mPostProcessSlangVbo at run time.
+int GfxRenderingAPIDX11::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsHlsl.empty() || src.fsHlsl.empty()) {
+        SPDLOG_ERROR("Slang post-process shader '{}': missing VS or FS HLSL "
+                     "(transpiler should have populated both — check earlier log)",
+                     src.name);
+        return -1;
+    }
+
+#if DEBUG_D3D
+    UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    HRESULT hr = mD3dCompile(src.vsHlsl.data(), src.vsHlsl.size(), nullptr, nullptr, nullptr,
+                             "VSMain", "vs_5_0", compileFlags, 0,
+                             vsBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': VSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+    errBlob.Reset();
+    hr = mD3dCompile(src.fsHlsl.data(), src.fsHlsl.size(), nullptr, nullptr, nullptr,
+                     "PSMain", "ps_5_0", compileFlags, 0,
+                     psBlob.GetAddressOf(), errBlob.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': PSMain compile failed: {}", src.name,
+                     errBlob ? (const char*)errBlob->GetBufferPointer() : "(no blob)");
+        return -1;
+    }
+
+    PostProcessSlangProgramD3D11 slot;
+    hr = mDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                     slot.vertex_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreateVertexShader failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+    hr = mDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                    slot.pixel_shader.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreatePixelShader failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+
+    // Vertex layout matches the slang VBO populated lazily on first
+    // run: {vec4 Position, vec2 TexCoord} interleaved, stride 24.
+    // SPIRV-Cross's HLSL output uses TEXCOORD<location> for input
+    // attribute semantics by default, so location=0 becomes
+    // TEXCOORD0 and location=1 becomes TEXCOORD1.
+    const D3D11_INPUT_ELEMENT_DESC kSlangLayout[] = {
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 16,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    hr = mDevice->CreateInputLayout(kSlangLayout, ARRAYSIZE(kSlangLayout),
+                                    vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                                    slot.input_layout.GetAddressOf());
+    if (FAILED(hr)) {
+        SPDLOG_ERROR("Slang post-process '{}': CreateInputLayout failed (hr=0x{:08X})",
+                     src.name, (uint32_t)hr);
+        return -1;
+    }
+
+    if (src.uboBytes > 0) {
+        const UINT bytes = (UINT)((src.uboBytes + 15) & ~15u);
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.ByteWidth = bytes;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = mDevice->CreateBuffer(&bd, nullptr, slot.ubo.GetAddressOf());
+        if (FAILED(hr)) {
+            SPDLOG_ERROR("Slang post-process '{}': CreateBuffer(ubo {}B) failed (hr=0x{:08X})",
+                         src.name, bytes, (uint32_t)hr);
+            return -1;
+        }
+        slot.uboBytes = bytes;
+    }
+    slot.name = src.name;
+    slot.samplerNames = src.samplerNames;
+
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].vertex_shader.Get() == nullptr) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessSlangPrograms.push_back(std::move(slot));
+    return (int)mPostProcessSlangPrograms.size() - 1;
+}
+
+void GfxRenderingAPIDX11::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    mPostProcessSlangPrograms[progId] = PostProcessSlangProgramD3D11{};
+}
+
+void GfxRenderingAPIDX11::RunPostProcessSlang(int progId, int dstFb,
+                                              const uint8_t* uboData, uint32_t uboBytes,
+                                              const int* samplerFbIds, uint32_t samplerCount,
+                                              const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    PostProcessSlangProgramD3D11& slot = mPostProcessSlangPrograms[progId];
+    if (slot.vertex_shader.Get() == nullptr || slot.pixel_shader.Get() == nullptr) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferDX11& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.render_target_view.Get() == nullptr) {
+        return;
+    }
+    TextureData& dstTex = mTextures[dstFbInfo.texture_id];
+
+    // Lazily build the slang vertex buffer (fullscreen triangle:
+    // 3 vertices of {vec4 Position, vec2 TexCoord}).
+    if (mPostProcessSlangVbo.Get() == nullptr) {
+        static const float kSlangVerts[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,  0.0f, 0.0f,
+             3.0f, -1.0f, 0.0f, 1.0f,  2.0f, 0.0f,
+            -1.0f,  3.0f, 0.0f, 1.0f,  0.0f, 2.0f,
+        };
+        D3D11_BUFFER_DESC bd = {};
+        bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.ByteWidth = sizeof(kSlangVerts);
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = kSlangVerts;
+        ThrowIfFailed(mDevice->CreateBuffer(&bd, &init, mPostProcessSlangVbo.GetAddressOf()));
+    }
+
+    // Upload the chain-built UBO blob into the program's cbuffer.
+    if (slot.ubo.Get() != nullptr && uboData != nullptr && uboBytes > 0) {
+        D3D11_MAPPED_SUBRESOURCE ms{};
+        ThrowIfFailed(mContext->Map(slot.ubo.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms));
+        auto* dst = static_cast<uint8_t*>(ms.pData);
+        std::memset(dst, 0, slot.uboBytes);
+        std::memcpy(dst, uboData, std::min<uint32_t>(uboBytes, slot.uboBytes));
+        mContext->Unmap(slot.ubo.Get(), 0);
+    }
+
+    // Set destination as the sole render target, no depth.
+    ID3D11RenderTargetView* rtv = dstFbInfo.render_target_view.Get();
+    mContext->OMSetRenderTargets(1, &rtv, nullptr);
+
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)dstTex.width;
+    vp.Height = (float)dstTex.height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    mContext->RSSetViewports(1, &vp);
+
+    // See RunPostProcess: the inherited rasterizer state has
+    // ScissorEnable=TRUE with a stale game-FB scissor rect. Cover the
+    // full destination so the slang pass isn't clipped to black.
+    D3D11_RECT ppScissor{};
+    ppScissor.left = 0;
+    ppScissor.top = 0;
+    ppScissor.right = (LONG)dstTex.width;
+    ppScissor.bottom = (LONG)dstTex.height;
+    mContext->RSSetScissorRects(1, &ppScissor);
+
+    // Bind the slang vertex buffer + input layout.
+    UINT stride = 6 * sizeof(float); // vec4 + vec2 = 24
+    UINT offset = 0;
+    ID3D11Buffer* vbo = mPostProcessSlangVbo.Get();
+    mContext->IASetInputLayout(slot.input_layout.Get());
+    mContext->IASetVertexBuffers(0, 1, &vbo, &stride, &offset);
+    mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    mContext->VSSetShader(slot.vertex_shader.Get(), nullptr, 0);
+    mContext->PSSetShader(slot.pixel_shader.Get(), nullptr, 0);
+
+    const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFFu);
+
+    // Build a single sampler reused across all slots — Phase 3D-3
+    // single-pass scope. Per-slot libretro filter/wrap routing comes
+    // with Phase 3D-3 multipass; for now Source-and-Original on
+    // linear/clamp matches the legacy behaviour.
+    auto wrapModeToD3D = [](PostProcessWrapMode m) -> D3D11_TEXTURE_ADDRESS_MODE {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return D3D11_TEXTURE_ADDRESS_CLAMP;
+            case PostProcessWrapMode::ClampToBorder:  return D3D11_TEXTURE_ADDRESS_BORDER;
+            case PostProcessWrapMode::Repeat:         return D3D11_TEXTURE_ADDRESS_WRAP;
+            case PostProcessWrapMode::MirroredRepeat: return D3D11_TEXTURE_ADDRESS_MIRROR;
+        }
+        return D3D11_TEXTURE_ADDRESS_CLAMP;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> ID3D11SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second.Get();
+        }
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                           : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        const D3D11_TEXTURE_ADDRESS_MODE addr = wrapModeToD3D(wrap);
+        sd.AddressU = addr;
+        sd.AddressV = addr;
+        sd.AddressW = addr;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+        ThrowIfFailed(mDevice->CreateSamplerState(&sd, sampler.GetAddressOf()));
+        ID3D11SamplerState* raw = sampler.Get();
+        mPostProcessSamplers.emplace(key, std::move(sampler));
+        return raw;
+    };
+
+    // Bind samplerFbIds[i]'s SRV at slot i. Use the first valid SRV
+    // as the fallback for any -1 entries.
+    constexpr size_t kMaxSlangSlots = 8;
+    ID3D11ShaderResourceView* srvs[kMaxSlangSlots] = {};
+    ID3D11SamplerState* samplers[kMaxSlangSlots] = {};
+    ID3D11ShaderResourceView* fallbackSrv = nullptr;
+    for (uint32_t i = 0; i < samplerCount && i < kMaxSlangSlots; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (fbId >= 0 && (size_t)fbId < mFrameBuffers.size()) {
+            const FramebufferDX11& f = mFrameBuffers[fbId];
+            if (f.texture_id < mTextures.size()) {
+                srv = mTextures[f.texture_id].resource_view.Get();
+            }
+        }
+        if (srv != nullptr && fallbackSrv == nullptr) {
+            fallbackSrv = srv;
+        }
+        srvs[i] = srv;
+        samplers[i] = getSampler(params.srcFilterLinear, params.srcWrapMode);
+    }
+    // Fill any nulls with the fallback so the shader's texture()
+    // calls don't trip a D3D11 null-SRV bind warning.
+    for (uint32_t i = 0; i < samplerCount && i < kMaxSlangSlots; ++i) {
+        if (srvs[i] == nullptr) {
+            srvs[i] = fallbackSrv;
+        }
+    }
+    const UINT slotCount = std::min<uint32_t>(samplerCount, kMaxSlangSlots);
+    if (slotCount > 0) {
+        mContext->PSSetShaderResources(0, slotCount, srvs);
+        mContext->PSSetSamplers(0, slotCount, samplers);
+    }
+
+    // Bind the slang UBO at both b0 stages (VS uses MVP; FS uses
+    // SourceSize / OutputSize / parameters).
+    ID3D11Buffer* cb = slot.ubo.Get();
+    if (cb != nullptr) {
+        mContext->VSSetConstantBuffers(0, 1, &cb);
+        mContext->PSSetConstantBuffers(0, 1, &cb);
+    }
+
+    mContext->Draw(3, 0);
+
+    // Invalidate the regular-draw caches so the next DrawTriangles
+    // re-binds everything.
+    mLastShaderProgram = nullptr;
+    for (size_t i = 0; i < SHADER_MAX_TEXTURES; ++i) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastBlendState.Reset();
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    mLastVertexBufferStride = 0;
+
+    // Detach SRVs so a later pass writing into any of these textures
+    // doesn't trip the RTV-and-SRV-bound warning.
+    ID3D11ShaderResourceView* nullSrvs[kMaxSlangSlots] = {};
+    if (slotCount > 0) {
+        mContext->PSSetShaderResources(0, slotCount, nullSrvs);
+    }
 }
 
 } // namespace Fast

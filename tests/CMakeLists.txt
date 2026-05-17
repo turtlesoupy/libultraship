@@ -12,6 +12,13 @@ add_executable(lus_tests
     binary_io_tests.cpp
     string_helper_tests.cpp
     crc64_tests.cpp
+    postprocess_transpiler_tests.cpp
+    postprocess_preset_tests.cpp
+    postprocess_slang_source_tests.cpp
+    postprocess_slang_transpiler_tests.cpp
+    postprocess_glsl_normalizer_tests.cpp
+    postprocess_runtime_diagnostics_tests.cpp
+    port_stubs.cpp
 )
 
 set_property(TARGET lus_tests PROPERTY CXX_STANDARD 20)

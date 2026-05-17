@@ -15,6 +15,7 @@
 #include "fast/types.h"
 #include "fast/ucodehandlers.h"
 #include "backends/gfx_rendering_api.h"
+#include "postprocess/PostProcessChain.h"
 
 #include "fast/resource/type/Texture.h"
 #include "ship/resource/Resource.h"
@@ -451,6 +452,15 @@ class Interpreter {
 
     // private: TODO make these private
     void Flush();
+    // End-of-frame composition step: resolves MSAA (when applicable),
+    // runs the post-process chain (when active), and sets mGfxFrameBuffer
+    // to the texture handle the GUI samples. Called from Run() and
+    // RunGuiOnly() once GBI execution is complete.
+    void ComposeFinalFrame();
+    // Reconcile the post-process chain with CVAR_POSTPROCESS_ENABLED /
+    // _SHADER. Compiles / unloads the active shader only on transitions —
+    // a no-op when both CVars are unchanged from the prior frame.
+    void UpdatePostProcessFromCVars();
     ShaderProgram* LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1);
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void TextureCacheClear();
@@ -580,6 +590,19 @@ class Interpreter {
 
     int mGameFb{};             // game_framebuffer;
     int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
+
+    // Post-process / user-shader pipeline. Owns its own FBO(s) and the
+    // currently-loaded compiled program. Inactive (passthrough) until a
+    // shader is loaded via PostProcessChain::LoadShader.
+    PostProcessChain mPostProcessChain{};
+    uint32_t mFrameCounter{};      // Monotonic, wraps. Fed to shader uniforms.
+    bool mPostProcessEnabled{};    // Last-seen CVAR_POSTPROCESS_ENABLED.
+    std::string mPostProcessName;  // Last-seen CVAR_POSTPROCESS_SHADER.
+    // Latches when the current (name, enabled) combo failed to load,
+    // so the per-frame UpdatePostProcessFromCVars doesn't retry the
+    // same broken preset 60× per second. Cleared on cvar change or
+    // when an attempted load succeeds.
+    bool mPostProcessLoadFailed{};
 
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;

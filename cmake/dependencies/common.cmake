@@ -108,6 +108,65 @@ if (GFX_DEBUG_DISASSEMBLER)
     target_include_directories(libgfxd PUBLIC ${libgfxd_SOURCE_DIR})
 endif()
 
+#======== Post-process shader transpiler (glslang + SPIRV-Cross) ========
+#
+# Pulls in glslang (BSD-3 + Apache 2.0) and SPIRV-Cross (Apache 2.0 + MIT)
+# so user-supplied .glsl post-process shaders can be transpiled to HLSL and
+# MSL at load time. Both licenses are MIT-compatible; nothing GPL ships
+# inside libultraship as a result of this addition. See
+# docs/crt_shader_plan_2026-05-11.md §3.2 / §8.3.
+#
+# Heavy first-build cost (~10-20s extra link), so default OFF on the mobile
+# targets that don't yet have a CRT-shader UI. Desktops get it ON so user
+# .glsl drops Just Work cross-backend.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(_LUS_PP_TRANSPILER_DEFAULT OFF)
+else()
+    set(_LUS_PP_TRANSPILER_DEFAULT ON)
+endif()
+option(LUS_ENABLE_POSTPROCESS_TRANSPILER
+       "Build the GLSL->HLSL/MSL transpiler used by the post-process runtime"
+       ${_LUS_PP_TRANSPILER_DEFAULT})
+unset(_LUS_PP_TRANSPILER_DEFAULT)
+
+if (LUS_ENABLE_POSTPROCESS_TRANSPILER)
+    # glslang. We disable everything except the bits we link against.
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+    set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE) # avoids the SPIRV-Tools dep
+    set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+    set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    FetchContent_Declare(
+        glslang
+        GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+        GIT_TAG 15.4.0
+    )
+    FetchContent_MakeAvailable(glslang)
+    set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
+    unset(_LUS_BUILD_SHARED_LIBS_SAVED)
+
+    # SPIRV-Cross. We only need core + glsl + hlsl + msl static libs.
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_STATIC ON CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_FORCE_PIC ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        spirv_cross
+        GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+        GIT_TAG vulkan-sdk-1.4.304.0
+    )
+    FetchContent_MakeAvailable(spirv_cross)
+endif()
+
 #======== thread-pool ========
 FetchContent_Declare(
     ThreadPool

@@ -613,6 +613,15 @@ void GfxRenderingAPIMetal::EndFrame() {
     for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
         FramebufferMetal& fb = mFramebuffers[fb_id];
 
+        // DestroyFramebuffer tombstones a slot by setting mTextureId
+        // to UINT32_MAX and deleting mViewport / mScissorRect. The
+        // memsets below would dereference those null pointers and
+        // SEGV at fault_addr=0x10 (= mScissorRect + 16). Skip the
+        // per-frame state reset for slots that have no live state.
+        if (fb.mTextureId == UINT32_MAX) {
+            continue;
+        }
+
         fb.mLastShaderProgram = nullptr;
         fb.mCommandBuffer = nullptr;
         fb.mCommandEncoder = nullptr;
@@ -634,6 +643,57 @@ void GfxRenderingAPIMetal::EndFrame() {
 }
 
 void GfxRenderingAPIMetal::FinishRender() {
+}
+
+void GfxRenderingAPIMetal::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& fb = mFramebuffers[fbId];
+    if (fb.mTextureId == UINT32_MAX) {
+        return; // Already destroyed.
+    }
+    if (fb.mDepthTexture != nullptr) {
+        fb.mDepthTexture->release();
+        fb.mDepthTexture = nullptr;
+    }
+    if (fb.mMsaaDepthTexture != nullptr) {
+        fb.mMsaaDepthTexture->release();
+        fb.mMsaaDepthTexture = nullptr;
+    }
+    // The color attachment lives in mTextures[mTextureId]; release the
+    // MTL::Texture so its GPU memory frees. Metal's command buffer /
+    // render pass / encoder objects are autoreleased pool-managed, so
+    // dropping our pointers is sufficient.
+    if (fb.mTextureId < mTextures.size()) {
+        TextureDataMetal& tex = mTextures[fb.mTextureId];
+        if (tex.texture != nullptr) {
+            tex.texture->release();
+            tex.texture = nullptr;
+        }
+        if (tex.msaaTexture != nullptr) {
+            tex.msaaTexture->release();
+            tex.msaaTexture = nullptr;
+        }
+        if (tex.sampler != nullptr) {
+            tex.sampler->release();
+            tex.sampler = nullptr;
+        }
+        tex.width = 0;
+        tex.height = 0;
+    }
+    delete fb.mScissorRect;
+    fb.mScissorRect = nullptr;
+    delete fb.mViewport;
+    fb.mViewport = nullptr;
+    fb.mCommandBuffer = nullptr;
+    fb.mRenderPassDescriptor = nullptr;
+    fb.mCommandEncoder = nullptr;
+    fb.mLastShaderProgram = nullptr;
+    fb.mHasDepthBuffer = false;
+    fb.mMsaaLevel = 0;
+    fb.mRenderTarget = false;
+    fb.mTextureId = UINT32_MAX;
 }
 
 int GfxRenderingAPIMetal::CreateFramebuffer() {
@@ -739,18 +799,51 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
         --msaa_level;
     }
 
-    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level;
+    const bool formatChanged = (fb.mPostProcessFormat != fb.mLastPostProcessFormat);
+    const bool mipmappedChanged = (fb.mPostProcessMipmapped != fb.mLastPostProcessMipmapped);
+    bool diff = tex.width != width || tex.height != height || fb.mMsaaLevel != msaa_level ||
+                formatChanged || mipmappedChanged;
 
     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
 
     if (diff || (fb.mRenderPassDescriptor != nullptr) != render_target) {
+        MTL::PixelFormat colorFormat = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+        switch (fb.mPostProcessFormat) {
+            case PostProcessFboFormat::Default:
+                // Keep the backend-wide default — respect mSrgbMode for
+                // non-post-process FBOs and the chain's mDstFb.
+                break;
+            case PostProcessFboFormat::Srgb:
+                colorFormat = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                colorFormat = MTL::PixelFormatRGBA16Float;
+                break;
+        }
+        // Phase 2.2: a chain-marked mipmap_input source needs its
+        // texture allocated with a populated mip chain so the
+        // GeneratePostProcessMipmaps blit encoder has somewhere to
+        // write. Metal textures cap mip count at creation, so the
+        // chain must mark before this call. MSAA + mips is not a
+        // viable combination on Metal — the chain only marks
+        // non-MSAA intermediates.
+        const bool mipmapped = fb.mPostProcessMipmapped && msaa_level <= 1;
+        NS::UInteger mipLevels = 1;
+        if (mipmapped) {
+            NS::UInteger maxDim = (width > height) ? width : height;
+            mipLevels = 1;
+            while (maxDim > 1) {
+                maxDim >>= 1;
+                ++mipLevels;
+            }
+        }
         MTL::TextureDescriptor* tex_descriptor = MTL::TextureDescriptor::alloc()->init();
         tex_descriptor->setTextureType(MTL::TextureType2D);
         tex_descriptor->setWidth(width);
         tex_descriptor->setHeight(height);
         tex_descriptor->setSampleCount(1);
-        tex_descriptor->setMipmapLevelCount(1);
-        tex_descriptor->setPixelFormat(mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+        tex_descriptor->setMipmapLevelCount(mipLevels);
+        tex_descriptor->setPixelFormat(colorFormat);
         tex_descriptor->setUsage((render_target ? MTL::TextureUsageRenderTarget : 0) | MTL::TextureUsageShaderRead);
 
         if (tex.texture != nullptr)
@@ -878,6 +971,8 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
     fb.mRenderTarget = render_target;
     fb.mHasDepthBuffer = has_depth_buffer;
     fb.mMsaaLevel = msaa_level;
+    fb.mLastPostProcessFormat = fb.mPostProcessFormat;
+    fb.mLastPostProcessMipmapped = fb.mPostProcessMipmapped;
 
     autorelease_pool->release();
 }
@@ -1288,6 +1383,936 @@ ImTextureID GfxRenderingAPIMetal::GetTextureById(int fb_id) {
 void GfxRenderingAPIMetal::SetSrgbMode() {
     mSrgbMode = true;
 }
+
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+//
+// Ordering note: Metal command buffers execute in enqueue() order, not
+// commit() order. By the time ComposeFinalFrame runs, the source FB's cb
+// (mGameFb) was enqueued during game rendering, then StartDrawToFramebuffer(0)
+// enqueued FB 0's cb for the GUI pass. A freshly-allocated cb here would
+// land *after* FB 0's, so the GUI would sample a stale destination texture.
+// We chain the post-process render encoder onto an already-enqueued
+// non-screen cb (preferably the source FB's) so its work executes before
+// FB 0 reads our output, without needing fences or events.
+
+bool GfxRenderingAPIMetal::SupportsPostProcess() {
+    return true;
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.msl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no MSL source. The .glsl "
+                     "should have been transpiled by PostProcessTranspiler "
+                     "at load time — check earlier log for the parse error.",
+                     src.name);
+        return -1;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = nullptr;
+    MTL::Library* library =
+        mDevice->newLibrary(NS::String::string(src.msl.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+    if (library == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': MSL compile failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        pool->release();
+        return -1;
+    }
+
+    MTL::Function* vsFn = library->newFunction(NS::String::string("postprocess_vertex", NS::UTF8StringEncoding));
+    MTL::Function* fsFn = library->newFunction(NS::String::string("postprocess_fragment", NS::UTF8StringEncoding));
+    if (vsFn == nullptr || fsFn == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': MSL must export postprocess_vertex / postprocess_fragment", src.name);
+        if (vsFn) {
+            vsFn->release();
+        }
+        if (fsFn) {
+            fsFn->release();
+        }
+        library->release();
+        pool->release();
+        return -1;
+    }
+
+    // Build the Default-format pipeline up front. Other format variants
+    // (sRGB / Float16) are compiled lazily in RunPostProcess when a pass
+    // first writes into an FBO with that format.
+    MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    desc->setVertexFunction(vsFn);
+    desc->setFragmentFunction(fsFn);
+    desc->colorAttachments()->object(0)->setPixelFormat(
+        mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+    desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+    desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+    desc->setSampleCount(1);
+    // Destination FB has no depth attachment (PostProcessChain::OnResize
+    // passes has_depth_buffer=false), so depth/stencil pixel formats stay
+    // at the default of Invalid.
+
+    MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
+    desc->release();
+
+    if (pipeline == nullptr) {
+        SPDLOG_ERROR("Post-process '{}': pipeline state failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        vsFn->release();
+        fsFn->release();
+        library->release();
+        pool->release();
+        return -1;
+    }
+
+    PostProcessProgramMetal slot{};
+    slot.library = library;
+    slot.vsFn = vsFn;
+    slot.fsFn = fsFn;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Default] = pipeline;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Srgb] = nullptr;
+    slot.pipelineVariants[(int)PostProcessFboFormat::Float16] = nullptr;
+    slot.name = src.name;
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        // Slot is free if it has no Default-format pipeline (the one we
+        // always build up front).
+        if (mPostProcessPrograms[i].pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+            mPostProcessPrograms[i] = std::move(slot);
+            pool->release();
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    pool->release();
+    return (int)mPostProcessPrograms.size() - 1;
+}
+
+GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    // The post-process sampler cache is keyed on (filter, wrap) — bounded
+    // to 8 entries by design — but `newSamplerState` returns a retained
+    // MTL::SamplerState that the backend owns. Release each on shutdown
+    // so the singleton teardown doesn't leak the cache.
+    //
+    // MTL ref-counts survive any in-flight GPU work because command
+    // buffers retain the samplers they bound, so this is safe even if a
+    // frame is still on the GPU when the backend is destroyed.
+    for (auto& kv : mPostProcessSamplers) {
+        if (kv.second != nullptr) {
+            kv.second->release();
+        }
+    }
+    mPostProcessSamplers.clear();
+    // Same teardown contract for the static-texture cache — the chain
+    // releases known live entries via DestroyPostProcessStaticTexture,
+    // but a process-exit teardown that bypasses the chain would leak.
+    for (auto*& tex : mPostProcessStaticTextures) {
+        if (tex != nullptr) {
+            tex->release();
+            tex = nullptr;
+        }
+    }
+    mPostProcessStaticTextures.clear();
+    // Phase 3D-3: release any leftover slang programs the chain didn't
+    // explicitly destroy, plus the shared vertex buffer.
+    for (auto& slot : mPostProcessSlangPrograms) {
+        for (auto*& variant : slot.pipelineVariants) {
+            if (variant != nullptr) {
+                variant->release();
+                variant = nullptr;
+            }
+        }
+        if (slot.vsFn != nullptr) {
+            slot.vsFn->release();
+            slot.vsFn = nullptr;
+        }
+        if (slot.fsFn != nullptr) {
+            slot.fsFn->release();
+            slot.fsFn = nullptr;
+        }
+        if (slot.vsLibrary != nullptr) {
+            slot.vsLibrary->release();
+            slot.vsLibrary = nullptr;
+        }
+        if (slot.fsLibrary != nullptr) {
+            slot.fsLibrary->release();
+            slot.fsLibrary = nullptr;
+        }
+        if (slot.ubo != nullptr) {
+            slot.ubo->release();
+            slot.ubo = nullptr;
+        }
+    }
+    mPostProcessSlangPrograms.clear();
+    if (mPostProcessSlangVbo != nullptr) {
+        mPostProcessSlangVbo->release();
+        mPostProcessSlangVbo = nullptr;
+    }
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessPrograms[progId];
+    for (auto*& variant : slot.pipelineVariants) {
+        if (variant != nullptr) {
+            variant->release();
+            variant = nullptr;
+        }
+    }
+    if (slot.vsFn != nullptr) {
+        slot.vsFn->release();
+        slot.vsFn = nullptr;
+    }
+    if (slot.fsFn != nullptr) {
+        slot.fsFn->release();
+        slot.fsFn = nullptr;
+    }
+    if (slot.library != nullptr) {
+        slot.library->release();
+        slot.library = nullptr;
+    }
+    slot = PostProcessProgramMetal{};
+}
+
+// Phase 3D-3: build a fullscreen-triangle vertex descriptor for slang
+// pipelines. Attribute layout matches the slang VBO populated lazily
+// on first slang Run: vec4 Position at offset 0, vec2 TexCoord at
+// offset 16, stride 24. Bound at high vertex-buffer index
+// (kPostProcessSlangVertexBufferIndex) so SPIRV-Cross's `[[buffer(0)]]`
+// UBO declaration has its own slot.
+static MTL::VertexDescriptor* MakeSlangVertexDescriptor(uint32_t bufferIndex) {
+    MTL::VertexDescriptor* vd = MTL::VertexDescriptor::alloc()->init();
+    vd->attributes()->object(0)->setFormat(MTL::VertexFormatFloat4);
+    vd->attributes()->object(0)->setOffset(0);
+    vd->attributes()->object(0)->setBufferIndex(bufferIndex);
+    vd->attributes()->object(1)->setFormat(MTL::VertexFormatFloat2);
+    vd->attributes()->object(1)->setOffset(16);
+    vd->attributes()->object(1)->setBufferIndex(bufferIndex);
+    vd->layouts()->object(bufferIndex)->setStride(24);
+    vd->layouts()->object(bufferIndex)->setStepRate(1);
+    vd->layouts()->object(bufferIndex)->setStepFunction(MTL::VertexStepFunctionPerVertex);
+    return vd;
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsMsl.empty() || src.fsMsl.empty()) {
+        SPDLOG_ERROR("Slang post-process '{}': missing VS or FS MSL", src.name);
+        return -1;
+    }
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* error = nullptr;
+
+    // Slang VS + FS live in separate sources (each was emitted by
+    // SPIRV-Cross from its own SPIR-V module). Compile each into its
+    // own MTL::Library and pull the entry-point function out.
+    auto compileSource = [&](const std::string& msl, const char* fnName,
+                             MTL::Library*& outLib, MTL::Function*& outFn) -> bool {
+        MTL::Library* lib = mDevice->newLibrary(
+            NS::String::string(msl.c_str(), NS::UTF8StringEncoding), nullptr, &error);
+        if (lib == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': MSL compile failed ({}): {}", src.name, fnName,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            return false;
+        }
+        MTL::Function* fn = lib->newFunction(NS::String::string(fnName, NS::UTF8StringEncoding));
+        if (fn == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': MSL missing entry '{}'", src.name, fnName);
+            lib->release();
+            return false;
+        }
+        outLib = lib;
+        outFn = fn;
+        return true;
+    };
+
+    PostProcessSlangProgramMetal slot{};
+    // Both libraries are retained for the slot's lifetime.
+    if (!compileSource(src.vsMsl, "postprocess_vertex", slot.vsLibrary, slot.vsFn)) {
+        pool->release();
+        return -1;
+    }
+    if (!compileSource(src.fsMsl, "postprocess_fragment", slot.fsLibrary, slot.fsFn)) {
+        slot.vsFn->release();
+        slot.vsLibrary->release();
+        pool->release();
+        return -1;
+    }
+
+    MTL::VertexDescriptor* vd = MakeSlangVertexDescriptor(kPostProcessSlangVertexBufferIndex);
+
+    MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+    desc->setVertexFunction(slot.vsFn);
+    desc->setFragmentFunction(slot.fsFn);
+    desc->setVertexDescriptor(vd);
+    desc->colorAttachments()->object(0)->setPixelFormat(
+        mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm);
+    desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+    desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+    desc->setSampleCount(1);
+
+    MTL::RenderPipelineState* pipeline = mDevice->newRenderPipelineState(desc, &error);
+    desc->release();
+    vd->release();
+
+    if (pipeline == nullptr) {
+        SPDLOG_ERROR("Slang post-process '{}': pipeline state failed: {}", src.name,
+                     error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+        slot.vsFn->release();
+        slot.fsFn->release();
+        slot.vsLibrary->release();
+        slot.fsLibrary->release();
+        pool->release();
+        return -1;
+    }
+    slot.pipelineVariants[(int)PostProcessFboFormat::Default] = pipeline;
+    slot.name = src.name;
+    slot.samplerNames = src.samplerNames;
+
+    if (src.uboBytes > 0) {
+        const NS::UInteger uboBytes = (src.uboBytes + 15) & ~15u;
+        slot.ubo = mDevice->newBuffer(uboBytes, MTL::ResourceStorageModeShared);
+        slot.uboBytes = static_cast<uint32_t>(uboBytes);
+    }
+
+    int handle = -1;
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            handle = (int)i;
+            break;
+        }
+    }
+    if (handle < 0) {
+        mPostProcessSlangPrograms.push_back(std::move(slot));
+        handle = (int)mPostProcessSlangPrograms.size() - 1;
+    }
+    pool->release();
+    return handle;
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessSlangPrograms[progId];
+    for (auto*& variant : slot.pipelineVariants) {
+        if (variant != nullptr) {
+            variant->release();
+            variant = nullptr;
+        }
+    }
+    if (slot.vsFn != nullptr) {
+        slot.vsFn->release();
+        slot.vsFn = nullptr;
+    }
+    if (slot.fsFn != nullptr) {
+        slot.fsFn->release();
+        slot.fsFn = nullptr;
+    }
+    if (slot.vsLibrary != nullptr) {
+        slot.vsLibrary->release();
+        slot.vsLibrary = nullptr;
+    }
+    if (slot.fsLibrary != nullptr) {
+        slot.fsLibrary->release();
+        slot.fsLibrary = nullptr;
+    }
+    if (slot.ubo != nullptr) {
+        slot.ubo->release();
+        slot.ubo = nullptr;
+    }
+    slot = PostProcessSlangProgramMetal{};
+}
+
+int GfxRenderingAPIMetal::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                         const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureType2D);
+    desc->setWidth(width);
+    desc->setHeight(height);
+    desc->setSampleCount(1);
+    desc->setMipmapLevelCount(1);
+    desc->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+    desc->setUsage(MTL::TextureUsageShaderRead);
+    MTL::Texture* tex = mDevice->newTexture(desc);
+    desc->release();
+    if (tex == nullptr) {
+        return -1;
+    }
+    MTL::Region region = MTL::Region::Make2D(0, 0, width, height);
+    tex->replaceRegion(region, 0, rgba8, width * 4u);
+
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i] == nullptr) {
+            mPostProcessStaticTextures[i] = tex;
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(tex);
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIMetal::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    MTL::Texture*& slot = mPostProcessStaticTextures[textureId];
+    if (slot != nullptr) {
+        slot->release();
+        slot = nullptr;
+    }
+}
+
+void GfxRenderingAPIMetal::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    mFramebuffers[fb_id].mPostProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIMetal::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& fb = mFramebuffers[fb_id];
+    if (!fb.mPostProcessMipmapped || fb.mTextureId == UINT32_MAX) {
+        return;
+    }
+    MTL::Texture* tex = mTextures[fb.mTextureId].texture;
+    if (tex == nullptr || tex->mipmapLevelCount() <= 1) {
+        return;
+    }
+    // Ensure any pending host encoder on this FB has finished — the
+    // blit pass writes into the texture's mip 1..N and races a still-
+    // live render-target encoder writing mip 0. Each pass's RunPost-
+    // Process is invoked on a host command buffer that already has
+    // its prior encoder ended (the chain runs sequentially), so this
+    // is mostly defensive.
+    if (!fb.mHasEndedEncoding && fb.mCommandEncoder != nullptr) {
+        fb.mCommandEncoder->endEncoding();
+        fb.mHasEndedEncoding = true;
+    }
+    MTL::CommandBuffer* cb = (fb.mCommandBuffer != nullptr) ? fb.mCommandBuffer
+                                                            : mCommandQueue->commandBuffer();
+    MTL::BlitCommandEncoder* enc = cb->blitCommandEncoder();
+    enc->generateMipmaps(tex);
+    enc->endEncoding();
+    if (fb.mCommandBuffer == nullptr) {
+        // We created a one-shot cb because no host cb was attached
+        // (rare; only on the very first pass when the chain runs
+        // before any draw). Commit it so the mip data is live before
+        // the next encoder samples the texture.
+        cb->commit();
+    }
+}
+
+void GfxRenderingAPIMetal::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFramebuffers.size()) {
+        return;
+    }
+    // Record the desired format; UpdateFramebufferParameters notices the
+    // mismatch against mLastPostProcessFormat and reallocates the
+    // underlying MTL::Texture with the new pixel format.
+    mFramebuffers[fb_id].mPostProcessFormat = fmt;
+}
+
+// Phase 3D-3: dispatch a compiled slang program. Mirrors the legacy
+// RunPostProcess but routes vertex data through a bound MTL::Buffer
+// (not [[vertex_id]]) and uploads a chain-built UBO blob to buffer(0)
+// on both stages instead of the fixed PostProcessUniformsMetal struct.
+void GfxRenderingAPIMetal::RunPostProcessSlang(int progId, int dstFb,
+                                                const uint8_t* uboData, uint32_t uboBytes,
+                                                const int* samplerFbIds, uint32_t samplerCount,
+                                                const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    PostProcessSlangProgramMetal& slot = mPostProcessSlangPrograms[progId];
+    if (slot.pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& dst = mFramebuffers[dstFb];
+    if (dst.mRenderPassDescriptor == nullptr) {
+        return;
+    }
+    MTL::Texture* dstTexture =
+        (dst.mTextureId != UINT32_MAX) ? mTextures[dst.mTextureId].texture : nullptr;
+    if (dstTexture == nullptr) {
+        return;
+    }
+
+    // Re-use the legacy host-cb hunt to find a non-screen command
+    // buffer to append our encoder to. The first sampler entry's
+    // source FBO is the most likely owner; otherwise scan drawn FBs.
+    MTL::CommandBuffer* hostCb = nullptr;
+    FramebufferMetal* hostFb = nullptr;
+    int seedFb = (samplerCount > 0 && samplerFbIds != nullptr) ? samplerFbIds[0] : -1;
+    if (seedFb >= 0 && (size_t)seedFb < mFramebuffers.size()) {
+        FramebufferMetal& candidate = mFramebuffers[seedFb];
+        if (candidate.mCommandBuffer != nullptr) {
+            hostCb = candidate.mCommandBuffer;
+            hostFb = &candidate;
+        }
+    }
+    if (hostCb == nullptr) {
+        for (int id : mDrawnFramebuffers) {
+            if (id == 0 || id == dstFb) {
+                continue;
+            }
+            if ((size_t)id >= mFramebuffers.size()) {
+                continue;
+            }
+            FramebufferMetal& candidate = mFramebuffers[id];
+            if (candidate.mCommandBuffer != nullptr) {
+                hostCb = candidate.mCommandBuffer;
+                hostFb = &candidate;
+                break;
+            }
+        }
+    }
+    if (hostCb == nullptr || hostFb == nullptr) {
+        SPDLOG_WARN("Slang post-process: no live non-screen command buffer; skipping pass for '{}'",
+                    slot.name);
+        return;
+    }
+    if (!hostFb->mHasEndedEncoding && hostFb->mCommandEncoder != nullptr) {
+        hostFb->mCommandEncoder->endEncoding();
+        hostFb->mHasEndedEncoding = true;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Build the shared slang VBO once. 3 vertices of {vec4 Position,
+    // vec2 TexCoord} in clip space + [0,2] UVs.
+    if (mPostProcessSlangVbo == nullptr) {
+        static const float kSlangVerts[] = {
+            -1.0f, -1.0f, 0.0f, 1.0f,  0.0f, 0.0f,
+             3.0f, -1.0f, 0.0f, 1.0f,  2.0f, 0.0f,
+            -1.0f,  3.0f, 0.0f, 1.0f,  0.0f, 2.0f,
+        };
+        mPostProcessSlangVbo = mDevice->newBuffer(kSlangVerts, sizeof(kSlangVerts),
+                                                   MTL::ResourceStorageModeShared);
+    }
+
+    MTL::RenderPassColorAttachmentDescriptor* color = dst.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::LoadAction origLoad = color->loadAction();
+    color->setLoadAction(MTL::LoadActionDontCare);
+
+    MTL::RenderCommandEncoder* enc = hostCb->renderCommandEncoder(dst.mRenderPassDescriptor);
+    enc->setLabel(NS::String::string("Slang post-process pass", NS::UTF8StringEncoding));
+
+    MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
+    enc->setViewport(vp);
+
+    // Lazy-build the pipeline variant for the destination's color
+    // format, mirroring the legacy path.
+    const PostProcessFboFormat dstFmt = dst.mPostProcessFormat;
+    MTL::RenderPipelineState* variant = slot.pipelineVariants[(int)dstFmt];
+    if (variant == nullptr) {
+        MTL::PixelFormat mtlFmt = MTL::PixelFormatBGRA8Unorm;
+        switch (dstFmt) {
+            case PostProcessFboFormat::Default:
+                mtlFmt = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+                break;
+            case PostProcessFboFormat::Srgb:
+                mtlFmt = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                mtlFmt = MTL::PixelFormatRGBA16Float;
+                break;
+        }
+        MTL::VertexDescriptor* vd = MakeSlangVertexDescriptor(kPostProcessSlangVertexBufferIndex);
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(slot.vsFn);
+        desc->setFragmentFunction(slot.fsFn);
+        desc->setVertexDescriptor(vd);
+        desc->colorAttachments()->object(0)->setPixelFormat(mtlFmt);
+        desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+        desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+        desc->setSampleCount(1);
+        NS::Error* error = nullptr;
+        variant = mDevice->newRenderPipelineState(desc, &error);
+        desc->release();
+        vd->release();
+        if (variant == nullptr) {
+            SPDLOG_ERROR("Slang post-process '{}': pipeline variant for format {} failed: {}",
+                         slot.name, (int)dstFmt,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            variant = slot.pipelineVariants[(int)PostProcessFboFormat::Default];
+        } else {
+            slot.pipelineVariants[(int)dstFmt] = variant;
+        }
+    }
+    enc->setRenderPipelineState(variant);
+
+    // Sampler binding plan: a single sampler reused at every slot
+    // for Phase 3D-3 scope. Per-slot libretro filter/wrap routing
+    // arrives with multipass slang chains in later phases.
+    auto wrapModeToMetal = [](PostProcessWrapMode m) -> MTL::SamplerAddressMode {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return MTL::SamplerAddressModeClampToEdge;
+            case PostProcessWrapMode::ClampToBorder:  return MTL::SamplerAddressModeClampToBorderColor;
+            case PostProcessWrapMode::Repeat:         return MTL::SamplerAddressModeRepeat;
+            case PostProcessWrapMode::MirroredRepeat: return MTL::SamplerAddressModeMirrorRepeat;
+        }
+        return MTL::SamplerAddressModeClampToEdge;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap) -> MTL::SamplerState* {
+        const uint32_t key =
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second;
+        }
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        const MTL::SamplerMinMagFilter f =
+            linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+        sd->setMinFilter(f);
+        sd->setMagFilter(f);
+        sd->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        const MTL::SamplerAddressMode addr = wrapModeToMetal(wrap);
+        sd->setSAddressMode(addr);
+        sd->setTAddressMode(addr);
+        if (wrap == PostProcessWrapMode::ClampToBorder) {
+            sd->setBorderColor(MTL::SamplerBorderColorTransparentBlack);
+        }
+        MTL::SamplerState* sampler = mDevice->newSamplerState(sd);
+        sd->release();
+        mPostProcessSamplers.emplace(key, sampler);
+        return sampler;
+    };
+    MTL::SamplerState* sampler = getSampler(params.srcFilterLinear, params.srcWrapMode);
+
+    // Bind samplerFbIds[i]'s texture at slot i. Fallback to the
+    // first valid texture if any entry is -1 so the shader's
+    // sample() calls don't read undefined memory.
+    MTL::Texture* fallbackTex = nullptr;
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        if (fbId >= 0 && (size_t)fbId < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[fbId];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    fallbackTex = t;
+                    break;
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        MTL::Texture* tex = fallbackTex;
+        if (fbId >= 0 && (size_t)fbId < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[fbId];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    tex = t;
+                }
+            }
+        }
+        if (tex != nullptr) {
+            enc->setFragmentTexture(tex, (NS::UInteger)i);
+            enc->setFragmentSamplerState(sampler, (NS::UInteger)i);
+        }
+    }
+
+    // UBO upload — bind to buffer(0) on both stages so the
+    // SPIRV-Cross-emitted `constant UBO& global [[buffer(0)]]`
+    // declaration finds it. Use setVertexBytes / setFragmentBytes
+    // (inline) for small blobs; spill to a persistent buffer for
+    // larger ones. Slang shaders rarely exceed 4KB so the inline
+    // path covers almost everything.
+    if (uboData != nullptr && uboBytes > 0) {
+        constexpr uint32_t kSetBytesThreshold = 4096;
+        if (uboBytes <= kSetBytesThreshold) {
+            enc->setVertexBytes(uboData, uboBytes, 0);
+            enc->setFragmentBytes(uboData, uboBytes, 0);
+        } else if (slot.ubo != nullptr) {
+            // Refill the per-program persistent buffer.
+            std::memcpy(slot.ubo->contents(), uboData,
+                        std::min<uint32_t>(uboBytes, slot.uboBytes));
+            slot.ubo->didModifyRange(NS::Range::Make(0, slot.uboBytes));
+            enc->setVertexBuffer(slot.ubo, 0, 0);
+            enc->setFragmentBuffer(slot.ubo, 0, 0);
+        }
+    }
+
+    // Bind the slang vertex buffer at the high index the descriptor
+    // routes attributes through.
+    enc->setVertexBuffer(mPostProcessSlangVbo, 0, kPostProcessSlangVertexBufferIndex);
+
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
+    enc->endEncoding();
+
+    color->setLoadAction(origLoad);
+
+    pool->release();
+}
+
+void GfxRenderingAPIMetal::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                          const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    PostProcessProgramMetal& slot = mPostProcessPrograms[progId];
+    if (slot.pipelineVariants[(int)PostProcessFboFormat::Default] == nullptr) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFramebuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFramebuffers.size()) {
+        return;
+    }
+    FramebufferMetal& src = mFramebuffers[srcFb];
+    FramebufferMetal& dst = mFramebuffers[dstFb];
+    if (dst.mRenderPassDescriptor == nullptr) {
+        return;
+    }
+    MTL::Texture* srcTexture = mTextures[src.mTextureId].texture;
+    MTL::Texture* dstTexture = mTextures[dst.mTextureId].texture;
+    if (srcTexture == nullptr || dstTexture == nullptr) {
+        return;
+    }
+
+    // Find a host command buffer to append our render encoder to. The cb
+    // must already be enqueued ahead of FB 0's GUI cb to satisfy the
+    // GPU-side read-after-write ordering described above.
+    MTL::CommandBuffer* hostCb = nullptr;
+    FramebufferMetal* hostFb = nullptr;
+    if (src.mCommandBuffer != nullptr) {
+        hostCb = src.mCommandBuffer;
+        hostFb = &src;
+    } else {
+        for (int id : mDrawnFramebuffers) {
+            if (id == 0 || id == dstFb) {
+                continue;
+            }
+            if ((size_t)id >= mFramebuffers.size()) {
+                continue;
+            }
+            FramebufferMetal& candidate = mFramebuffers[id];
+            if (candidate.mCommandBuffer != nullptr) {
+                hostCb = candidate.mCommandBuffer;
+                hostFb = &candidate;
+                break;
+            }
+        }
+    }
+    if (hostCb == nullptr || hostFb == nullptr) {
+        SPDLOG_WARN("Post-process: no live non-screen command buffer; skipping pass for '{}'", slot.name);
+        return;
+    }
+    if (!hostFb->mHasEndedEncoding && hostFb->mCommandEncoder != nullptr) {
+        hostFb->mCommandEncoder->endEncoding();
+        hostFb->mHasEndedEncoding = true;
+    }
+
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
+    // Temporarily switch the destination's load action to DontCare — the
+    // fullscreen triangle writes every pixel, so a load is wasted bandwidth.
+    // Restore after the encoder so any later use of the descriptor (resize
+    // path) keeps the default Load semantics it was set up with.
+    MTL::RenderPassColorAttachmentDescriptor* color = dst.mRenderPassDescriptor->colorAttachments()->object(0);
+    MTL::LoadAction origLoad = color->loadAction();
+    color->setLoadAction(MTL::LoadActionDontCare);
+
+    MTL::RenderCommandEncoder* enc = hostCb->renderCommandEncoder(dst.mRenderPassDescriptor);
+    enc->setLabel(NS::String::string("Post-process pass", NS::UTF8StringEncoding));
+
+    MTL::Viewport vp = { 0.0, 0.0, (double)dstTexture->width(), (double)dstTexture->height(), 0.0, 1.0 };
+    enc->setViewport(vp);
+
+    // Metal pins the color-attachment format into the pipeline state, so
+    // we need a separate pipeline variant per (program, dst format).
+    // Look up / lazily build the variant matching dst's current format.
+    const PostProcessFboFormat dstFmt = dst.mPostProcessFormat;
+    MTL::RenderPipelineState* variant = slot.pipelineVariants[(int)dstFmt];
+    if (variant == nullptr) {
+        MTL::PixelFormat mtlFmt = MTL::PixelFormatBGRA8Unorm;
+        switch (dstFmt) {
+            case PostProcessFboFormat::Default:
+                mtlFmt = mSrgbMode ? MTL::PixelFormatBGRA8Unorm_sRGB : MTL::PixelFormatBGRA8Unorm;
+                break;
+            case PostProcessFboFormat::Srgb:
+                // Intermediate FBOs use BGRA8Unorm_sRGB to match the
+                // surrounding allocation in UpdateFramebufferParameters.
+                mtlFmt = MTL::PixelFormatBGRA8Unorm_sRGB;
+                break;
+            case PostProcessFboFormat::Float16:
+                mtlFmt = MTL::PixelFormatRGBA16Float;
+                break;
+        }
+        MTL::RenderPipelineDescriptor* desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(slot.vsFn);
+        desc->setFragmentFunction(slot.fsFn);
+        desc->colorAttachments()->object(0)->setPixelFormat(mtlFmt);
+        desc->colorAttachments()->object(0)->setBlendingEnabled(false);
+        desc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+        desc->setSampleCount(1);
+        NS::Error* error = nullptr;
+        variant = mDevice->newRenderPipelineState(desc, &error);
+        desc->release();
+        if (variant == nullptr) {
+            SPDLOG_ERROR("Post-process '{}': pipeline variant for format {} failed: {}",
+                         slot.name, (int)dstFmt,
+                         error ? error->localizedDescription()->cString(NS::UTF8StringEncoding) : "unknown");
+            // Fall back to the Default variant so we at least render
+            // something rather than a black frame.
+            variant = slot.pipelineVariants[(int)PostProcessFboFormat::Default];
+        } else {
+            slot.pipelineVariants[(int)dstFmt] = variant;
+        }
+    }
+    enc->setRenderPipelineState(variant);
+
+    // Slot 0 (Source) sampler comes from the producer pass's libretro
+    // filter_linearN / wrap_modeN, encoded as a small cache key. Slot 1
+    // (Original) always uses the default linear / clamp-to-edge sampler
+    // because .glslp has no per-pass override for Original.
+    auto wrapModeToMetal = [](PostProcessWrapMode m) -> MTL::SamplerAddressMode {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return MTL::SamplerAddressModeClampToEdge;
+            case PostProcessWrapMode::ClampToBorder:  return MTL::SamplerAddressModeClampToBorderColor;
+            case PostProcessWrapMode::Repeat:         return MTL::SamplerAddressModeRepeat;
+            case PostProcessWrapMode::MirroredRepeat: return MTL::SamplerAddressModeMirrorRepeat;
+        }
+        return MTL::SamplerAddressModeClampToEdge;
+    };
+    auto getSampler = [&](bool linear, PostProcessWrapMode wrap, bool mipmap) -> MTL::SamplerState* {
+        // Cache key folds the (linear, wrap, mipmap) tuple into a small
+        // int. Mipmap occupies a single bit above the existing
+        // (wrap << 1 | linear) layout so the prior keys keep working.
+        const uint32_t key =
+            (mipmap ? (1u << 8) : 0u) |
+            (static_cast<uint32_t>(wrap) << 1) | (linear ? 1u : 0u);
+        auto it = mPostProcessSamplers.find(key);
+        if (it != mPostProcessSamplers.end()) {
+            return it->second;
+        }
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        const MTL::SamplerMinMagFilter f =
+            linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+        sd->setMinFilter(f);
+        sd->setMagFilter(f);
+        if (mipmap) {
+            sd->setMipFilter(linear ? MTL::SamplerMipFilterLinear
+                                    : MTL::SamplerMipFilterNearest);
+        } else {
+            sd->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        }
+        const MTL::SamplerAddressMode addr = wrapModeToMetal(wrap);
+        sd->setSAddressMode(addr);
+        sd->setTAddressMode(addr);
+        if (wrap == PostProcessWrapMode::ClampToBorder) {
+            sd->setBorderColor(MTL::SamplerBorderColorTransparentBlack);
+        }
+        MTL::SamplerState* sampler = mDevice->newSamplerState(sd);
+        sd->release();
+        mPostProcessSamplers.emplace(key, sampler);
+        return sampler;
+    };
+    MTL::SamplerState* srcSampler =
+        getSampler(params.srcFilterLinear, params.srcWrapMode, params.srcUseMipmap);
+    MTL::SamplerState* origSampler = getSampler(true, PostProcessWrapMode::ClampToEdge, false);
+
+    enc->setFragmentTexture(srcTexture, 0);
+    enc->setFragmentSamplerState(srcSampler, 0);
+
+    // Original (game FB) on slot 1 for multipass shaders that combine
+    // post-bloom Source with the pre-bloom Original. Falls back to the
+    // source texture for pass 0 — caller passes srcFb == originalFb.
+    MTL::Texture* originalTexture = srcTexture;
+    if (originalFb >= 0 && (size_t)originalFb < mFramebuffers.size()) {
+        FramebufferMetal& origFbInfo = mFramebuffers[originalFb];
+        if (origFbInfo.mTextureId != UINT32_MAX) {
+            MTL::Texture* t = mTextures[origFbInfo.mTextureId].texture;
+            if (t != nullptr) {
+                originalTexture = t;
+            }
+        }
+    }
+    enc->setFragmentTexture(originalTexture, 1);
+    enc->setFragmentSamplerState(origSampler, 1);
+
+    // Alias / external-texture bindings at slots 2..N+1. Each entry's
+    // sampler comes from the per-pass (filter, wrap) cache. sourceFb
+    // == -1 (producer pass hasn't run yet in this chain pass index)
+    // falls back to the Original texture so the shader's texture()
+    // call reads a sensible value rather than the stale slot.
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        MTL::Texture* texToBind = originalTexture; // defensive fallback
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size() &&
+            mPostProcessStaticTextures[eb.staticTextureId] != nullptr) {
+            texToBind = mPostProcessStaticTextures[eb.staticTextureId];
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFramebuffers.size()) {
+            const FramebufferMetal& f = mFramebuffers[eb.sourceFb];
+            if (f.mTextureId != UINT32_MAX) {
+                MTL::Texture* t = mTextures[f.mTextureId].texture;
+                if (t != nullptr) {
+                    texToBind = t;
+                }
+            }
+        }
+        const NS::UInteger slot = (NS::UInteger)(2 + i);
+        enc->setFragmentTexture(texToBind, slot);
+        MTL::SamplerState* s = getSampler(eb.filterLinear, eb.wrapMode, false);
+        enc->setFragmentSamplerState(s, slot);
+    }
+
+    // Pack the per-frame uniforms followed by the per-pass alias /
+    // external-texture `vec2 <name>Size` slots. The shader's MSL
+    // `PostProcessUniforms` struct (transpiled by SPIRV-Cross from
+    // the GLSL UBO block) lays the trailing vec2s at offsets
+    // 40, 48, 56, ... matching std140; we push exactly those bytes
+    // into Metal's argument buffer via setFragmentBytes. Total size
+    // is padded to a multiple of 16 to match the D3D11 cbuffer rule
+    // — Metal accepts any size, but the alignment keeps the layout
+    // identical across backends.
+    constexpr size_t kPrefixBytes = sizeof(PostProcessUniformsMetal);
+    static_assert(kPrefixBytes == 40, "PostProcessUniformsMetal must stay 40 bytes");
+    constexpr size_t kAliasStrideBytes = sizeof(simd::float2);
+    static_assert(kAliasStrideBytes == 8, "simd::float2 must be 8 bytes for the alias UBO tail");
+    const size_t aliasBytes = params.extraBindingsCount * kAliasStrideBytes;
+    const size_t totalBytes = (kPrefixBytes + aliasBytes + 15) & ~15u;
+
+    std::vector<uint8_t> uboBytes(totalBytes, 0);
+    PostProcessUniformsMetal* uni = reinterpret_cast<PostProcessUniformsMetal*>(uboBytes.data());
+    uni->sourceSize = simd::float2{ (float)params.srcWidth, (float)params.srcHeight };
+    uni->outputSize = simd::float2{ (float)params.dstWidth, (float)params.dstHeight };
+    uni->inputSize = simd::float2{ (float)params.inputWidth, (float)params.inputHeight };
+    uni->originalSize = simd::float2{ (float)params.originalWidth, (float)params.originalHeight };
+    uni->frameCount = (int)params.frameCount;
+    uni->frameDirection = 1.0f;
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        simd::float2* slotPtr = reinterpret_cast<simd::float2*>(
+            uboBytes.data() + kPrefixBytes + i * kAliasStrideBytes);
+        *slotPtr = simd::float2{ (float)eb.width, (float)eb.height };
+    }
+    enc->setFragmentBytes(uboBytes.data(), totalBytes, 0);
+
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, (NS::UInteger)0, (NS::UInteger)3);
+    enc->endEncoding();
+
+    color->setLoadAction(origLoad);
+
+    pool->release();
+}
+
 } // namespace Fast
 
 bool Metal_IsSupported() {

@@ -1,6 +1,8 @@
 #ifdef ENABLE_OPENGL
 #pragma once
 
+#include <string>
+
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -47,6 +49,85 @@ struct FramebufferOGL {
     bool invertY;
 
     GLuint fbo, clrbuf, clrbufMsaa, rbo;
+
+    // Post-process intermediate FBOs override the default RGB8 color
+    // format. `last` tracks the format the texture is currently
+    // allocated with so UpdateFramebufferParameters can force a
+    // re-allocation when the chain switches a slot's format. Both
+    // default to Default for non-post-process FBOs and the chain's
+    // mDstFb (which always carries the regular RGBA8 LDR contract).
+    PostProcessFboFormat postProcessFormat = PostProcessFboFormat::Default;
+    PostProcessFboFormat lastPostProcessFormat = PostProcessFboFormat::Default;
+    // Phase 2.2: chain marks this FBO as needing a mip chain for
+    // downstream mipmap_input passes. OpenGL textures created with
+    // glTexImage2D are mutable and glGenerateMipmap auto-allocates
+    // the chain on first call, so this flag is mostly informational
+    // for GL; it gates the LINEAR_MIPMAP_LINEAR sampler pick.
+    bool postProcessMipmapped = false;
+};
+
+// Post-process fragment program + its standard-uniform locations. The
+// runtime emits a fixed vertex shader (NDC fullscreen triangle) so only
+// the FS source is user-controlled.
+struct PostProcessProgramOGL {
+    GLuint program = 0;
+    GLint sourceLocation = -1;
+    GLint sourceSizeLocation = -1;
+    GLint outputSizeLocation = -1;
+    GLint inputSizeLocation = -1;
+    GLint originalLocation = -1;     // sampler2D Original (game FB, slot 1)
+    GLint originalSizeLocation = -1; // vec2 OriginalSize
+    GLint frameCountLocation = -1;
+    GLint frameDirectionLocation = -1;
+    // Per-alias `uniform sampler2D <name>` locations. Index i in this
+    // vector is the alias bound at texture slot (2 + i) — matches
+    // PostProcessSource::aliasNames and the chain's extraBindings
+    // ordering. Locations may be -1 (driver optimised the uniform out
+    // because the shader doesn't sample it); the binding loop skips
+    // those.
+    std::vector<GLint> aliasLocations;
+    // Per-alias `uniform vec2 <name>Size` locations, same indexing as
+    // aliasLocations. Populated from PostProcessExtraBinding::
+    // {width,height} each frame so multipass shaders that read filtered
+    // sampler dimensions (libretro `<alias>Size`) see real values.
+    // -1 if the driver optimised the uniform out.
+    std::vector<GLint> aliasSizeLocations;
+    std::string name;
+};
+
+// Phase 3D-1: compiled slang program slot. Distinct from the legacy
+// PostProcessProgramOGL because:
+//   - The vertex stage is authored by the shader (compiled at runtime
+//     rather than referencing the stock fullscreen-triangle stub).
+//   - Per-frame uniforms ride on a UBO of arbitrary declared layout,
+//     not the loose-uniform LUS schema, so we hold a UBO id and its
+//     byte size rather than per-member GLint locations.
+//   - Sampler texture units are bound by name at link time (one
+//     glUniform1i call per sampler) so the run path only needs to
+//     glActiveTexture + glBindTexture per slot.
+//
+// Phase 3D-1 fills the program + ubo + sampler bookkeeping; the Run
+// path (Phase 3D-2) consumes them. Until 3D-2 lands, a slot built
+// here is dormant — it stays in memory until Unload destroys it.
+struct PostProcessSlangProgramOGL {
+    GLuint program = 0;
+    std::string name;
+    // Per-program UBO buffer + size. Allocated in
+    // CreatePostProcessSlangProgram; bound at the program's
+    // GL_UNIFORM_BUFFER binding point during Run.
+    GLuint ubo = 0;
+    uint32_t uboBytes = 0;
+    // Binding point assigned to this program's UBO (matches the
+    // shader's `layout(std140) uniform UBO { ... }` after the
+    // explicit glUniformBlockBinding done at link time). Always 0
+    // for now since each slang program owns its own UBO; deferred
+    // multi-block layouts will widen this.
+    GLuint uboBindingPoint = 0;
+    // Names of samplers in slot order (slot 0..N-1). glUniform1i was
+    // called for each at link time so the FS texture(N) calls already
+    // point at the right unit; the run path just binds textures to
+    // GL_TEXTURE0+i without further uniform pokes.
+    std::vector<std::string> samplerNames;
 };
 
 struct TextureInfo {
@@ -82,6 +163,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void EndFrame() override;
     void FinishRender() override;
     int CreateFramebuffer() override;
+    void DestroyFramebuffer(int fbId) override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                      bool can_extract_depth) override;
@@ -102,10 +184,31 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
 
+    bool SupportsPostProcess() override;
+    int CreatePostProcessProgram(const PostProcessSource& src) override;
+    void DestroyPostProcessProgram(int progId) override;
+    void RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                        const PostProcessParams& params) override;
+    void SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) override;
+    void SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) override;
+    void GeneratePostProcessMipmaps(int fb_id) override;
+    int CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                       const uint8_t* rgba8) override;
+    void DestroyPostProcessStaticTexture(int textureId) override;
+    int CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) override;
+    void DestroyPostProcessSlangProgram(int progId) override;
+    void RunPostProcessSlang(int progId, int dstFb,
+                             const uint8_t* uboData, uint32_t uboBytes,
+                             const int* samplerFbIds, uint32_t samplerCount,
+                             const PostProcessParams& params) override;
+
   private:
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+    GLuint CompilePostProcessProgram(const std::string& fsSource, std::string& errOut);
+    GLuint EnsurePostProcessVao();
+    GLuint EnsurePostProcessSlangVao();
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES];
@@ -135,6 +238,30 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    std::vector<PostProcessProgramOGL> mPostProcessPrograms;
+    GLuint mPostProcessVao = 0;
+    GLuint mPostProcessVbo = 0;
+
+    // Phase 3D-1: compiled slang programs. Handles returned by
+    // CreatePostProcessSlangProgram are vector indices into this
+    // table; empty slots (program == 0) are reused. Lives alongside
+    // the legacy mPostProcessPrograms — neither table interferes with
+    // the other and the chain decides which Create function to call.
+    std::vector<PostProcessSlangProgramOGL> mPostProcessSlangPrograms;
+    // Phase 3D-2: slang VAO/VBO. Layout is {vec4 Position, vec2
+    // TexCoord} interleaved — slang vertex stages declare both
+    // attributes at location 0 / location 1, unlike the LUS-schema
+    // VS which only takes a 2D position. Created once on first
+    // RunPostProcessSlang and reused for every slang draw.
+    GLuint mPostProcessSlangVao = 0;
+    GLuint mPostProcessSlangVbo = 0;
+
+    // Static GL texture objects for libretro `.glslp` external
+    // `textures = "..."` entries. The vector index returned by
+    // CreatePostProcessStaticTexture round-trips through the chain;
+    // empty slots (texture == 0) are reused.
+    std::vector<GLuint> mPostProcessStaticTextures;
 };
 
 } // namespace Fast

@@ -11,6 +11,13 @@ file(GLOB Source_Files__Debug RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "debug/*.cpp"
 source_group("debug" FILES ${Source_Files__Debug})
 target_sources(libultraship PRIVATE ${Source_Files__Debug})
 
+#=================== Postprocess ===================
+
+file(GLOB Source_Files__Postprocess RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "postprocess/*.cpp")
+
+source_group("postprocess" FILES ${Source_Files__Postprocess})
+target_sources(libultraship PRIVATE ${Source_Files__Postprocess})
+
 #=================== Resource ===================
 
 file(GLOB Source_Files__Resource__Types RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "resource/type/*.h" "resource/type/*.cpp")

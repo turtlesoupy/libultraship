@@ -786,6 +786,43 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     return i;
 }
 
+void GfxRenderingAPIOGL::DestroyFramebuffer(int fbId) {
+    if (fbId < 0 || (size_t)fbId >= mFrameBuffers.size()) {
+        return;
+    }
+    FramebufferOGL& fb = mFrameBuffers[fbId];
+    if (fb.fbo == 0 && fb.clrbuf == 0 && fb.clrbufMsaa == 0 && fb.rbo == 0) {
+        return; // Already destroyed.
+    }
+    if (fb.fbo != 0) {
+        glDeleteFramebuffers(1, &fb.fbo);
+    }
+    if (fb.clrbuf != 0) {
+        glDeleteTextures(1, &fb.clrbuf);
+        // Drop the matching entry in our textures table; SelectTextureFb
+        // never references this id again because the chain releases the
+        // FBO before it could be sampled.
+        if ((size_t)fb.clrbuf < textures.size()) {
+            textures[fb.clrbuf].width = 0;
+            textures[fb.clrbuf].height = 0;
+        }
+    }
+    if (fb.clrbufMsaa != 0) {
+        glDeleteRenderbuffers(1, &fb.clrbufMsaa);
+    }
+    if (fb.rbo != 0) {
+        glDeleteRenderbuffers(1, &fb.rbo);
+    }
+    fb.fbo = 0;
+    fb.clrbuf = 0;
+    fb.clrbufMsaa = 0;
+    fb.rbo = 0;
+    fb.width = 0;
+    fb.height = 0;
+    fb.has_depth_buffer = false;
+    fb.msaa_level = 0;
+}
+
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                      bool can_extract_depth) {
@@ -798,18 +835,43 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
     if (fb_id != 0) {
-        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
+        // Post-process intermediates may have switched format (sRGB or
+        // float). When that happens the color attachment must be
+        // reallocated even if size/msaa are unchanged.
+        const bool formatChanged = (fb.postProcessFormat != fb.lastPostProcessFormat);
+        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || formatChanged) {
+            GLenum internalFmt = GL_RGB8;
+            GLenum srcFmt = GL_RGB;
+            GLenum srcType = GL_UNSIGNED_BYTE;
+            switch (fb.postProcessFormat) {
+                case PostProcessFboFormat::Default:
+                    internalFmt = GL_RGB8;
+                    srcFmt = GL_RGB;
+                    srcType = GL_UNSIGNED_BYTE;
+                    break;
+                case PostProcessFboFormat::Srgb:
+                    internalFmt = GL_SRGB8_ALPHA8;
+                    srcFmt = GL_RGBA;
+                    srcType = GL_UNSIGNED_BYTE;
+                    break;
+                case PostProcessFboFormat::Float16:
+                    internalFmt = GL_RGBA16F;
+                    srcFmt = GL_RGBA;
+                    srcType = GL_HALF_FLOAT;
+                    break;
+            }
             if (msaa_level <= 1) {
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                glTexImage2D(GL_TEXTURE_2D, 0, internalFmt, width, height, 0, srcFmt, srcType, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, internalFmt, width, height);
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
             }
+            fb.lastPostProcessFormat = fb.postProcessFormat;
         }
 
         if (has_depth_buffer &&
@@ -892,6 +954,740 @@ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sour
 
 void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
     return (void*)(uintptr_t)mFrameBuffers[fb_id].clrbuf;
+}
+
+// --- Post-process / user-shader pipeline ----------------------------------
+//
+// Implemented from the plan in docs/crt_shader_plan_2026-05-11.md §7.1.
+// No code copied from RetroArch or any GPL-licensed shader runtime.
+
+static const char kPostProcessVertexShader[] =
+    "#version 330 core\n"
+    "in vec2 aPos;\n"
+    "out vec2 vTexCoord;\n"
+    "uniform int FlipY;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "    vec2 uv = aPos * 0.5 + 0.5;\n"
+    "    if (FlipY != 0) uv.y = 1.0 - uv.y;\n"
+    "    vTexCoord = uv;\n"
+    "}\n";
+
+bool GfxRenderingAPIOGL::SupportsPostProcess() {
+    return true;
+}
+
+GLuint GfxRenderingAPIOGL::CompilePostProcessProgram(const std::string& fsSource, std::string& errOut) {
+    auto compile = [&](GLenum type, const char* src) -> GLuint {
+        GLuint sh = glCreateShader(type);
+        glShaderSource(sh, 1, &src, nullptr);
+        glCompileShader(sh);
+        GLint ok = GL_FALSE;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            GLint len = 0;
+            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+            std::string log(std::max(len, 1) - 1, '\0');
+            if (len > 0) {
+                glGetShaderInfoLog(sh, len, nullptr, log.data());
+            }
+            errOut = std::move(log);
+            glDeleteShader(sh);
+            return 0;
+        }
+        return sh;
+    };
+    GLuint vs = compile(GL_VERTEX_SHADER, kPostProcessVertexShader);
+    if (vs == 0) {
+        return 0;
+    }
+    GLuint fs = compile(GL_FRAGMENT_SHADER, fsSource.c_str());
+    if (fs == 0) {
+        glDeleteShader(vs);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    // Tie the only vertex attribute to slot 0; the FS doesn't have any so
+    // there is no fragment-output binding to worry about (single FS
+    // output is assumed at location 0).
+    glBindAttribLocation(prog, 0, "aPos");
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        std::string log(std::max(len, 1) - 1, '\0');
+        if (len > 0) {
+            glGetProgramInfoLog(prog, len, nullptr, log.data());
+        }
+        errOut = std::move(log);
+        glDeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
+int GfxRenderingAPIOGL::CreatePostProcessProgram(const PostProcessSource& src) {
+    if (src.glsl.empty()) {
+        SPDLOG_ERROR("Post-process shader '{}' has no GLSL source", src.name);
+        return -1;
+    }
+    std::string err;
+    GLuint prog = CompilePostProcessProgram(src.glsl, err);
+    if (prog == 0) {
+        SPDLOG_ERROR("Post-process shader '{}' failed to compile/link: {}", src.name, err);
+        return -1;
+    }
+
+    PostProcessProgramOGL slot{};
+    slot.program = prog;
+    slot.name = src.name;
+    slot.sourceLocation = glGetUniformLocation(prog, "Source");
+    slot.sourceSizeLocation = glGetUniformLocation(prog, "SourceSize");
+    slot.outputSizeLocation = glGetUniformLocation(prog, "OutputSize");
+    slot.inputSizeLocation = glGetUniformLocation(prog, "InputSize");
+    slot.originalLocation = glGetUniformLocation(prog, "Original");
+    slot.originalSizeLocation = glGetUniformLocation(prog, "OriginalSize");
+    slot.frameCountLocation = glGetUniformLocation(prog, "FrameCount");
+    slot.frameDirectionLocation = glGetUniformLocation(prog, "FrameDirection");
+    slot.aliasLocations.reserve(src.aliasNames.size());
+    slot.aliasSizeLocations.reserve(src.aliasNames.size());
+    for (const std::string& alias : src.aliasNames) {
+        slot.aliasLocations.push_back(glGetUniformLocation(prog, alias.c_str()));
+        const std::string sizeName = alias + "Size";
+        slot.aliasSizeLocations.push_back(glGetUniformLocation(prog, sizeName.c_str()));
+    }
+
+    for (size_t i = 0; i < mPostProcessPrograms.size(); ++i) {
+        if (mPostProcessPrograms[i].program == 0) {
+            mPostProcessPrograms[i] = std::move(slot);
+            return (int)i;
+        }
+    }
+    mPostProcessPrograms.push_back(std::move(slot));
+    return (int)(mPostProcessPrograms.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessPrograms[progId];
+    if (slot.program != 0) {
+        glDeleteProgram(slot.program);
+        slot = PostProcessProgramOGL{};
+    }
+}
+
+// Phase 3D-1: compile a slang program (authored VS + FS) and pre-
+// allocate its UBO. Sampler texture units are pinned at link time via
+// glUniform1i so the run path (Phase 3D-2) only needs to bind
+// textures, not re-poke uniform values. The legacy LUS-schema path
+// (CreatePostProcessProgram) is untouched.
+int GfxRenderingAPIOGL::CreatePostProcessSlangProgram(const PostProcessSlangProgramSource& src) {
+    if (src.vsGlsl.empty() || src.fsGlsl.empty()) {
+        SPDLOG_ERROR("Slang post-process shader '{}' missing VS or FS GLSL", src.name);
+        return -1;
+    }
+
+    auto compile = [&](GLenum type, const char* source) -> GLuint {
+        GLuint sh = glCreateShader(type);
+        glShaderSource(sh, 1, &source, nullptr);
+        glCompileShader(sh);
+        GLint ok = GL_FALSE;
+        glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            GLint len = 0;
+            glGetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+            std::string log(std::max(len, 1) - 1, '\0');
+            if (len > 0) {
+                glGetShaderInfoLog(sh, len, nullptr, log.data());
+            }
+            SPDLOG_ERROR("Slang post-process shader '{}' {} compile failed: {}",
+                         src.name,
+                         (type == GL_VERTEX_SHADER) ? "vertex" : "fragment",
+                         log);
+            glDeleteShader(sh);
+            return 0;
+        }
+        return sh;
+    };
+
+    GLuint vs = compile(GL_VERTEX_SHADER, src.vsGlsl.c_str());
+    if (vs == 0) {
+        return -1;
+    }
+    GLuint fs = compile(GL_FRAGMENT_SHADER, src.fsGlsl.c_str());
+    if (fs == 0) {
+        glDeleteShader(vs);
+        return -1;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    // Slang vertex stages declare attributes via `layout(location=N)
+    // in ...;` so we let GLSL's explicit-attrib-location handling
+    // bind them; no glBindAttribLocation needed.
+    glLinkProgram(prog);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLint len = 0;
+        glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+        std::string log(std::max(len, 1) - 1, '\0');
+        if (len > 0) {
+            glGetProgramInfoLog(prog, len, nullptr, log.data());
+        }
+        SPDLOG_ERROR("Slang post-process shader '{}' link failed: {}", src.name, log);
+        glDeleteProgram(prog);
+        return -1;
+    }
+
+    // Pin each sampler uniform to texture unit i in declaration order.
+    // The slang shader's GLSL declarations had their binding= and
+    // descriptor-set= decorations stripped during transpile, so unit
+    // assignment lives at the program level (here) and the Run path
+    // only needs glActiveTexture(GL_TEXTURE0 + i) + glBindTexture.
+    glUseProgram(prog);
+    for (size_t i = 0; i < src.samplerNames.size(); ++i) {
+        const GLint loc = glGetUniformLocation(prog, src.samplerNames[i].c_str());
+        if (loc >= 0) {
+            glUniform1i(loc, static_cast<GLint>(i));
+        }
+        // Missing samplers (loc == -1) are fine — the driver optimised
+        // the binding out because the shader never sampled it. The run
+        // path can still bind a texture at the unit; it's just unused.
+    }
+    glUseProgram(0);
+
+    // Bind the UBO (named "UBO" by slang convention) to binding point 0
+    // on this program and allocate a dedicated buffer of the declared
+    // size. The Run path memcpys frame data here and reuses the same
+    // glBuffer every frame.
+    const GLuint uboBindingPoint = 0;
+    GLuint ubo = 0;
+    if (src.uboBytes > 0) {
+        const GLuint blockIdx = glGetUniformBlockIndex(prog, "UBO");
+        if (blockIdx != GL_INVALID_INDEX) {
+            glUniformBlockBinding(prog, blockIdx, uboBindingPoint);
+        }
+        glGenBuffers(1, &ubo);
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(src.uboBytes),
+                     nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+    }
+
+    PostProcessSlangProgramOGL slot{};
+    slot.program = prog;
+    slot.name = src.name;
+    slot.ubo = ubo;
+    slot.uboBytes = src.uboBytes;
+    slot.uboBindingPoint = uboBindingPoint;
+    slot.samplerNames = src.samplerNames;
+
+    for (size_t i = 0; i < mPostProcessSlangPrograms.size(); ++i) {
+        if (mPostProcessSlangPrograms[i].program == 0) {
+            mPostProcessSlangPrograms[i] = std::move(slot);
+            return static_cast<int>(i);
+        }
+    }
+    mPostProcessSlangPrograms.push_back(std::move(slot));
+    return static_cast<int>(mPostProcessSlangPrograms.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessSlangProgram(int progId) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    auto& slot = mPostProcessSlangPrograms[progId];
+    if (slot.program != 0) {
+        glDeleteProgram(slot.program);
+    }
+    if (slot.ubo != 0) {
+        glDeleteBuffers(1, &slot.ubo);
+    }
+    slot = PostProcessSlangProgramOGL{};
+}
+
+GLuint GfxRenderingAPIOGL::EnsurePostProcessSlangVao() {
+    if (mPostProcessSlangVao != 0 && mPostProcessSlangVbo != 0) {
+        return mPostProcessSlangVao;
+    }
+    // Fullscreen triangle for slang: vec4 Position (clip space) +
+    // vec2 TexCoord (covers [0,1] after the rasterizer interpolates).
+    // The slang VS multiplies Position by an identity MVP (provided
+    // by the chain), so the vertices land in clip space directly.
+    static const GLfloat kSlangVerts[] = {
+        // Position (xyzw)            // TexCoord (uv)
+        -1.0f, -1.0f, 0.0f, 1.0f,     0.0f, 0.0f,
+         3.0f, -1.0f, 0.0f, 1.0f,     2.0f, 0.0f,
+        -1.0f,  3.0f, 0.0f, 1.0f,     0.0f, 2.0f,
+    };
+    glGenVertexArrays(1, &mPostProcessSlangVao);
+    glBindVertexArray(mPostProcessSlangVao);
+    glGenBuffers(1, &mPostProcessSlangVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessSlangVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kSlangVerts), kSlangVerts, GL_STATIC_DRAW);
+    // location 0 = vec4 Position.
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
+                          reinterpret_cast<void*>(0));
+    // location 1 = vec2 TexCoord.
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(GLfloat),
+                          reinterpret_cast<void*>(4 * sizeof(GLfloat)));
+    return mPostProcessSlangVao;
+}
+
+void GfxRenderingAPIOGL::RunPostProcessSlang(int progId, int dstFb,
+                                             const uint8_t* uboData, uint32_t uboBytes,
+                                             const int* samplerFbIds, uint32_t samplerCount,
+                                             const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessSlangPrograms.size()) {
+        return;
+    }
+    const PostProcessSlangProgramOGL& slot = mPostProcessSlangPrograms[progId];
+    if (slot.program == 0) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
+    if (dstFbInfo.fbo == 0) {
+        return;
+    }
+
+    // Fixed-function state: identical to the legacy post-process
+    // path. Mirrors the cache-invalidation pattern so the next
+    // regular draw sees consistent state.
+    if (mLastScissorEnabled != 0) {
+        glDisable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 0;
+    }
+    if (mLastBlendEnabled != 0) {
+        glDisable(GL_BLEND);
+        mLastBlendEnabled = 0;
+    }
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
+    mCurrentFrameBuffer = dstFb;
+    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
+        glEnable(GL_FRAMEBUFFER_SRGB);
+    }
+
+    // Upload the chain-built UBO blob. The buffer was allocated at
+    // CreatePostProcessSlangProgram time so we just refill.
+    if (slot.ubo != 0 && uboData != nullptr && uboBytes > 0) {
+        glBindBuffer(GL_UNIFORM_BUFFER, slot.ubo);
+        const GLsizeiptr writeBytes =
+            static_cast<GLsizeiptr>(std::min<uint32_t>(uboBytes, slot.uboBytes));
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, writeBytes, uboData);
+        glBindBufferBase(GL_UNIFORM_BUFFER, slot.uboBindingPoint, slot.ubo);
+    }
+
+    // Bind sampler textures in declaration order. Each entry's
+    // samplerFbIds[i] is the FBO whose color texture goes on unit i.
+    // -1 means "use a fallback" — we pick TU0's source if available,
+    // else leave whatever was bound.
+    GLuint fallbackTex = 0;
+    if (samplerCount > 0 && samplerFbIds != nullptr && samplerFbIds[0] >= 0 &&
+        (size_t)samplerFbIds[0] < mFrameBuffers.size()) {
+        fallbackTex = mFrameBuffers[samplerFbIds[0]].clrbuf;
+    }
+    for (uint32_t i = 0; i < samplerCount; ++i) {
+        const int fbId = samplerFbIds ? samplerFbIds[i] : -1;
+        GLuint tex = fallbackTex;
+        if (fbId >= 0 && (size_t)fbId < mFrameBuffers.size() &&
+            mFrameBuffers[fbId].clrbuf != 0) {
+            tex = mFrameBuffers[fbId].clrbuf;
+        }
+        if (tex == 0) {
+            continue;
+        }
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        // Phase 3D-2 minimal sampler state: linear / clamp-to-edge on
+        // every slot. Per-slot libretro filter_linearN / wrap_modeN
+        // routing comes with Phase 3D-3 multipass.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                        params.srcFilterLinear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        if (i < SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[i] = tex;
+        }
+    }
+    glActiveTexture(GL_TEXTURE0);
+    mLastActiveTexture = 0;
+
+    glUseProgram(slot.program);
+    mLastLoadedShader = nullptr;
+
+    EnsurePostProcessSlangVao();
+    glBindVertexArray(mPostProcessSlangVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Restore the regular-draw VAO/VBO bindings.
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray(mOpenglVao);
+#else
+    glBindVertexArray(0);
+#endif
+    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
+}
+
+GLuint GfxRenderingAPIOGL::EnsurePostProcessVao() {
+    if (mPostProcessVao != 0 && mPostProcessVbo != 0) {
+        return mPostProcessVao;
+    }
+    // Fullscreen triangle in NDC. Extends past the [-1,1] viewport on two
+    // edges so a single triangle covers the entire output without the
+    // diagonal seam of a two-triangle quad.
+    static const GLfloat kFullscreenTriangle[] = {
+        -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f,
+    };
+    glGenVertexArrays(1, &mPostProcessVao);
+    glBindVertexArray(mPostProcessVao);
+    glGenBuffers(1, &mPostProcessVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, mPostProcessVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kFullscreenTriangle), kFullscreenTriangle, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(GLfloat), (void*)0);
+    return mPostProcessVao;
+}
+
+int GfxRenderingAPIOGL::CreatePostProcessStaticTexture(uint32_t width, uint32_t height,
+                                                       const uint8_t* rgba8) {
+    if (width == 0 || height == 0 || rgba8 == nullptr) {
+        return -1;
+    }
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (tex == 0) {
+        return -1;
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width, (GLsizei)height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba8);
+    // Sampler state is set per RunPostProcess call from the per-binding
+    // filterLinear / wrapMode — leave the texture object defaults here.
+    glBindTexture(GL_TEXTURE_2D, 0);
+    for (size_t i = 0; i < mPostProcessStaticTextures.size(); ++i) {
+        if (mPostProcessStaticTextures[i] == 0) {
+            mPostProcessStaticTextures[i] = tex;
+            return (int)i;
+        }
+    }
+    mPostProcessStaticTextures.push_back(tex);
+    return (int)(mPostProcessStaticTextures.size() - 1);
+}
+
+void GfxRenderingAPIOGL::DestroyPostProcessStaticTexture(int textureId) {
+    if (textureId < 0 || (size_t)textureId >= mPostProcessStaticTextures.size()) {
+        return;
+    }
+    GLuint& slot = mPostProcessStaticTextures[textureId];
+    if (slot != 0) {
+        glDeleteTextures(1, &slot);
+        slot = 0;
+    }
+}
+
+void GfxRenderingAPIOGL::SetPostProcessFramebufferMipmapped(int fb_id, bool mipmapped) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    mFrameBuffers[fb_id].postProcessMipmapped = mipmapped;
+}
+
+void GfxRenderingAPIOGL::GeneratePostProcessMipmaps(int fb_id) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& fb = mFrameBuffers[fb_id];
+    if (fb.clrbuf == 0) {
+        return;
+    }
+    // OpenGL textures allocated via glTexImage2D are mutable; the
+    // first glGenerateMipmap call also reserves storage for levels
+    // 1..N, so the FBO does not need to be pre-allocated as
+    // mipmapped. Set the min filter to MIPMAP_LINEAR on the
+    // implicit texture object so the call is mipmap-complete; the
+    // per-call sampler override in RunPostProcess restores whatever
+    // filter the next bind needs.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    // Restore the cached binding so the next regular draw's
+    // texture-bind cache stays accurate. mLastBoundTextures[0] is
+    // whatever the chain or main pass set last; clearing it forces
+    // the next SelectTexture to re-bind.
+    mLastBoundTextures[0] = 0;
+}
+
+void GfxRenderingAPIOGL::SetPostProcessFramebufferFormat(int fb_id, PostProcessFboFormat fmt) {
+    if (fb_id < 0 || (size_t)fb_id >= mFrameBuffers.size()) {
+        return;
+    }
+    // Record the desired format; the next UpdateFramebufferParameters
+    // notices the mismatch against lastPostProcessFormat and reallocates
+    // the color attachment.
+    mFrameBuffers[fb_id].postProcessFormat = fmt;
+}
+
+void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int originalFb,
+                                        const PostProcessParams& params) {
+    if (progId < 0 || (size_t)progId >= mPostProcessPrograms.size()) {
+        return;
+    }
+    const PostProcessProgramOGL& slot = mPostProcessPrograms[progId];
+    if (slot.program == 0) {
+        return;
+    }
+    if (srcFb < 0 || (size_t)srcFb >= mFrameBuffers.size()) {
+        return;
+    }
+    if (dstFb < 0 || (size_t)dstFb >= mFrameBuffers.size()) {
+        return;
+    }
+    const FramebufferOGL& srcFbInfo = mFrameBuffers[srcFb];
+    const FramebufferOGL& dstFbInfo = mFrameBuffers[dstFb];
+    if (srcFbInfo.clrbuf == 0 || dstFbInfo.fbo == 0) {
+        return;
+    }
+
+    // Fixed-function state for a fullscreen pass. No scissor, no depth,
+    // no blend. The next regular draw resets viewport / blend / depth.
+    if (mLastScissorEnabled != 0) {
+        glDisable(GL_SCISSOR_TEST);
+        mLastScissorEnabled = 0;
+    }
+    if (mLastBlendEnabled != 0) {
+        glDisable(GL_BLEND);
+        mLastBlendEnabled = 0;
+    }
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    mLastDepthTest = -1;
+    mLastDepthMask = -1;
+    mLastZmodeDecal = -1;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbInfo.fbo);
+    mCurrentFrameBuffer = dstFb;
+    glViewport(0, 0, dstFbInfo.width, dstFbInfo.height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
+    // hardware encodes the fragment's linear output back to sRGB on
+    // write. For non-sRGB destinations the state is ignored by spec
+    // (encoding only happens when the attachment is sRGB-formatted),
+    // so we leave it enabled afterwards rather than thrashing state.
+    if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
+        glEnable(GL_FRAMEBUFFER_SRGB);
+    }
+
+    // Sample source FB's color texture on TU0. Filter + wrap mode come
+    // from the producer pass's libretro `filter_linearN` / `wrap_modeN`
+    // — passed through PostProcessParams by the chain. Pass 0 sees the
+    // chain's defaults (linear / clamp-to-edge).
+    // Phase 2.2: pick a mipmap-aware min filter when the chain has
+    // pre-populated this pass's input texture with a mip chain via
+    // GeneratePostProcessMipmaps. Mag is single-level by construction.
+    GLint srcMinFilter = params.srcFilterLinear ? GL_LINEAR : GL_NEAREST;
+    GLint srcMagFilter = srcMinFilter;
+    if (params.srcUseMipmap) {
+        srcMinFilter = params.srcFilterLinear ? GL_LINEAR_MIPMAP_LINEAR
+                                              : GL_NEAREST_MIPMAP_NEAREST;
+    }
+    GLint srcWrap = GL_CLAMP_TO_EDGE;
+    switch (params.srcWrapMode) {
+        case PostProcessWrapMode::ClampToEdge:    srcWrap = GL_CLAMP_TO_EDGE; break;
+        case PostProcessWrapMode::ClampToBorder:
+#ifdef USE_OPENGLES
+            // GLES core has no CLAMP_TO_BORDER (3.2 added it as an ext but
+            // we can't assume coverage). Fall back to edge clamp — shaders
+            // that depend on the transparent-black border behaviour will
+            // see edge-sampling artifacts but the pass still renders.
+            srcWrap = GL_CLAMP_TO_EDGE;
+#else
+            srcWrap = GL_CLAMP_TO_BORDER;
+#endif
+            break;
+        case PostProcessWrapMode::Repeat:         srcWrap = GL_REPEAT; break;
+        case PostProcessWrapMode::MirroredRepeat: srcWrap = GL_MIRRORED_REPEAT; break;
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, srcFbInfo.clrbuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, srcMinFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, srcMagFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, srcWrap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, srcWrap);
+    mLastBoundTextures[0] = srcFbInfo.clrbuf;
+
+    // Original (game FB) on TU1 for multipass shaders that combine
+    // post-bloom Source with the pre-bloom Original. We bind it
+    // unconditionally; shaders that don't reference Original simply
+    // ignore the binding.
+    GLuint originalTex = srcFbInfo.clrbuf;
+    if (originalFb >= 0 && (size_t)originalFb < mFrameBuffers.size() &&
+        mFrameBuffers[originalFb].clrbuf != 0) {
+        originalTex = mFrameBuffers[originalFb].clrbuf;
+    }
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, originalTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    mLastBoundTextures[1] = originalTex;
+
+    // Alias / external-texture bindings at TUs 2+. Each entry's
+    // sampler state comes from the producer pass's libretro
+    // filter_linearN / wrap_modeN. sourceFb == -1 means "producer
+    // pass hasn't run yet at this point in the chain" — bind the
+    // game FB (Original) as a defensive fallback so the shader's
+    // texture() reads something sane rather than a stale slot.
+    auto glWrap = [](PostProcessWrapMode m) -> GLint {
+        switch (m) {
+            case PostProcessWrapMode::ClampToEdge:    return GL_CLAMP_TO_EDGE;
+            case PostProcessWrapMode::ClampToBorder:
+#ifdef USE_OPENGLES
+                return GL_CLAMP_TO_EDGE;
+#else
+                return GL_CLAMP_TO_BORDER;
+#endif
+            case PostProcessWrapMode::Repeat:         return GL_REPEAT;
+            case PostProcessWrapMode::MirroredRepeat: return GL_MIRRORED_REPEAT;
+        }
+        return GL_CLAMP_TO_EDGE;
+    };
+    for (size_t i = 0; i < params.extraBindingsCount; ++i) {
+        const auto& eb = params.extraBindings[i];
+        GLuint tex = originalTex; // defensive fallback
+        if (eb.staticTextureId >= 0 &&
+            (size_t)eb.staticTextureId < mPostProcessStaticTextures.size() &&
+            mPostProcessStaticTextures[eb.staticTextureId] != 0) {
+            tex = mPostProcessStaticTextures[eb.staticTextureId];
+        } else if (eb.sourceFb >= 0 && (size_t)eb.sourceFb < mFrameBuffers.size() &&
+                   mFrameBuffers[eb.sourceFb].clrbuf != 0) {
+            tex = mFrameBuffers[eb.sourceFb].clrbuf;
+        }
+        const GLenum unit = GL_TEXTURE2 + (GLenum)i;
+        glActiveTexture(unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        const GLint flt = eb.filterLinear ? GL_LINEAR : GL_NEAREST;
+        const GLint wrp = glWrap(eb.wrapMode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, flt);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, flt);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrp);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrp);
+        if (i < (size_t)SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[i] = tex;
+        }
+    }
+    // Leave the active texture on TU0 so the next regular draw's
+    // glActiveTexture call doesn't have to undo us.
+    glActiveTexture(GL_TEXTURE0);
+    mLastActiveTexture = 0;
+
+    glUseProgram(slot.program);
+    mLastLoadedShader = nullptr; // Force LoadShader to re-glUseProgram next frame.
+    if (slot.sourceLocation >= 0) {
+        glUniform1i(slot.sourceLocation, 0);
+    }
+    if (slot.originalLocation >= 0) {
+        glUniform1i(slot.originalLocation, 1);
+    }
+    for (size_t i = 0; i < slot.aliasLocations.size(); ++i) {
+        if (slot.aliasLocations[i] >= 0) {
+            glUniform1i(slot.aliasLocations[i], (GLint)(2 + i));
+        }
+    }
+    for (size_t i = 0; i < slot.aliasSizeLocations.size(); ++i) {
+        if (slot.aliasSizeLocations[i] < 0) {
+            continue;
+        }
+        float w = 1.0f;
+        float h = 1.0f;
+        if (i < params.extraBindingsCount) {
+            const auto& eb = params.extraBindings[i];
+            w = (float)eb.width;
+            h = (float)eb.height;
+        }
+        glUniform2f(slot.aliasSizeLocations[i], w, h);
+    }
+    if (slot.originalSizeLocation >= 0) {
+        glUniform2f(slot.originalSizeLocation, (float)params.originalWidth,
+                    (float)params.originalHeight);
+    }
+    if (slot.sourceSizeLocation >= 0) {
+        glUniform2f(slot.sourceSizeLocation, (float)params.srcWidth, (float)params.srcHeight);
+    }
+    if (slot.inputSizeLocation >= 0) {
+        glUniform2f(slot.inputSizeLocation, (float)params.inputWidth, (float)params.inputHeight);
+    }
+    if (slot.outputSizeLocation >= 0) {
+        glUniform2f(slot.outputSizeLocation, (float)params.dstWidth, (float)params.dstHeight);
+    }
+    if (slot.frameCountLocation >= 0) {
+        glUniform1i(slot.frameCountLocation, (int)params.frameCount);
+    }
+    if (slot.frameDirectionLocation >= 0) {
+        glUniform1f(slot.frameDirectionLocation, 1.0f);
+    }
+    // FlipY uniform on the vertex shader compensates for the V-axis
+    // mismatch between source FBO sampling and ImGui::Image's default
+    // UV interpretation (which treats V=0 as the top of the displayed
+    // quad). Both mGameFb (rendered with invertY=true, game-top at
+    // pixel-bottom = V=0) and mGameFbMsaaResolved (MSAA-blitted from
+    // mGameFb, same pixel layout) already have game-top at V=0, so
+    // the post-process pass writes them passthrough — bottom vertex
+    // of the fullscreen tri samples V=0 (game-top) and lands at
+    // GL-pixel-bottom of mDstFb, which is V=0 when ImGui samples mDstFb.
+    // Standard-orientation source FBs (V=0 = image-bottom) would need
+    // FlipY=1; none of the inputs the chain currently runs on are of
+    // that flavour, so the uniform is wired to 0.
+    GLint flipYLoc = glGetUniformLocation(slot.program, "FlipY");
+    if (flipYLoc >= 0) {
+        glUniform1i(flipYLoc, 0);
+    }
+
+    EnsurePostProcessVao();
+    glBindVertexArray(mPostProcessVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Restore the driver-visible VAO/VBO bindings the regular draw path
+    // assumes. On Apple / GLES the backend keeps mOpenglVao bound at all
+    // times; elsewhere it uses the default VAO (0) and an always-bound
+    // mOpenglVbo on GL_ARRAY_BUFFER.
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray(mOpenglVao);
+#else
+    glBindVertexArray(0);
+#endif
+    glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
 }
 
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
