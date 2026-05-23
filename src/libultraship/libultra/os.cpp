@@ -48,19 +48,42 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
 
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
-    // Disable SDL's HIDAPI joystick backend on Linux. The HIDAPI backend
-    // performs synchronous udev sysattr reads from SDL_PumpEvents on the main
-    // thread; if a USB device is in a weird transient state, those reads block
-    // for the kernel sysfs timeout (~3-5s) — exactly the watchdog signature in
-    // issue #137. Falling back to SDL's evdev backend uses inotify on
-    // /dev/input/ for hotplug, which doesn't block. SDL_HINT_JOYSTICK_THREAD
-    // alone doesn't cover this because the udev hotplug monitor still runs
-    // from PumpEvents on the main thread regardless.
+#if defined(_WIN32)
+    // Windows: keep HIDAPI on, and explicitly enable the PS5 driver + its
+    // rumble path. Without HIDAPI on Windows, SDL falls back to DirectInput /
+    // raw HID, which doesn't expose FF_RUMBLE for the DualSense and reports
+    // the wrong button layout — so SDL_GameControllerHasRumble() returns
+    // false (RumbleMappingFactory early-returns, no SDLRumbleMapping ever
+    // created) and SDL_GameControllerGetButton() returns 0 during the
+    // remap-popup capture loop. See issue #193.
     //
-    // Cost: lose HIDAPI-specific PS4/PS5 features (rumble metadata over USB).
-    // SSB64 doesn't use any of those. Standard gamepads (Xbox / DualShock /
-    // 8BitDo / etc.) all enumerate fine through evdev.
+    // The Linux #137 udev stall doesn't reproduce on Windows — Windows
+    // HIDAPI uses setupapi / RegisterDeviceNotification, an entirely
+    // different hotplug code path with no synchronous-sysattr-read bug.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#else
+    // Linux + macOS: disable SDL's HIDAPI joystick backend.
+    //
+    // Linux: the HIDAPI backend performs synchronous udev sysattr reads from
+    // SDL_PumpEvents on the main thread; if a USB device is in a weird
+    // transient state, those reads block for the kernel sysfs timeout
+    // (~3-5s) — exactly the watchdog signature in issue #137. The evdev
+    // fallback uses inotify on /dev/input/ for hotplug, which doesn't
+    // block. SDL_HINT_JOYSTICK_THREAD alone doesn't cover this because
+    // the udev hotplug monitor still runs from PumpEvents regardless.
+    //
+    // macOS: doesn't have the udev path, but disabling HIDAPI is safe and
+    // preferred — the IOKit backend natively supports DualSense rumble +
+    // LED + correct PS5 controller-type detection. Empirically verified on
+    // macOS 25.4 with SDL 2.32.10: SDL_GameControllerHasRumble returns
+    // true, gctype reports SDL_CONTROLLER_TYPE_PS5, and rumble + sticks
+    // both fire in-game without the HIDAPI driver loaded. See issue #193.
+    //
+    // Cost: lose HIDAPI-specific PS4/PS5 features (adaptive triggers, etc.)
+    // on Linux. SSB64 doesn't use any of those.
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+#endif
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         SPDLOG_ERROR("Failed to initialize SDL game controllers ({})", SDL_GetError());
         exit(EXIT_FAILURE);
