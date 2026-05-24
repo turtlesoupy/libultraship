@@ -189,27 +189,91 @@ FetchContent_MakeAvailable(prism)
 #=========== hidapi (native Raphnet N64 USB adapter support) ===========
 # Static-only, hidraw backend on Linux (no libusb dep). 0.14.0 fixes a
 # macOS hid_close deadlock present in 0.13.x.
-set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
-set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
-set(HIDAPI_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
-    set(HIDAPI_WITH_HIDRAW ON CACHE BOOL "" FORCE)
-    set(HIDAPI_WITH_LIBUSB OFF CACHE BOOL "" FORCE)
+#
+# On Android, hidapi-0.14.0 only ships a libusb backend, and the NDK
+# sysroot has no libusb-1.0 — so we provide a tiny stub library that
+# exposes the same hidapi C symbols as no-ops. The Raphnet code paths
+# in libultraship still link cleanly; at runtime hid_init() reports
+# success but hid_enumerate() returns nullptr, so RaphnetPhysicalDeviceManager
+# decides "no adapter found" and the SDL2 / Java HIDDeviceManager handles
+# everything that's actually present.
+if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(_LUS_HIDAPI_STUB_DIR ${CMAKE_CURRENT_BINARY_DIR}/hidapi_stub)
+    file(MAKE_DIRECTORY ${_LUS_HIDAPI_STUB_DIR})
+    file(WRITE ${_LUS_HIDAPI_STUB_DIR}/hidapi.h [=[
+/* hidapi.h — Android stub shim. Minimal subset used by libultraship's
+ * Raphnet support paths. All operations report failure / no devices. */
+#ifndef HIDAPI_STUB_H
+#define HIDAPI_STUB_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <wchar.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct hid_device_ hid_device;
+
+struct hid_device_info {
+    char            *path;
+    unsigned short   vendor_id;
+    unsigned short   product_id;
+    wchar_t         *serial_number;
+    unsigned short   release_number;
+    wchar_t         *manufacturer_string;
+    wchar_t         *product_string;
+    unsigned short   usage_page;
+    unsigned short   usage;
+    int              interface_number;
+    struct hid_device_info *next;
+};
+
+static inline int                       hid_init(void) { return 0; }
+static inline int                       hid_exit(void) { return 0; }
+static inline struct hid_device_info   *hid_enumerate(unsigned short vid, unsigned short pid) { (void)vid; (void)pid; return NULL; }
+static inline void                      hid_free_enumeration(struct hid_device_info *devs) { (void)devs; }
+static inline hid_device               *hid_open_path(const char *path) { (void)path; return NULL; }
+static inline void                      hid_close(hid_device *dev) { (void)dev; }
+static inline int                       hid_read(hid_device *dev, unsigned char *data, size_t length) { (void)dev; (void)data; (void)length; return -1; }
+static inline int                       hid_send_feature_report(hid_device *dev, const unsigned char *data, size_t length) { (void)dev; (void)data; (void)length; return -1; }
+static inline int                       hid_get_feature_report(hid_device *dev, unsigned char *data, size_t length) { (void)dev; (void)data; (void)length; return -1; }
+static inline int                       hid_set_nonblocking(hid_device *dev, int nonblock) { (void)dev; (void)nonblock; return 0; }
+static inline const wchar_t            *hid_error(hid_device *dev) { (void)dev; return L"hidapi-stub: Android build has no native HID backend"; }
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* HIDAPI_STUB_H */
+]=])
+    add_library(hidapi_stub INTERFACE)
+    target_include_directories(hidapi_stub INTERFACE ${_LUS_HIDAPI_STUB_DIR})
+    add_library(hidapi::hidapi ALIAS hidapi_stub)
+else()
+    set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
+    set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
+    set(HIDAPI_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+        set(HIDAPI_WITH_HIDRAW ON CACHE BOOL "" FORCE)
+        set(HIDAPI_WITH_LIBUSB OFF CACHE BOOL "" FORCE)
+    endif()
+    # Force static while pulling hidapi in, then restore caller's preference.
+    set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    # hidapi-0.14.0 declares cmake_minimum_required(3.4.3); CMake 4.x removed
+    # < 3.5 compatibility, so allow it via policy minimum.
+    set(_LUS_CMP_MIN_SAVED ${CMAKE_POLICY_VERSION_MINIMUM})
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    FetchContent_Declare(
+        hidapi
+        GIT_REPOSITORY https://github.com/libusb/hidapi.git
+        GIT_TAG hidapi-0.14.0
+    )
+    FetchContent_MakeAvailable(hidapi)
+    set(CMAKE_POLICY_VERSION_MINIMUM ${_LUS_CMP_MIN_SAVED})
+    unset(_LUS_CMP_MIN_SAVED)
+    set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
+    unset(_LUS_BUILD_SHARED_LIBS_SAVED)
 endif()
-# Force static while pulling hidapi in, then restore caller's preference.
-set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
-set(BUILD_SHARED_LIBS OFF)
-# hidapi-0.14.0 declares cmake_minimum_required(3.4.3); CMake 4.x removed
-# < 3.5 compatibility, so allow it via policy minimum.
-set(_LUS_CMP_MIN_SAVED ${CMAKE_POLICY_VERSION_MINIMUM})
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-FetchContent_Declare(
-    hidapi
-    GIT_REPOSITORY https://github.com/libusb/hidapi.git
-    GIT_TAG hidapi-0.14.0
-)
-FetchContent_MakeAvailable(hidapi)
-set(CMAKE_POLICY_VERSION_MINIMUM ${_LUS_CMP_MIN_SAVED})
-unset(_LUS_CMP_MIN_SAVED)
-set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
-unset(_LUS_BUILD_SHARED_LIBS_SAVED)
