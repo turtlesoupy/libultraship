@@ -472,6 +472,9 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         MTL::DepthStencilState* depth_stencil_state = mDevice->newDepthStencilState(depth_descriptor);
         current_framebuffer.mCommandEncoder->setDepthStencilState(depth_stencil_state);
 
+        // setDepthStencilState retains; drop our +1 from newDepthStencilState
+        // or every depth-mode change this frame leaks a state object.
+        depth_stencil_state->release();
         depth_descriptor->release();
     }
 
@@ -502,6 +505,15 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     }
 
     MTL::Buffer* vertex_buffer = mVertexBufferPool[mCurrentVertexBufferPoolIndex];
+    if (mCurrentVertexBufferOffset + sizeof(float) * buf_vbo_len > vertex_buffer->length()) {
+        // The per-frame pool slot is full — writing past it would corrupt
+        // adjacent heap/driver memory. Dropping the draw is visually wrong
+        // for one frame but safe.
+        SPDLOG_ERROR("Metal vertex buffer overflow: offset={} + {} > capacity={}; dropping draw",
+                     mCurrentVertexBufferOffset, sizeof(float) * buf_vbo_len, vertex_buffer->length());
+        autorelease_pool->release();
+        return;
+    }
     memcpy((char*)vertex_buffer->contents() + mCurrentVertexBufferOffset, buf_vbo, sizeof(float) * buf_vbo_len);
 
     if (!current_framebuffer.mHasBoundVertexShader) {
