@@ -97,6 +97,17 @@ void WasapiAudioPlayer::DoClose() {
     mStarted = false;
 }
 
+WasapiAudioPlayer::~WasapiAudioPlayer() {
+    // Unregister the IMMNotificationClient before this object goes away —
+    // otherwise Windows keeps delivering device-change callbacks to a
+    // dangling `this` (use-after-free on device plug/unplug after close).
+    if (mDeviceEnumerator) {
+        mDeviceEnumerator->UnregisterEndpointNotificationCallback(this);
+        mDeviceEnumerator.Reset();
+    }
+    DoClose();
+}
+
 int WasapiAudioPlayer::Buffered() {
     std::lock_guard<std::mutex> lock(mMutex);
     if (!mInitialized) {

@@ -15,6 +15,7 @@ class WasapiAudioPlayer : public AudioPlayer, public IMMNotificationClient {
   public:
     WasapiAudioPlayer(AudioSettings settings) : AudioPlayer(settings) {
     }
+    ~WasapiAudioPlayer();
 
     int Buffered() override;
 
