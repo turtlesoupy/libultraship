@@ -188,8 +188,21 @@ struct TextureCacheKey {
 
     struct Hasher {
         size_t operator()(const TextureCacheKey& key) const noexcept {
-            uintptr_t addr = (uintptr_t)key.texture_addr;
-            return (size_t)(addr ^ (addr >> 5));
+            // FNV-1a over every field operator== compares. Hashing only the
+            // address degrades the map to a linked list when the game's bump
+            // heaps cycle many textures through the same addresses.
+            uint64_t h = 1469598103934665603ULL;
+            auto mix = [&h](uint64_t v) {
+                h ^= v;
+                h *= 1099511628211ULL;
+            };
+            mix((uint64_t)(uintptr_t)key.texture_addr);
+            mix((uint64_t)(uintptr_t)key.palette_addrs[0]);
+            mix((uint64_t)(uintptr_t)key.palette_addrs[1]);
+            mix((uint64_t)key.fmt | ((uint64_t)key.siz << 8) | ((uint64_t)key.palette_index << 16) |
+                ((uint64_t)key.masks << 24) | ((uint64_t)key.maskt << 32));
+            mix((uint64_t)key.size_bytes | ((uint64_t)key.tile_width << 32) | ((uint64_t)key.tile_height << 48));
+            return (size_t)h;
         }
     };
 };
