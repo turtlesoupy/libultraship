@@ -67,6 +67,14 @@ void ConnectedPhysicalDeviceManager::HandlePhysicalDeviceDisconnect(int32_t sdlJ
 }
 
 void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
+    // Snapshot the instance ids we already knew about. A refresh fires on
+    // EVERY controller add/remove event, and the per-port routing (ignore
+    // sets) must survive for pads that were already connected — previously
+    // each refresh re-ignored every pad for ports 2-4, silently reverting
+    // the user's port assignments whenever any device event arrived.
+    auto previouslyConnected = std::move(mConnectedSDLGamepads);
+    std::vector<int32_t> newInstanceIds;
+
     mConnectedSDLGamepads.clear();
     mConnectedSDLGamepadNames.clear();
     static SDL_JoystickGUID sZeroGuid;
@@ -130,9 +138,45 @@ void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
         mConnectedSDLGamepads[instanceId] = gamepad;
         mConnectedSDLGamepadNames[instanceId] = gamepadName;
 
-        for (uint8_t port = 1; port < 4; port++) {
-            mIgnoredInstanceIds[port].insert(instanceId);
+        if (!previouslyConnected.contains(instanceId)) {
+            newInstanceIds.push_back(instanceId);
         }
+    }
+
+    // Default routing for newly connected pads: each goes to the first port
+    // that doesn't have a pad yet (1st pad → port 1, 2nd pad → port 2, ...)
+    // so local multiplayer works out of the box with any mix of controller
+    // types. Insert into every port's ignore set first so the occupancy
+    // scan below doesn't see the pad we're currently placing.
+    for (int32_t newId : newInstanceIds) {
+        for (uint8_t port = 0; port < 4; port++) {
+            mIgnoredInstanceIds[port].insert(newId);
+        }
+    }
+    for (int32_t newId : newInstanceIds) {
+        uint8_t freePort = UINT8_MAX;
+        for (uint8_t port = 0; port < 4; port++) {
+            bool occupied = false;
+            for (const auto& [instanceId, gamepad] : mConnectedSDLGamepads) {
+                if (!mIgnoredInstanceIds[port].contains(instanceId)) {
+                    occupied = true;
+                    break;
+                }
+            }
+            if (!occupied) {
+                freePort = port;
+                break;
+            }
+        }
+        if (freePort == UINT8_MAX) {
+            SPDLOG_INFO("ConnectedPhysicalDeviceManager: all 4 ports already have a gamepad; "
+                        "leaving '{}' (instanceId {}) unassigned",
+                        mConnectedSDLGamepadNames[newId], newId);
+            continue;
+        }
+        mIgnoredInstanceIds[freePort].erase(newId);
+        SPDLOG_INFO("ConnectedPhysicalDeviceManager: assigned new gamepad '{}' (instanceId {}) to port {}",
+                    mConnectedSDLGamepadNames[newId], newId, freePort + 1);
     }
 }
 } // namespace Ship

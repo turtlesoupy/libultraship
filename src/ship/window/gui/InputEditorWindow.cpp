@@ -1199,7 +1199,25 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
     ImGui::PopItemFlag();
 
     auto connectedDeviceManager = Ship::Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager();
-    for (const auto& [instanceId, name] : connectedDeviceManager->GetConnectedSDLGamepadNames()) {
+
+    // Sort rows by instance id (connection order) and disambiguate identical
+    // device names with an ordinal — two pads of the same model otherwise
+    // render as indistinguishable rows.
+    auto gamepadNames = connectedDeviceManager->GetConnectedSDLGamepadNames();
+    std::vector<std::pair<int32_t, std::string>> sortedGamepads(gamepadNames.begin(), gamepadNames.end());
+    std::sort(sortedGamepads.begin(), sortedGamepads.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::unordered_map<std::string, int32_t> nameCounts;
+    for (const auto& [instanceId, name] : sortedGamepads) {
+        nameCounts[name]++;
+    }
+    std::unordered_map<std::string, int32_t> nameOrdinals;
+
+    for (const auto& [instanceId, name] : sortedGamepads) {
+        std::string displayName = name;
+        if (nameCounts[name] > 1) {
+            displayName = StringHelper::Sprintf("%s #%d", name.c_str(), ++nameOrdinals[name]);
+        }
         ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
         auto buttonColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
         auto buttonHoveredColor = ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered);
@@ -1221,8 +1239,9 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
         // identical labels, and ImGui derives widget IDs from the label — the
         // ID-conflict debug warning fires and hover states cross-talk. "###"
         // pins the ID to the SDL instance id, independent of the display text.
-        ImGui::Button(
-            StringHelper::Sprintf("%s %s (SDL)###gamepadName_%d", ICON_FA_GAMEPAD, name.c_str(), instanceId).c_str());
+        ImGui::Button(StringHelper::Sprintf("%s %s (SDL)###gamepadName_%d", ICON_FA_GAMEPAD, displayName.c_str(),
+                                            instanceId)
+                          .c_str());
         ImGui::PopStyleColor();
         ImGui::PopStyleColor();
         ImGui::PopItemFlag();

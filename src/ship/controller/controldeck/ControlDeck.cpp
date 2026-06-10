@@ -95,6 +95,18 @@ void ControlDeck::Init(uint8_t* controllerBits) {
         mPorts[0]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::SDLGamepad);
     }
 
+    // Gamepad defaults for ports 2-4 as well: SDL mappings only fire for
+    // pads routed to their port, so these stay dormant until a pad is
+    // assigned there (second pad connected, or the user toggles routing in
+    // the input editor) — at which point the pad just works instead of
+    // requiring a manual "Set Defaults" per port. Keyboard/mouse stay
+    // port-1-only.
+    for (size_t i = 1; i < mPorts.size(); i++) {
+        if (!mPorts[i]->GetConnectedController()->HasConfig()) {
+            mPorts[i]->GetConnectedController()->AddDefaultMappings(PhysicalDeviceType::SDLGamepad);
+        }
+    }
+
     // Install Raphnet rumble mappings on any port the RaphnetPhysicalDeviceManager
     // has claimed. Polling (the input read path) wires up in L7 — this commit
     // only handles rumble wiring, which can land independently because
