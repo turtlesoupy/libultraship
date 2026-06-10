@@ -1217,7 +1217,12 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
         };
         ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
         ImGui::SameLine();
-        ImGui::Button(StringHelper::Sprintf("%s %s (SDL)", ICON_FA_GAMEPAD, name.c_str()).c_str());
+        // Two identical controllers (e.g. a pair of DualSense pads) produce
+        // identical labels, and ImGui derives widget IDs from the label — the
+        // ID-conflict debug warning fires and hover states cross-talk. "###"
+        // pins the ID to the SDL instance id, independent of the display text.
+        ImGui::Button(
+            StringHelper::Sprintf("%s %s (SDL)###gamepadName_%d", ICON_FA_GAMEPAD, name.c_str(), instanceId).c_str());
         ImGui::PopStyleColor();
         ImGui::PopStyleColor();
         ImGui::PopItemFlag();
