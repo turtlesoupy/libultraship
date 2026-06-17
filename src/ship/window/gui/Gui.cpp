@@ -717,8 +717,34 @@ void Gui::DrawGame() {
     }
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
+        // SSB64 overscan crop. The game bakes a 10px "title-safe" margin into its
+        // GBI on every side: the default scissor (decomp sys/rdp.c
+        // syRdpResetSettings) and every per-camera scissor (decomp sys/objdisplay.c,
+        // dGCCameraScissor{Left,Top,Right,Bottom} = 10) clip all drawing — and the
+        // per-frame framebuffer clear itself — to (10,10)..(310,230) of the 320x240
+        // frame. On a CRT, the TV's own overscan hid that margin; presenting the
+        // full framebuffer 1:1 to a desktop window instead exposes it as a black
+        // border on all four sides. The margin is never drawn into (not even
+        // cleared), so widening the scissor would reveal uncleared garbage rather
+        // than content — instead we crop the proportional margin out of the
+        // presented texture and let the safe area fill the viewport, reproducing the
+        // on-TV image. The margin is a fixed fraction of the frame (10/320 x,
+        // 10/240 y) regardless of internal resolution, so the crop is resolution-
+        // independent and symmetric (orientation/flip-agnostic). Skipped in
+        // pixel-perfect mode, where the user has opted into an exact 1:1 framebuffer.
+        ImVec2 uv0(0.0f, 0.0f);
+        ImVec2 uv1(1.0f, 1.0f);
+        const auto cvars = Ship::Context::GetInstance()->GetConsoleVariables();
+        const bool pixelPerfect = cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0) &&
+                                  cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".PixelPerfectMode", 0);
+        if (!pixelPerfect && cvars->GetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Overscan.Enabled", 1)) {
+            const float fx = cvars->GetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".Overscan.Horizontal", 10.0f) / 320.0f;
+            const float fy = cvars->GetFloat(CVAR_PREFIX_ADVANCED_RESOLUTION ".Overscan.Vertical", 10.0f) / 240.0f;
+            uv0 = ImVec2(fx, fy);
+            uv1 = ImVec2(1.0f - fx, 1.0f - fy);
+        }
         ImGui::SetCursorPos(pos);
-        ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
+        ImGui::Image(reinterpret_cast<ImTextureID>(fb), size, uv0, uv1);
     }
 
     ImGui::End();
