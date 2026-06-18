@@ -663,12 +663,14 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
                         Close();
                     }
                     break;
-                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                case SDL_WINDOWEVENT_FOCUS_GAINED: {
                     CALL_EVENT(WindowFocusEvent, true);
                     break;
-                case SDL_WINDOWEVENT_FOCUS_LOST:
+                }
+                case SDL_WINDOWEVENT_FOCUS_LOST: {
                     CALL_EVENT(WindowFocusEvent, false);
                     break;
+                }
             }
             break;
         case SDL_DROPFILE:
