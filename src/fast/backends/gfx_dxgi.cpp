@@ -27,6 +27,8 @@
 #include "ship/window/FileDropMgr.h"
 
 #include "libultraship/bridge/controllerbridge.h"
+#include "ship/events/WindowEvents.h"
+#include "libultraship/bridge/eventsbridge.h"
 
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -494,12 +496,14 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             if (self->mIsMouseCaptured) {
                 self->ApplyMouseCaptureClip();
             }
+            CALL_EVENT(WindowFocusEvent, true);
             break;
         case WM_KILLFOCUS:
             if (!Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                 ControllerBlockGameInput(ALLOW_BACKGROUND_INPUTS_BLOCK_ID);
             }
             self->mInFocus = false;
+            CALL_EVENT(WindowFocusEvent, false);
             break;
         default:
             return DefWindowProcW(h_wnd, message, w_param, l_param);
