@@ -18,6 +18,10 @@ void EventSystemUnregisterListener(EventID ev, ListenerID id) {
 }
 
 void EventSystemCallEvent(EventID id, void* event, const char* file, int line, const char* key) {
-    Ship::Context::GetInstance()->GetEventSystem()->CallEvent(id, static_cast<IEvent*>(event), file, line, key);
+    auto ctx = Ship::Context::GetInstance();
+    if (!ctx) return;
+    auto es = ctx->GetEventSystem();
+    if (!es) return;
+    es->CallEvent(id, static_cast<IEvent*>(event), file, line, key);
 }
 }
