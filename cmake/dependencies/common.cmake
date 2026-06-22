@@ -287,7 +287,7 @@ if(NOT DISABLE_SCRIPTING)
 FetchContent_Declare(
     tinycc
     GIT_REPOSITORY https://github.com/TinyCC/tinycc.git
-    GIT_TAG        mob
+    GIT_TAG        a338258d309c888bde96b2d1f206299231a54ddf
 )
 
 FetchContent_MakeAvailable(tinycc)
