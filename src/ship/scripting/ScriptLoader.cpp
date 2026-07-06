@@ -11,6 +11,8 @@
 #include <sstream>
 #include <string_view>
 #include <libtcc.h>
+#include <algorithm>
+#include <cctype>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -19,7 +21,44 @@
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
+
 namespace Ship {
+struct ScriptLoader::LoadedScript {
+    Scripting::LibraryLoader Loader;
+    TCCState* State = nullptr;
+    std::unordered_map<std::string, std::unique_ptr<void*>> ImportPointers;
+
+    LoadedScript() = default;
+    LoadedScript(const LoadedScript&) = delete;
+    LoadedScript& operator=(const LoadedScript&) = delete;
+
+    ~LoadedScript() {
+        Unload();
+    }
+
+    void* GetFunction(const std::string& name) {
+        if (State != nullptr) {
+            return tcc_get_symbol(State, name.c_str());
+        }
+        return Loader.GetFunction(name);
+    }
+
+    void Unload() {
+        if (State != nullptr) {
+            tcc_delete(State);
+            State = nullptr;
+        }
+        Loader.Unload();
+        ImportPointers.clear();
+    }
+};
+
 std::optional<std::vector<uint8_t>> LoadFromO2R(const std::string& path,
                                                 const std::shared_ptr<Archive>& archive = nullptr) {
     const auto file = archive->LoadFile(path);
@@ -80,6 +119,146 @@ constexpr std::string_view GetPlatform() {
 #endif
 }
 
+std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::optional<std::filesystem::path> FindLibraryFile(const std::vector<std::string>& libraryPaths,
+                                                     const std::string& library) {
+    std::filesystem::path libraryPath(library);
+    if (libraryPath.is_absolute() && std::filesystem::exists(libraryPath)) {
+        return libraryPath;
+    }
+
+    if (std::filesystem::exists(libraryPath)) {
+        return std::filesystem::absolute(libraryPath);
+    }
+
+    for (const std::string& searchPath : libraryPaths) {
+        std::filesystem::path candidate = std::filesystem::path(searchPath) / libraryPath;
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void* ResolveHostSymbol(const std::string& name) {
+#if defined(_WIN32) || defined(__CYGWIN__)
+    return reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA(nullptr), name.c_str()));
+#elif defined(__linux__) || defined(__APPLE__)
+    return dlsym(RTLD_DEFAULT, name.c_str());
+#else
+    return nullptr;
+#endif
+}
+
+std::optional<std::string> ParseDefExportName(std::string_view line) {
+    line = Trim(line);
+    if (line.empty() || line[0] == ';' || line[0] == '#') {
+        return std::nullopt;
+    }
+    if (line.size() >= 2 && line[0] == '/' && line[1] == '/') {
+        return std::nullopt;
+    }
+
+    const std::string lowerLine = ToLower(std::string(line));
+    if (lowerLine == "exports" || lowerLine.rfind("library", 0) == 0) {
+        return std::nullopt;
+    }
+
+    const size_t whitespace = line.find_first_of(" \t\r\n");
+    std::string name(line.substr(0, whitespace));
+    const size_t alias = name.find('=');
+    if (alias != std::string::npos) {
+        name.resize(alias);
+    }
+    const size_t ordinal = name.find('@');
+    if (ordinal != std::string::npos) {
+        name.resize(ordinal);
+    }
+
+    if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+        name = name.substr(1, name.size() - 2);
+    }
+    if (name.empty()) {
+        return std::nullopt;
+    }
+
+    return name;
+}
+
+void RegisterImportPointer(TCCState* state, ScriptLoader::LoadedScript& module, const std::string& symbol, void* addr) {
+#if defined(_WIN32) || defined(__CYGWIN__)
+    const std::string importName = "__imp_" + symbol;
+    auto slot = std::make_unique<void*>(addr);
+    void** slotAddress = slot.get();
+    auto [it, inserted] = module.ImportPointers.emplace(importName, std::move(slot));
+    if (!inserted) {
+        it->second = std::make_unique<void*>(addr);
+        slotAddress = it->second.get();
+    }
+    tcc_add_symbol(state, it->first.c_str(), slotAddress);
+#else
+    (void)state;
+    (void)module;
+    (void)symbol;
+    (void)addr;
+#endif
+}
+
+void AddSymbolsFromDef(TCCState* state, ScriptLoader::LoadedScript& module, const std::filesystem::path& defPath) {
+    std::ifstream def(defPath);
+    if (!def.is_open()) {
+        throw std::runtime_error("Failed to open TCC symbol definition file: " + defPath.string());
+    }
+
+    size_t resolved = 0;
+    size_t missing = 0;
+    std::string line;
+    while (std::getline(def, line)) {
+        auto exportName = ParseDefExportName(line);
+        if (!exportName.has_value()) {
+            continue;
+        }
+
+        void* addr = ResolveHostSymbol(exportName.value());
+        if (addr == nullptr) {
+            missing++;
+            if (!exportName->empty() && exportName->front() != '?') {
+                SPDLOG_WARN("TCC host symbol not found: {}", exportName.value());
+            }
+            continue;
+        }
+
+        tcc_add_symbol(state, exportName->c_str(), addr);
+        RegisterImportPointer(state, module, exportName.value(), addr);
+        resolved++;
+    }
+
+    SPDLOG_INFO("Registered {} TCC host symbols from {} ({} missing)", resolved, defPath.string(), missing);
+}
+
+void SetTccLibraryRoot(TCCState* state, const std::vector<std::string>& libraryPaths) {
+    if (libraryPaths.empty()) {
+        return;
+    }
+
+    std::filesystem::path tccRoot = std::filesystem::path(libraryPaths.front()).parent_path();
+    if (tccRoot.empty() || !std::filesystem::exists(tccRoot)) {
+        return;
+    }
+
+    const std::string tccRootString = tccRoot.string();
+    tcc_set_lib_path(state, tccRootString.c_str());
+}
+
+ScriptLoader::~ScriptLoader() = default;
+
 void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
     const ArchiveManifest& info = archive->GetManifest();
     constexpr std::string_view platform = GetPlatform();
@@ -121,12 +300,12 @@ void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
 
     mLoadedArchives.push_back(archive);
 
-    Scripting::LibraryLoader loader;
+    auto module = std::make_shared<LoadedScript>();
 
     const auto& binaries = info.Binaries;
-    const std::string temp = loader.GenerateTempFile();
 
     if (binaries.contains(std::string(platform))) {
+        const std::string temp = module->Loader.GenerateTempFile();
         const std::string& path = binaries.at(std::string(platform));
         auto data = LoadFromO2R(path, archive);
         if (!data.has_value()) {
@@ -139,6 +318,7 @@ void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
         }
         out.write(reinterpret_cast<const char*>(data->data()), data->size());
         out.close();
+        module->Loader.Init(temp);
     } else if (!info.Main.empty()) {
         const auto data = LoadFromO2R(info.Main, archive);
         if (!data.has_value()) {
@@ -162,13 +342,15 @@ void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
         });
 
         tcc_define_symbol(s, "__DLL__", "1");
+        tcc_define_symbol(s, "LUS_TCC_MEMORY", "1");
 
         for (const auto& [key, value] : mCompileDefines) {
             tcc_define_symbol(s, key.c_str(), value.c_str());
         }
 
         tcc_set_options(s, mBuildOptions.c_str());
-        tcc_set_output_type(s, TCC_OUTPUT_DLL);
+        SetTccLibraryRoot(s, mLibraryPaths);
+        tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
 
         for (const std::string& includePath : mIncludePaths) {
             if (!std::filesystem::exists(includePath)) {
@@ -199,7 +381,21 @@ void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
         }
 
         for (const std::string& library : mLibraries) {
-            tcc_add_library(s, library.c_str());
+            const std::string extension = ToLower(std::filesystem::path(library).extension().string());
+            if (extension == ".def") {
+                auto defPath = FindLibraryFile(mLibraryPaths, library);
+                if (!defPath.has_value()) {
+                    tcc_delete(s);
+                    throw std::runtime_error("Missing TCC symbol definition file: " + library);
+                }
+                AddSymbolsFromDef(s, *module, defPath.value());
+                continue;
+            }
+
+            if (tcc_add_library(s, library.c_str()) == -1) {
+                tcc_delete(s);
+                throw std::runtime_error("Failed to add TCC library: " + library);
+            }
         }
 
         const std::vector<uint8_t>& raw = data.value();
@@ -235,14 +431,15 @@ void ScriptLoader::Compile(const std::shared_ptr<Archive>& archive) {
             }
         }
 
-        if (tcc_output_file(s, temp.c_str()) == -1) {
+        if (tcc_relocate(s) < 0) {
             tcc_delete(s);
-            throw std::runtime_error("Failed to output compiled code for " + temp);
+            throw std::runtime_error("Failed to relocate compiled code for " + info.Name);
         }
+
+        module->State = s;
     }
 
-    loader.Init(temp);
-    mLoadedScripts[info.Name] = loader;
+    mLoadedScripts[info.Name] = std::move(module);
 };
 
 void ScriptLoader::CompileAll(const std::optional<std::function<void(const std::shared_ptr<Archive>&)>>& preCallback,
@@ -336,7 +533,7 @@ void ScriptLoader::LoadAll(
     const std::optional<std::function<void(const std::string&)>>& postInitCb) {
     auto loaders = GetLoadersInDependencyOrder();
     for (const auto& id : loaders) {
-        auto& loader = mLoadedScripts.at(id);
+        auto& loader = *mLoadedScripts.at(id);
         SPDLOG_INFO("Initializing script: {}", id);
         const auto init = (Scripting::LibraryFunc_t)loader.GetFunction("ModInit");
         if (preInitCb.has_value()) {
@@ -355,7 +552,7 @@ void ScriptLoader::UnloadAll(
     const std::optional<std::function<void(const std::string&)>>& postExitCb) {
     auto loaders = GetLoadersInDependencyOrder();
     for (auto it = loaders.rbegin(); it != loaders.rend(); ++it) {
-        auto& loader = mLoadedScripts.at(*it);
+        auto& loader = *mLoadedScripts.at(*it);
         SPDLOG_INFO("Uninitialize script: {}", *it);
         const auto exit = (Scripting::LibraryFunc_t)loader.GetFunction("ModExit");
 
@@ -365,10 +562,9 @@ void ScriptLoader::UnloadAll(
         if (exit) {
             exit();
         }
-        /* postExitCb fires BEFORE loader.Unload() so the host can
-         * walk per-mod state (uninstall hooks etc.) while the mod's
-         * code is still mapped — once Unload() FreeLibrary's the
-         * temp DLL, any trampolines pointing into it are dangling. */
+        /* postExitCb fires BEFORE loader.Unload() so the host can walk
+         * per-mod state (uninstall hooks etc.) while the mod's code is
+         * still mapped. */
         if (postExitCb.has_value()) {
             postExitCb.value()(*it);
         }
@@ -380,7 +576,7 @@ void ScriptLoader::UnloadAll(
 
 void* ScriptLoader::GetFunction(const std::string& name, const std::string& function) {
     if (mLoadedScripts.contains(name)) {
-        return mLoadedScripts.at(name).GetFunction(function);
+        return mLoadedScripts.at(name)->GetFunction(function);
     }
     return nullptr;
 };

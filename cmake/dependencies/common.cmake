@@ -279,8 +279,8 @@ else()
 endif()
 
 #=========== libtcc (TinyCC — runtime C compiler for mod scripting) ===========
-# Ported from upstream Kenix3/libultraship at SHA ecb0867. Builds libtcc as
-# SHARED + libtcc1 as STATIC. Game-side post-build steps (.def gen, .tcc/
+# Ported from upstream Kenix3/libultraship at SHA ecb0867. Builds libtcc and
+# libtcc1 as STATIC. Game-side post-build steps (.def gen, .tcc/
 # include+lib copy) live in the outer project's CMakeLists.txt.
 if(NOT DISABLE_SCRIPTING)
 
@@ -292,9 +292,6 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(tinycc)
 if(NOT TARGET libtcc)
-    # Enable symbol exporting for Windows DLLs
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-
     if(NOT EXISTS "${tinycc_SOURCE_DIR}/config.h")
         message(STATUS "Configuring TinyCC to generate config.h...")
         if(WIN32)
@@ -383,7 +380,7 @@ if(NOT TARGET libtcc)
         )
     endif()
 
-    add_library(libtcc SHARED
+    add_library(libtcc STATIC
         "${tinycc_SOURCE_DIR}/libtcc.c"
         "${tinycc_BINARY_DIR}/tccdefs_.h"
     )
@@ -391,20 +388,10 @@ if(NOT TARGET libtcc)
     add_library(libtcc1 STATIC
         "${tinycc_SOURCE_DIR}/lib/libtcc1.c"
     )
-    # On Windows, mods compile to DLLs that need TCC's PE-side runtime
-    # helpers (_dllstart entry, DllMain default) at link time. These live
-    # in win32/lib/ separate from the cross-platform libtcc1.c. Pulling
-    # them into libtcc1.a means mods don't need any extra link inputs.
-    if(WIN32)
-        target_sources(libtcc1 PRIVATE
-            "${tinycc_SOURCE_DIR}/win32/lib/dllcrt1.c"
-            "${tinycc_SOURCE_DIR}/win32/lib/dllmain.c"
-        )
-    endif()
-
     # Standalone tcc.exe — the CLI driver. Used post-build by the outer
     # project to run `tcc.exe -impdef BattleShip.exe -o BattleShip.def`,
-    # producing the import library that mod source links against.
+    # producing the export-name list that memory-mode mod source resolves
+    # against the running process.
     # tcc.c #includes libtcc.c via ONE_SOURCE so we don't link against
     # libtcc here — it's a self-contained translation unit.
     add_executable(tcc
@@ -431,10 +418,9 @@ if(NOT TARGET libtcc)
             target_compile_definitions(libtcc  PRIVATE __x86_64__ TCC_TARGET_X86_64 _WIN64)
             target_compile_definitions(tcc     PRIVATE __x86_64__ TCC_TARGET_X86_64 _WIN64)
         endif()
-        # TCC_TARGET_PE: generate Windows PE/COFF output and use Windows
-        # runtime conventions instead of Linux/ELF. Required on libtcc so
-        # mods compile to .dll without TCC trying to link `crti.o`, and on
-        # the standalone tcc.exe so its `-impdef` tool is available.
+        # TCC_TARGET_PE: generate Windows PE/COFF code and use Windows
+        # runtime conventions instead of Linux/ELF. Required on libtcc for
+        # memory-mode mod relocation and on tcc.exe so `-impdef` is available.
         target_compile_definitions(libtcc PRIVATE TCC_TARGET_PE)
         target_compile_definitions(tcc    PRIVATE TCC_TARGET_PE)
         target_compile_definitions(libtcc1 PRIVATE "__faststorefence=__faststorefence_tcc_unused")

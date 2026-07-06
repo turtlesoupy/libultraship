@@ -9,6 +9,7 @@
 #include <string>
 #include <optional>
 #include <functional>
+#include <memory>
 
 namespace Ship {
 
@@ -26,11 +27,13 @@ enum class SafeLevel {
  * @brief Manages compilation, loading, and lifetime of runtime scripts.
  *
  * ScriptLoader compiles C/C++ source files found in mounted archives using TCC
- * (Tiny C Compiler), then loads the resulting shared objects at runtime so their
- * exported functions can be called by the engine via GetFunction().
+ * (Tiny C Compiler), then relocates the resulting code into process memory so
+ * its exported functions can be called by the engine via GetFunction().
  */
 class ScriptLoader {
   public:
+    struct LoadedScript;
+
     /**
      * @brief Constructs a ScriptLoader with the given compiler configuration.
      * @param compileDefines Preprocessor defines passed to the compiler.
@@ -46,6 +49,7 @@ class ScriptLoader {
         : mCodeVersion(codeVersion), mBuildOptions(buildOptions), mIncludePaths(includePaths),
           mLibraryPaths(libraryPaths), mLibraries(libraries), mCompileDefines(compileDefines) {
     }
+    ~ScriptLoader();
 
     /**
      * @brief Compiles script sources from a single archive.
@@ -63,7 +67,7 @@ class ScriptLoader {
                const std::optional<std::function<void()>>& postCallback = std::nullopt);
 
     /**
-     * @brief Loads all previously compiled script modules into the runtime.
+     * @brief Initializes all previously compiled script modules.
      * @param preInitCb  Optional callback invoked with the script's name
      *                    before its ModInit runs. Used by the host to set
      *                    the current hook-owner so InstallHook records
@@ -80,7 +84,7 @@ class ScriptLoader {
      * @param preExitCb  Optional callback invoked with the script's name
      *                    before its ModExit runs.
      * @param postExitCb Optional callback invoked AFTER ModExit returns
-     *                    but BEFORE the DLL is FreeLibrary'd. Used by
+     *                    but BEFORE the module memory is released. Used by
      *                    the host to walk per-mod state (e.g.,
      *                    UninstallHooksForOwner) while the mod's code
      *                    is still mapped.
@@ -119,7 +123,7 @@ class ScriptLoader {
     std::vector<std::string> mLibraryPaths;
     std::vector<std::string> mLibraries;
     std::unordered_map<std::string, std::string> mCompileDefines;
-    std::unordered_map<std::string, Scripting::LibraryLoader> mLoadedScripts;
+    std::unordered_map<std::string, std::shared_ptr<LoadedScript>> mLoadedScripts;
     std::vector<std::shared_ptr<Archive>> mLoadedArchives;
 };
 
