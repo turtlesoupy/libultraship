@@ -60,26 +60,57 @@ index 6c4f19cfef02..e4a4cbf98ef6 100644
 From 56f5907cf5224e1a2f64289029cc2b46e51d3b6c Mon Sep 17 00:00:00 2001
 From: briaguya <70942617+briaguya-ai@users.noreply.github.com>
 Date: Sat, 17 May 2025 04:42:41 -0400
-Subject: [PATCH 2/3] gamepad fix
+Subject: [PATCH 2/3] gamepad fix + Android per-frame monitor JNI guard
 
 ---
- backends/imgui_impl_sdl2.cpp | 3 ---
- 1 file changed, 3 deletions(-)
+ backends/imgui_impl_sdl2.cpp | 21 +++++++++++++++++----
+ 1 file changed, 17 insertions(+), 4 deletions(-)
 
 diff --git a/backends/imgui_impl_sdl2.cpp b/backends/imgui_impl_sdl2.cpp
-index f3a31c5c3c5e..2e6a1ad9d1f1 100644
+index f3a31c5c3..446d5faa4 100644
 --- a/backends/imgui_impl_sdl2.cpp
 +++ b/backends/imgui_impl_sdl2.cpp
 @@ -845,9 +845,6 @@ static void ImGui_ImplSDL2_UpdateGamepads()
          bd->WantUpdateGamepadsList = false;
      }
- 
+
 -    // FIXME: Technically feeding gamepad shouldn't depend on this now that they are regular inputs.
 -    if ((io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == 0)
 -        return;
      io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
      if (bd->Gamepads.Size == 0)
          return;
+@@ -885,6 +882,16 @@ static void ImGui_ImplSDL2_UpdateGamepads()
+ static void ImGui_ImplSDL2_UpdateMonitors()
+ {
+     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
++#if defined(__ANDROID__)
++    // Android has a single, fixed display and multi-viewport is disabled, so the
++    // monitor list is static — populate it once and never re-query. Rendering runs
++    // on the cooperative-scheduler fiber, whose stack pointer is outside the
++    // SDL_main thread's ART-registered stack bounds; a per-frame JNI call here
++    // (SDL_GetDisplayDPI Binder-IPCs into Java) trips ART's stack-overflow guard
++    // and aborts with a spurious StackOverflowError (the armeabi-v7a boot crash).
++    if (!platform_io.Monitors.empty())
++        return;
++#endif
+     platform_io.Monitors.resize(0);
+     int display_count = SDL_GetNumVideoDisplays();
+     for (int n = 0; n < display_count; n++)
+@@ -902,9 +909,12 @@ static void ImGui_ImplSDL2_UpdateMonitors()
+             monitor.WorkSize = ImVec2((float)r.w, (float)r.h);
+         }
+ #endif
+-#if SDL_HAS_PER_MONITOR_DPI
++#if SDL_HAS_PER_MONITOR_DPI && !defined(__ANDROID__)
+         // FIXME-VIEWPORT: On MacOS SDL reports actual monitor DPI scale, ignoring OS configuration. We may want to set
+         //  DpiScale to cocoa_window.backingScaleFactor here.
++        // Skipped on Android: SDL_GetDisplayDPI() Binder-IPCs into Java, which is
++        // unsafe from the render fiber (see the __ANDROID__ note at the top of this
++        // function). DPI scaling is unused on the single fixed Android display.
+         float dpi = 0.0f;
+         if (!SDL_GetDisplayDPI(n, &dpi, nullptr, nullptr))
+         {
 
 From 90c4297624a0fe993f1ac0e538bccdc80a0fc5f2 Mon Sep 17 00:00:00 2001
 From: briaguya <70942617+briaguya-ai@users.noreply.github.com>
