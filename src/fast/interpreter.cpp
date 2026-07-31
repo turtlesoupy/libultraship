@@ -2918,22 +2918,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    bool depth_test = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    // PORT: on the RDP, depth *comparison* is enabled solely by Z_CMP in
+    // other_mode_l; G_ZBUFFER in geometry mode only makes the RSP emit
+    // per-vertex Z (a prerequisite for any Z op, not a request to test).
+    // Deriving depth_test from G_ZBUFFER alone Z-rejects primitives whose
+    // render mode has Z_CMP clear — hardware never compares those. SSB64's
+    // intro explosion draws its red outer ring (Outline mesh) with G_ZBUFFER
+    // set but Z_CMP/Z_UPD clear, immediately after the redirect fill stamps
+    // the whole Z buffer to near: with gm-derived testing every ring pixel
+    // fails and the hardware-visible red starburst border vanishes.
+    bool has_vertex_z = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    bool depth_test = has_vertex_z && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     // PORT: SSB64's mvOpeningRoom transition Overlay/Outline use the N64
     // "redirect color image to Z buffer" idiom: tris are drawn with G_ZBUFFER
     // set in geometry_mode but no Z_CMP/Z_UPD in render mode, so on real
     // hardware they bypass depth comparison and write into the ZB as if it
-    // were a colour buffer. Fast3D ignores the colour-image redirect (so
-    // those tris land on the primary FB instead) and also derives
-    // depth_test from G_ZBUFFER alone — which Z-rejects them against the
-    // stale ZB content from the previous scene draw, making the explosion
-    // sprite invisible. When the redirect is active, gate depth_test on
-    // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
-    // white tris reach the framebuffer.
+    // were a colour buffer.
     bool redirect_active = RdpColorImageIsZBuffer();
     if (redirect_active) {
-        depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
         // On real hardware a redirect-active draw's combiner output is written
         // to the Z buffer as pixel data — unconditionally, regardless of
         // Z_UPD (that flag governs the *depth* path, but here the *color*
