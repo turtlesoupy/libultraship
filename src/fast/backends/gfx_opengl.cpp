@@ -27,6 +27,16 @@
 #include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
 
+#include <vector>
+#include <cstring>
+
+// stb_image_write for backbuffer screenshot capture (portFastCaptureBackbufferPNG).
+// STB_IMAGE_WRITE_STATIC keeps the instantiation TU-local, so this does not
+// collide with gfx_direct3d11.cpp's copy on builds that enable both backends.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
@@ -732,7 +742,64 @@ void GfxRenderingAPIOGL::StartFrame() {
     mFrameCount++;
 }
 
+// --------------------------------------------------------------------------
+// Backbuffer screenshot capture (portFastCaptureBackbufferPNG, GL path).
+//
+// Unlike DX11 (which can read the swap chain back buffer synchronously at any
+// point), GL's back buffer contents are undefined after SwapWindow. The port
+// calls portFastCaptureBackbufferPNG *after* the frame has been presented, so
+// a synchronous glReadPixels would read garbage on flip-model drivers.
+// Instead the request is staged here and fulfilled at the next EndFrame(),
+// which runs after all game + ImGui draws but before the buffer swap — the
+// default framebuffer is complete and well-defined at that point. Captures
+// therefore lag the requested frame index by exactly one frame on GL.
+// --------------------------------------------------------------------------
+static char sGLCapturePendingPath[1024];
+static bool sGLCapturePending = false;
+
+static void GLCaptureBackbufferNow(const char* path) {
+    auto wnd = Ship::Context::GetInstance() ? Ship::Context::GetInstance()->GetWindow() : nullptr;
+    if (wnd == nullptr) {
+        return;
+    }
+    const int32_t w = (int32_t)wnd->GetWidth();
+    const int32_t h = (int32_t)wnd->GetHeight();
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    GLint prevReadFb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    std::vector<uint8_t> pixels((size_t)w * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
+
+    // GL rows are bottom-up; PNG wants top-down. Flip in place, force opaque.
+    std::vector<uint8_t> row((size_t)w * 4);
+    for (int32_t y = 0; y < h / 2; ++y) {
+        uint8_t* a = pixels.data() + (size_t)y * w * 4;
+        uint8_t* b = pixels.data() + (size_t)(h - 1 - y) * w * 4;
+        memcpy(row.data(), a, row.size());
+        memcpy(a, b, row.size());
+        memcpy(b, row.data(), row.size());
+    }
+    for (size_t i = 3; i < pixels.size(); i += 4) {
+        pixels[i] = 0xFF;
+    }
+
+    if (stbi_write_png(path, w, h, 4, pixels.data(), w * 4) == 0) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG(GL): stbi_write_png failed for {}", path);
+    }
+}
+
 void GfxRenderingAPIOGL::EndFrame() {
+    if (sGLCapturePending) {
+        sGLCapturePending = false;
+        GLCaptureBackbufferNow(sGLCapturePendingPath);
+    }
     glFlush();
 }
 
@@ -1889,6 +1956,23 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
     return reinterpret_cast<ImTextureID>(id);
 }
 } // namespace Fast
+
+#if !defined(ENABLE_DX11) && !defined(__APPLE__)
+// C-callable entry point for the port (see gfx_direct3d11.cpp for the DX11
+// version, which owns the symbol whenever DX11 is compiled in; macOS keeps
+// the stub there). GL cannot read the back buffer after present, so this
+// stages the request; the PNG is written at the next EndFrame() (one frame
+// after the requested index). Returns 1 if the request was staged.
+extern "C" int portFastCaptureBackbufferPNG(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+    snprintf(Fast::sGLCapturePendingPath, sizeof(Fast::sGLCapturePendingPath), "%s", path);
+    Fast::sGLCapturePending = true;
+    return 1;
+}
+#endif
+
 #endif
 
 #pragma clang diagnostic pop

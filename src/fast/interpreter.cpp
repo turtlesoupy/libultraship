@@ -303,10 +303,32 @@ bool gfxPointerInLoadedModule(const void* ptr) {
                            reinterpret_cast<LPCSTR>(ptr), &mod) == 0) {
         return false;
     }
-    return mod != nullptr;
+    // The exception is for mod DLLs only. The main program image must not
+    // count: a non-relocated build occupies low VA, so every N64-segment
+    // leftover (0x01000000, 0x0E000000, ...) would land "inside a module"
+    // and the SETTIMG/G_VTX guards would never fire.
+    return mod != nullptr && mod != GetModuleHandleA(nullptr);
 #else
+    // Same main-image exclusion as Windows. On Linux the port links
+    // non-PIE, so the executable itself owns the sub-256MB VA range that
+    // stale N64-segment addresses decode into; treating "inside the main
+    // binary" as valid mod data structurally disabled these guards
+    // (observed: G_VTX walked vertices=0x1000000 into a SIGSEGV instead
+    // of being skipped). TCC source mods on POSIX are relocated in
+    // memory, not dlopen'd, so they never resolve via dladdr anyway —
+    // only real dlopen'd mod .so's should pass.
+    static void* sMainBase = [] {
+        Dl_info self = {};
+        if (dladdr(reinterpret_cast<void*>(&gfxPointerInLoadedModule), &self) != 0) {
+            return self.dli_fbase;
+        }
+        return static_cast<void*>(nullptr);
+    }();
     Dl_info info = {};
-    return dladdr(const_cast<void*>(ptr), &info) != 0 && info.dli_fbase != nullptr;
+    if (dladdr(const_cast<void*>(ptr), &info) == 0 || info.dli_fbase == nullptr) {
+        return false;
+    }
+    return info.dli_fbase != sMainBase;
 #endif
 }
 
@@ -936,16 +958,75 @@ void Interpreter::TextureCacheClear() {
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
 }
 
+// FNV-1a over the texture source bytes, 8-byte strides + tail. Reads exactly
+// the range the ImportTexture* miss path would read, so it is precisely as
+// safe as a cache miss.
+static uint64_t PortTextureContentHash(const uint8_t* p, uint32_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h ^= w;
+        h *= 1099511628211ULL;
+    }
+    for (; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// SSB64_TEXCACHE_VERIFY=0 disables content verification of cache hits.
+// Default is on: the key is raw-pointer identity and SSB64's bump heaps /
+// bridge buffers recycle addresses with identical shapes, so a hit can
+// silently alias a different texture (corrupted particles / backgrounds).
+static bool PortTextureCacheVerifyEnabled() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* env = std::getenv("SSB64_TEXCACHE_VERIFY");
+        mode = (env != nullptr && env[0] == '0') ? 0 : 1;
+    }
+    return mode != 0;
+}
+
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
 
+    const bool verify = PortTextureCacheVerifyEnabled() && key.texture_addr != nullptr && key.size_bytes != 0;
+    uint64_t content_hash = 0;
+    if (verify) {
+        content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+    }
+
     if (it != mTextureCache.map.end()) {
-        mRapi->SelectTexture(i, it->second.texture_id);
-        *n = &*it;
-        mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
-                                 it->second.lru_location); // move to back
-        return true;
+        if (verify && it->second.content_hash != content_hash) {
+            // Stale identity hit: same (addr, shape) key, different bytes.
+            // Evict and fall through to the miss path so the caller
+            // re-imports the current contents.
+            static int sStaleLogCount = 0;
+            if (sStaleLogCount < 64) {
+                SPDLOG_WARN("TextureCache stale-content hit healed: addr={} fmt={} siz={} {}x{} bytes={}",
+                            (const void*)key.texture_addr, key.fmt, key.siz, key.tile_width, key.tile_height,
+                            key.size_bytes);
+                sStaleLogCount++;
+            }
+            mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+                if (mRenderingState.mTextures[j] == &*it)
+                    mRenderingState.mTextures[j] = nullptr;
+            }
+            mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.map.erase(it);
+            it = mTextureCache.map.end();
+        } else {
+            mRapi->SelectTexture(i, it->second.texture_id);
+            *n = &*it;
+            mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
+                                     it->second.lru_location); // move to back
+            return true;
+        }
     }
 
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
@@ -971,6 +1052,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
     TextureCacheNode* node = &*it;
     node->second.texture_id = texture_id;
+    node->second.content_hash = content_hash;
     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
 
     mRapi->SelectTexture(i, texture_id);
@@ -3927,6 +4009,16 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
     if (mRdp->texture_to_load.addr == nullptr) {
         SPDLOG_ERROR("GfxDpLoadBlock: missing texture image for tile {}", tile);
+        // First occurrences per run: dump the exec-stack so the DL (and thus
+        // the object/file) issuing the NULL SETTIMG is identifiable. The
+        // intro "560 burst" renders an object textureless for a whole clip
+        // with no stale-token log — the pointer field read as zero; this
+        // names the holder.
+        static int sNullTexDiagCount = 0;
+        if (sNullTexDiagCount < 3) {
+            sNullTexDiagCount++;
+            DumpDLDiag(nullptr, "null-settimg-loadblock");
+        }
         return;
     }
 

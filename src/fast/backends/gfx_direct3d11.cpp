@@ -2368,10 +2368,13 @@ extern "C" int portFastCaptureBackbufferPNG(const char* path) {
 
 #else // !ENABLE_DX11
 
-// Stub when DX11 backend is disabled, so the port always has a symbol to link.
+#ifdef __APPLE__
+// Stub for Metal-only builds, so the port always has a symbol to link.
+// Linux/GL builds get the real GL implementation in gfx_opengl.cpp.
 extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     (void)path;
     return 0;
 }
+#endif
 
 #endif

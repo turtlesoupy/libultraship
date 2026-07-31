@@ -214,6 +214,12 @@ struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
+    // FNV-1a of the source bytes (texture_addr..+size_bytes) at import time.
+    // The cache key is raw-pointer identity; the game's bump heaps and the
+    // port's bridge buffers recycle addresses, so identity alone can alias
+    // two different textures. Verified on hit (see TextureCacheLookup);
+    // 0 when verification is disabled or the key carries no size.
+    uint64_t content_hash;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
