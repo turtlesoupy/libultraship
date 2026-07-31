@@ -171,6 +171,13 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    void SetColorWriteMask(bool enable) override;
+    void ClearColorRegion(float x0, float y0, float x1, float y1) override;
+
+  private:
+    void ClearRegionImpl(float x0, float y0, float x1, float y1, bool color, bool depth, float depth_value);
+
+  public:
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
@@ -217,6 +224,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int8_t mLastActiveTexture = -1;
     int8_t mLastBlendEnabled = -1;
     int8_t mLastScissorEnabled = -1;
+    bool mColorWriteEnabled = true; // mirrors SetColorWriteMask (redirect-to-Z draws)
 
     std::map<std::pair<uint64_t, uint32_t>, ShaderProgram> mShaderProgramPool;
     ShaderProgram* mCurrentShaderProgram;

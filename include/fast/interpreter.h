@@ -337,6 +337,13 @@ struct RDP {
     bool viewport_or_scissor_changed;
     void* z_buf_address;
     void* color_image_address;
+    // Raw (pre-SegAddr) operands of the last G_SETZIMG / G_SETCIMG. The
+    // resolved pointers can disagree for the same RDRAM target when a DL
+    // carries a baked N64 address whose segment resolution differs from the
+    // moment the depth image was registered; the redirect-to-Z detection
+    // accepts a match on either form.
+    uint32_t z_buf_address_raw;
+    uint32_t color_image_address_raw;
 };
 
 typedef enum Attribute {
@@ -371,6 +378,7 @@ struct RenderingState {
     uint8_t depth_test_and_mask; // 1: depth test, 2: depth mask
     bool decal_mode;
     bool alpha_blend;
+    bool color_write_enabled = true; // false while color image is redirected to the Z buffer
     struct XYWidthHeight viewport, scissor;
     struct ShaderProgram* mShaderProgram;
     TextureCacheNode* mTextures[SHADER_MAX_TEXTURES];
@@ -536,8 +544,14 @@ class Interpreter {
     void GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_t ulx, int32_t uly, int16_t uls, int16_t ult,
                              int32_t lrx, int32_t lry, int16_t lrs, int16_t lrt);
     void GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry);
-    void GfxDpSetZImage(void* zBufAddr);
-    void GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address);
+    void GfxDpSetZImage(void* zBufAddr, uint32_t rawAddr = 0);
+    void GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address, uint32_t rawAddr = 0);
+    // True when the color image currently targets the Z buffer (the SSB64
+    // redirect-to-Z idiom), matching on resolved pointers or raw operands.
+    bool RdpColorImageIsZBuffer() const;
+    // Accumulated native-res screen coverage of triangles this Run (see
+    // gfx_get_frame_tri_area_px). Public so the C bridge can read it.
+    float mFrameTriAreaPx = 0.0f;
     void GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t mode);
     void GfxDpSetOtherMode(uint32_t h, uint32_t l);
 

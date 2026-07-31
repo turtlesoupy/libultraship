@@ -72,6 +72,27 @@ class GfxRenderingAPI {
     virtual void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0,
                                  int dstY0, int dstX1, int dstY1) = 0;
     virtual void ClearFramebuffer(bool color, bool depth) = 0;
+    // Color-image-redirect emulation (SSB64 "gDPSetColorImage → Z buffer"
+    // idiom). Both have conservative defaults so backends can adopt them
+    // incrementally, mirroring DestroyFramebuffer/FbNeedsSampleVFlip below.
+    //
+    // Enable/disable framebuffer color writes for subsequent draws. Backends
+    // without an override keep drawing color (the pre-hook behavior).
+    virtual void SetColorWriteMask(bool enable) {
+        (void)enable;
+    }
+    // Clear only the color attachment inside the given normalized region.
+    // Used for widescreen pillarbox strips so the 4:3 content area keeps its
+    // prior-frame pixels (N64 framebuffers persist across frames; SSB64's
+    // opening transition displays weeks-old pixels outside its Z mask).
+    // Default falls back to a full-buffer color clear.
+    virtual void ClearColorRegion(float x0, float y0, float x1, float y1) {
+        (void)x0;
+        (void)y0;
+        (void)x1;
+        (void)y1;
+        ClearFramebuffer(true, false);
+    }
     virtual void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) = 0;
     virtual void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) = 0;
     virtual std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>

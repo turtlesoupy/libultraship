@@ -186,6 +186,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    void SetColorWriteMask(bool enable) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
@@ -284,6 +285,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     struct ShaderProgramD3D11* mLastShaderProgram = nullptr;
     uint32_t mLastVertexBufferStride = 0;
     Microsoft::WRL::ComPtr<ID3D11BlendState> mLastBlendState = nullptr;
+    // Redirect-to-Z draws (SSB64 color-image-redirect emulation): shared
+    // blend state with all color channels masked off, selected in
+    // DrawTriangles while mColorWritesDisabled is set.
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mNoColorWriteBlendState = nullptr;
+    bool mColorWritesDisabled = false;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mLastResourceViews[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
 

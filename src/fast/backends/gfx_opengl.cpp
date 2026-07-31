@@ -642,6 +642,10 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
     }
 }
 
+extern "C" int gPortGLDumpDraws;
+static void GLDumpDrawSnapshot();
+static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats);
+
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
@@ -697,6 +701,11 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     // printf("flushing %d tris\n", buf_vbo_num_tris);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+    if (gPortGLDumpDraws) {
+        GLDumpDrawVbo(buf_vbo, buf_vbo_len, buf_vbo_num_tris,
+                      buf_vbo_num_tris ? buf_vbo_len / (3 * buf_vbo_num_tris) : 0);
+        GLDumpDrawSnapshot();
+    }
 }
 
 void GfxRenderingAPIOGL::Init() {
@@ -801,6 +810,100 @@ void GfxRenderingAPIOGL::EndFrame() {
         GLCaptureBackbufferNow(sGLCapturePendingPath);
     }
     glFlush();
+}
+
+// Per-draw framebuffer dump (debug): when gPortGLDumpDraws is nonzero, every
+// DrawTriangles call writes a numbered snapshot of the current draw target so
+// a corrupt frame can be bisected to the exact draw. Armed externally (see
+// port/gameloop.cpp SSB64_DUMP_DRAWS). Reset the counter when re-arming.
+extern "C" int gPortGLDumpDraws = 0;
+static int sGLDumpDrawIndex = 0;
+
+static void GLDumpDrawSnapshot() {
+    char path[256];
+    GLint prevReadFb = 0, prevDrawFb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFb);
+    // Read only the current viewport rect — the one region guaranteed to be
+    // inside the draw target regardless of which FBO is bound.
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevDrawFb);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<uint8_t> pixels((size_t)w * h * 4);
+    glReadPixels(vp[0], vp[1], w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
+    std::vector<uint8_t> row((size_t)w * 4);
+    for (int32_t y = 0; y < h / 2; ++y) {
+        uint8_t* a = pixels.data() + (size_t)y * w * 4;
+        uint8_t* b = pixels.data() + (size_t)(h - 1 - y) * w * 4;
+        memcpy(row.data(), a, row.size());
+        memcpy(a, b, row.size());
+        memcpy(b, row.data(), row.size());
+    }
+    for (size_t i = 3; i < pixels.size(); i += 4) {
+        pixels[i] = 0xFF;
+    }
+    snprintf(path, sizeof(path), "draw_dump/draw_f%d_%04d.png", gPortGLDumpDraws, sGLDumpDrawIndex++);
+    stbi_write_png(path, w, h, 4, pixels.data(), w * 4);
+
+    // Append the GL state this draw used, for correlating visual anomalies
+    // with pipeline state.
+    static FILE* sStateLog = nullptr;
+    if (sStateLog == nullptr) {
+        sStateLog = fopen("draw_dump/draw_state.log", "w");
+    }
+    if (sStateLog != nullptr) {
+        GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+        GLboolean scissorEn = glIsEnabled(GL_SCISSOR_TEST);
+        GLint depthFunc = 0, depthMask = 0, sc[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+        glGetIntegerv(GL_DEPTH_WRITEMASK, &depthMask);
+        glGetIntegerv(GL_SCISSOR_BOX, sc);
+        GLint prog = 0, tex0 = 0, blendEn = 0, blendSrc = 0, blendDst = 0, activeTex = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTex);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+        glActiveTexture((GLenum)activeTex);
+        blendEn = glIsEnabled(GL_BLEND);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrc);
+        glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDst);
+        fprintf(sStateLog,
+                "%s vp=(%d,%d,%d,%d) scissor=%d(%d,%d,%d,%d) depth_test=%d func=0x%X mask=%d fbo=%d prog=%d tex0=%d "
+                "blend=%d(0x%X,0x%X)\n",
+                path, vp[0], vp[1], vp[2], vp[3], (int)scissorEn, sc[0], sc[1], sc[2], sc[3], (int)depthTest,
+                (unsigned)depthFunc, (int)depthMask, (int)prevDrawFb, (int)prog, (int)tex0, (int)blendEn,
+                (unsigned)blendSrc, (unsigned)blendDst);
+        fflush(sStateLog);
+    }
+}
+
+// Companion to GLDumpDrawSnapshot: log the submitted vertex positions so a
+// misplaced draw can be attributed to VBO contents vs pipeline state.
+static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats) {
+    static FILE* sVboLog = nullptr;
+    if (sVboLog == nullptr) {
+        sVboLog = fopen("draw_dump/draw_vbo.log", "w");
+    }
+    if (sVboLog == nullptr || num_tris == 0 || stride_floats == 0) {
+        return;
+    }
+    size_t verts = num_tris * 3;
+    if (verts > 6) {
+        verts = 6;
+    }
+    fprintf(sVboLog, "draw %d tris=%zu:", sGLDumpDrawIndex, num_tris);
+    for (size_t i = 0; i < verts; i++) {
+        const float* v = buf + i * stride_floats;
+        fprintf(sVboLog, "  (%.3f,%.3f,%.3f,%.3f)", v[0], v[1], v[2], v[3]);
+    }
+    fprintf(sVboLog, "\n");
+    fflush(sVboLog);
 }
 
 void GfxRenderingAPIOGL::FinishRender() {
@@ -987,14 +1090,83 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
         mLastScissorEnabled = 0;
         glDisable(GL_SCISSOR_TEST);
     }
+    if (color && !mColorWriteEnabled) {
+        // glClear honors glColorMask; a color clear must not be silently
+        // dropped while a redirect draw has color writes suppressed.
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
         glEnable(GL_SCISSOR_TEST);
     }
+}
+
+void GfxRenderingAPIOGL::SetColorWriteMask(bool enable) {
+    mColorWriteEnabled = enable;
+    glColorMask(enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE,
+                enable ? GL_TRUE : GL_FALSE);
+    // Redirect-to-Z draws (color writes off) also need REAL near/far
+    // clipping: the backend runs with GL_DEPTH_CLAMP enabled globally
+    // (N64-style permissive near behavior for ordinary color draws), but a
+    // depth-mask mesh straddling the camera plane then rasterizes an
+    // inflated unclipped shape and its synthesized-depth writes smear far
+    // beyond the authored mask region — SSB64's intro explosion Overlay
+    // punches its reveal mask over the red outer ring that way. The RSP
+    // clips these tris; matching that requires clipping here too.
+    if (enable) {
+        glEnable(GL_DEPTH_CLAMP);
+    } else {
+        glDisable(GL_DEPTH_CLAMP);
+    }
+}
+
+void GfxRenderingAPIOGL::ClearRegionImpl(float x0, float y0, float x1, float y1, bool color, bool depth,
+                                         float depth_value) {
+    const FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
+    const int w = (int)fb.width;
+    const int h = (int)fb.height;
+    int px0 = (int)(x0 * w + 0.5f);
+    int px1 = (int)(x1 * w + 0.5f);
+    // Game-space y is top-down; convert to this FB's row convention the same
+    // way GetPixelDepth does.
+    int py_top = (int)(y0 * h + 0.5f);
+    int py_bot = (int)(y1 * h + 0.5f);
+    int gy0 = fb.invertY ? (h - py_bot) : py_top;
+    if (px1 <= px0 || py_bot <= py_top) {
+        return;
+    }
+
+    GLint prevScissor[4];
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+    glScissor(px0, gy0, px1 - px0, py_bot - py_top);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    glDepthMask(GL_TRUE);
+    glClearDepth((GLdouble)depth_value);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
+    glClearDepth(1.0);
+    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
+    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
+}
+
+void GfxRenderingAPIOGL::ClearColorRegion(float x0, float y0, float x1, float y1) {
+    ClearRegionImpl(x0, y0, x1, y1, true, false, 1.0f);
 }
 
 void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1957,12 +2129,12 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 }
 } // namespace Fast
 
-#if !defined(ENABLE_DX11) && !defined(__APPLE__)
+#ifndef ENABLE_DX11
 // C-callable entry point for the port (see gfx_direct3d11.cpp for the DX11
-// version, which owns the symbol whenever DX11 is compiled in; macOS keeps
-// the stub there). GL cannot read the back buffer after present, so this
-// stages the request; the PNG is written at the next EndFrame() (one frame
-// after the requested index). Returns 1 if the request was staged.
+// version, which owns the symbol whenever DX11 is compiled in). GL cannot
+// read the back buffer after present, so this stages the request; the PNG is
+// written at the next EndFrame() (one frame after the requested index).
+// Returns 1 if the request was staged.
 extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     if (path == nullptr || path[0] == '\0') {
         return 0;

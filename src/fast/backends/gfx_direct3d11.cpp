@@ -783,10 +783,16 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->IASetInputLayout(mShaderProgram->input_layout.Get());
         mContext->VSSetShader(mShaderProgram->vertex_shader.Get(), 0, 0);
         mContext->PSSetShader(mShaderProgram->pixel_shader.Get(), 0, 0);
+    }
 
-        if (mLastBlendState.Get() != mShaderProgram->blend_state.Get()) {
-            mLastBlendState = mShaderProgram->blend_state.Get();
-            mContext->OMSetBlendState(mShaderProgram->blend_state.Get(), 0, 0xFFFFFFFF);
+    // Redirect-to-Z draws replace the program's blend state with a shared
+    // all-channels-masked state so only the synthesized depth lands.
+    {
+        ID3D11BlendState* desired =
+            mColorWritesDisabled ? mNoColorWriteBlendState.Get() : mShaderProgram->blend_state.Get();
+        if (mLastBlendState.Get() != desired) {
+            mLastBlendState = desired;
+            mContext->OMSetBlendState(desired, 0, 0xFFFFFFFF);
         }
     }
 
@@ -2366,15 +2372,27 @@ extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     }
 }
 
-#else // !ENABLE_DX11
+namespace Fast {
+void GfxRenderingAPIDX11::SetColorWriteMask(bool enable) {
+    mColorWritesDisabled = !enable;
+    if (!enable && mNoColorWriteBlendState.Get() == nullptr && mDevice) {
+        D3D11_BLEND_DESC blend_desc;
+        ZeroMemory(&blend_desc, sizeof(D3D11_BLEND_DESC));
+        blend_desc.RenderTarget[0].BlendEnable = false;
+        blend_desc.RenderTarget[0].RenderTargetWriteMask = 0;
+        mDevice->CreateBlendState(&blend_desc, mNoColorWriteBlendState.GetAddressOf());
+    }
+}
+} // namespace Fast
 
-#ifdef __APPLE__
-// Stub for Metal-only builds, so the port always has a symbol to link.
-// Linux/GL builds get the real GL implementation in gfx_opengl.cpp.
+#elif !defined(ENABLE_OPENGL) // !ENABLE_DX11 && !ENABLE_OPENGL
+
+// Stub when neither the DX11 nor the OpenGL backend is compiled in, so the
+// port always has a symbol to link. (gfx_opengl.cpp provides a real GL
+// implementation whenever ENABLE_OPENGL is set and DX11 is not.)
 extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     (void)path;
     return 0;
 }
-#endif
 
 #endif
