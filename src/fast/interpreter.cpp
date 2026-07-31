@@ -2809,7 +2809,19 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         if (y > w) {
             d->clip_rej |= 8; // CLIP_TOP
         }
-        // if (z < -w) d->clip_rej |= 16; // CLIP_NEAR
+        if (w <= 0.0f || z < -w) {
+            // CLIP_NEAR — outside the near plane, or behind the camera
+            // (w <= 0). The RSP trivially rejects triangles whose verts all
+            // share this code; without it, a poly straddling the camera
+            // plane reaches the rasterizer with mixed-sign w and produces a
+            // huge homogeneous wrap-around smear. SSB64 issue #72: the Yoshi
+            // catch flash quad sits entirely outside the near plane and
+            // must never draw (verified against cxd4-LLE RSP). Rejection
+            // still requires all three verts to share the flag, so
+            // geometry merely crossing the near plane keeps rendering
+            // exactly as before.
+            d->clip_rej |= 16;
+        }
         if (z > w) {
             d->clip_rej |= 32; // CLIP_FAR
         }
@@ -3304,6 +3316,35 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                                normVMax, v_arr[0]->x, v_arr[0]->y, v_arr[0]->z, v_arr[0]->w, v_arr[1]->x,
                                v_arr[1]->y, v_arr[1]->z, v_arr[1]->w, v_arr[2]->x, v_arr[2]->y, v_arr[2]->z,
                                v_arr[2]->w);
+    }
+
+    // Accumulate this triangle's screen coverage for the port's RCP cost
+    // model (see gfx_get_frame_tri_area_px). The RDP's per-pixel cost is
+    // fillrate-dominated; the DL-word cost model alone cannot see that a
+    // "cheap" 2-triangle quad covers the whole screen — SSB64's opening
+    // authors exploit exactly that (huge climax flash polys) to stall the
+    // RDP for several VIs. Area computed in native-resolution pixels from
+    // the projected NDC positions so it is window-size independent.
+    {
+        float sx[3], sy[3];
+        bool valid = true;
+        for (int i = 0; i < 3; i++) {
+            float w = v_arr[i]->w;
+            if (!(w > 0.0001f || w < -0.0001f)) {
+                valid = false;
+                break;
+            }
+            sx[i] = v_arr[i]->x / w;
+            sy[i] = v_arr[i]->y / w;
+        }
+        if (valid) {
+            float area_ndc = 0.5f * fabsf((sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]));
+            if (area_ndc > 8.0f) {
+                area_ndc = 8.0f; // clamp absurd off-screen tris; scissor bounds real cost
+            }
+            mFrameTriAreaPx +=
+                area_ndc * 0.25f * (float)mNativeDimensions.width * (float)mNativeDimensions.height;
+        }
     }
 
     for (int i = 0; i < 3; i++) {
@@ -6791,6 +6832,17 @@ extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback) {
     sGbiTraceCallback = callback;
 }
 
+// Screen coverage (native-resolution pixels) of all triangles processed in
+// the current/most recent Interpreter::Run. Consumed by the port's RCP cost
+// model so fillrate-heavy climax polys register like they do on real
+// hardware. Reset at the start of each Run.
+extern "C" float gfx_get_frame_tri_area_px(void) {
+    if (auto inst = mInstance.lock()) {
+        return inst->mFrameTriAreaPx;
+    }
+    return 0.0f;
+}
+
 void Interpreter::RunGuiOnly() {
     SpReset();
 
@@ -6845,6 +6897,7 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+    mFrameTriAreaPx = 0.0f;
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

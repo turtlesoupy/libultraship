@@ -644,6 +644,7 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
 
 extern "C" int gPortGLDumpDraws;
 static void GLDumpDrawSnapshot();
+static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats);
 
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
@@ -701,6 +702,8 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
     if (gPortGLDumpDraws) {
+        GLDumpDrawVbo(buf_vbo, buf_vbo_len, buf_vbo_num_tris,
+                      buf_vbo_num_tris ? buf_vbo_len / (3 * buf_vbo_num_tris) : 0);
         GLDumpDrawSnapshot();
     }
 }
@@ -861,12 +864,46 @@ static void GLDumpDrawSnapshot() {
         glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
         glGetIntegerv(GL_DEPTH_WRITEMASK, &depthMask);
         glGetIntegerv(GL_SCISSOR_BOX, sc);
+        GLint prog = 0, tex0 = 0, blendEn = 0, blendSrc = 0, blendDst = 0, activeTex = 0;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTex);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+        glActiveTexture((GLenum)activeTex);
+        blendEn = glIsEnabled(GL_BLEND);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrc);
+        glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDst);
         fprintf(sStateLog,
-                "%s vp=(%d,%d,%d,%d) scissor=%d(%d,%d,%d,%d) depth_test=%d func=0x%X mask=%d fbo=%d\n",
+                "%s vp=(%d,%d,%d,%d) scissor=%d(%d,%d,%d,%d) depth_test=%d func=0x%X mask=%d fbo=%d prog=%d tex0=%d "
+                "blend=%d(0x%X,0x%X)\n",
                 path, vp[0], vp[1], vp[2], vp[3], (int)scissorEn, sc[0], sc[1], sc[2], sc[3], (int)depthTest,
-                (unsigned)depthFunc, (int)depthMask, (int)prevDrawFb);
+                (unsigned)depthFunc, (int)depthMask, (int)prevDrawFb, (int)prog, (int)tex0, (int)blendEn,
+                (unsigned)blendSrc, (unsigned)blendDst);
         fflush(sStateLog);
     }
+}
+
+// Companion to GLDumpDrawSnapshot: log the submitted vertex positions so a
+// misplaced draw can be attributed to VBO contents vs pipeline state.
+static void GLDumpDrawVbo(const float* buf, size_t num_floats, size_t num_tris, size_t stride_floats) {
+    static FILE* sVboLog = nullptr;
+    if (sVboLog == nullptr) {
+        sVboLog = fopen("draw_dump/draw_vbo.log", "w");
+    }
+    if (sVboLog == nullptr || num_tris == 0 || stride_floats == 0) {
+        return;
+    }
+    size_t verts = num_tris * 3;
+    if (verts > 6) {
+        verts = 6;
+    }
+    fprintf(sVboLog, "draw %d tris=%zu:", sGLDumpDrawIndex, num_tris);
+    for (size_t i = 0; i < verts; i++) {
+        const float* v = buf + i * stride_floats;
+        fprintf(sVboLog, "  (%.3f,%.3f,%.3f,%.3f)", v[0], v[1], v[2], v[3]);
+    }
+    fprintf(sVboLog, "\n");
+    fflush(sVboLog);
 }
 
 void GfxRenderingAPIOGL::FinishRender() {

@@ -543,6 +543,9 @@ class Interpreter {
     // True when the color image currently targets the Z buffer (the SSB64
     // redirect-to-Z idiom), matching on resolved pointers or raw operands.
     bool RdpColorImageIsZBuffer() const;
+    // Accumulated native-res screen coverage of triangles this Run (see
+    // gfx_get_frame_tri_area_px). Public so the C bridge can read it.
+    float mFrameTriAreaPx = 0.0f;
     void GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t mode);
     void GfxDpSetOtherMode(uint32_t h, uint32_t l);
 
