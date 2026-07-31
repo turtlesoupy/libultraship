@@ -172,7 +172,6 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
     void SetColorWriteMask(bool enable) override;
-    void ClearDepthRegion(float x0, float y0, float x1, float y1, float depth) override;
     void ClearColorRegion(float x0, float y0, float x1, float y1) override;
 
   private:

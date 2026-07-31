@@ -2809,16 +2809,20 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         if (y > w) {
             d->clip_rej |= 8; // CLIP_TOP
         }
-        if (w <= 0.0f || z < -w) {
-            // CLIP_NEAR — outside the near plane, or behind the camera
-            // (w <= 0). The RSP trivially rejects triangles whose verts all
-            // share this code; without it, a poly straddling the camera
-            // plane reaches the rasterizer with mixed-sign w and produces a
-            // huge homogeneous wrap-around smear. SSB64 issue #72: the Yoshi
-            // catch flash quad sits entirely outside the near plane and
-            // must never draw (verified against cxd4-LLE RSP). Rejection
-            // still requires all three verts to share the flag, so
-            // geometry merely crossing the near plane keeps rendering
+        if (z < -w) {
+            // CLIP_NEAR — outside the near-plane half-space (z + w < 0, a
+            // homogeneous test that is valid for both signs of w). The RSP
+            // trivially rejects triangles whose verts all share this code;
+            // without it, a poly lying entirely outside the near plane
+            // reaches the rasterizer with mixed-sign w and produces a huge
+            // homogeneous wrap-around smear. SSB64 issue #72: the Yoshi
+            // catch flash quad has all four vertices in this half-space and
+            // must never draw (verified against cxd4-LLE RSP). Do NOT
+            // additionally flag all w <= 0 vertices: a partially visible
+            // primitive can legitimately own behind-camera vertices, and
+            // over-flagging them trivially rejects geometry that hardware
+            // clips and draws. Rejection still requires all three verts to share the
+            // flag, so geometry merely crossing the near plane renders
             // exactly as before.
             d->clip_rej |= 16;
         }
@@ -4520,34 +4524,38 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         // PORT: color-image-redirect fill — the game is writing a constant
         // 16-bit value into the Z buffer through the color path (per-camera
         // depth clears in objdisplay, and the mvOpeningRoom transition
-        // Outline's full-screen Z=near fill). Emulate as a depth clear that
-        // honors BOTH the written value and the fill rectangle:
-        //   - G_CYC_FILL: the value is fill_color's packed RGBA16
-        //     (objdisplay uses GPACK_ZDZ(G_MAXFBZ,0) = 0xFFFC → far).
-        //   - 1-cycle (Outline): the combiner output; SSB64 drives it with a
-        //     constant PRIM color ((0,0,0,FF) + XLU blend lands ~0x0001 on
-        //     hardware → near 0).
-        // Values at/above 0xFFFC snap to exactly 1.0 so the per-camera clear
-        // remains a bit-exact full-range clear. The region matters: the band
-        // cameras clear only their own viewport strip — a full-buffer clear
-        // here mid-frame stomps depth under the rest of the scene.
-        Flush();
+        // Outline's full-screen Z=near fill). Route it through the normal
+        // rectangle pipeline: the redirect-active tri path already
+        // suppresses framebuffer color writes and synthesizes constant
+        // depth from prim_color (packed 5551, >=0xFFFC snapping to exactly
+        // 1.0), so drawing the rect yields a value- and REGION-accurate
+        // depth fill on every backend with no backend-specific clear hook.
+        //   - G_CYC_FILL: the written value is fill_color's packed RGBA16
+        //     (objdisplay uses GPACK_ZDZ(G_MAXFBZ,0) = 0xFFFC → far) —
+        //     staged into prim_color for the duration of the draw.
+        //   - 1-cycle (Outline): the combiner constant is already
+        //     prim_color ((0,0,0,FF) + XLU blend lands ~0x0001 on hardware
+        //     → near 0).
+        // The region matters: the band cameras clear only their own
+        // viewport strip — a full-buffer clear here mid-frame stomps depth
+        // under the rest of the scene.
         uint32_t fill_mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
-        const auto& c = (fill_mode == G_CYC_FILL) ? mRdp->fill_color : mRdp->prim_color;
-        uint16_t z16 = (uint16_t)((((uint32_t)c.r >> 3) << 11) | (((uint32_t)c.g >> 3) << 6) |
-                                  (((uint32_t)c.b >> 3) << 1) | (c.a >= 128 ? 1u : 0u));
-        if (fill_mode == G_CYC_FILL && mRdp->fill_color.a != 0) {
-            z16 |= 1;
+        struct RGBA saved_prim = mRdp->prim_color;
+        uint64_t saved_combine = mRdp->combine_mode;
+        if (fill_mode == G_CYC_FILL) {
+            mRdp->prim_color = mRdp->fill_color;
         }
-        float depth = (z16 >= 0xFFFC) ? 1.0f : (float)z16 / 65535.0f;
-        // Fill coords are 10.2 fixed point in native (320x240) space; FILL
-        // mode is inclusive of the lower-right pixel.
-        float nx0 = (ulx / 4.0f) / (float)mNativeDimensions.width;
-        float ny0 = (uly / 4.0f) / (float)mNativeDimensions.height;
-        float nx1 = (lrx / 4.0f + 1.0f) / (float)mNativeDimensions.width;
-        float ny1 = (lry / 4.0f + 1.0f) / (float)mNativeDimensions.height;
-        mRapi->ClearDepthRegion(nx0, ny0, nx1, ny1, depth);
-        mRenderingState.depth_test_and_mask = 0xff; /* invalidate cached state */
+        // Match the non-redirect fill flow: FILL/COPY rects are inclusive of
+        // the lower-right pixel, and a known-constant combiner avoids
+        // stale-texture shader selection (color output is masked anyway).
+        if (fill_mode == G_CYC_COPY || fill_mode == G_CYC_FILL) {
+            lrx += 1 << 2;
+            lry += 1 << 2;
+        }
+        GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_PRIMITIVE), alpha_comb(0, 0, 0, G_ACMUX_PRIMITIVE), 0, 0);
+        GfxDrawRectangle(ulx, uly, lrx, lry);
+        mRdp->combine_mode = saved_combine;
+        mRdp->prim_color = saved_prim;
         return;
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));

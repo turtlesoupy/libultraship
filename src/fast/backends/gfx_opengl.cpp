@@ -1112,6 +1112,19 @@ void GfxRenderingAPIOGL::SetColorWriteMask(bool enable) {
     mColorWriteEnabled = enable;
     glColorMask(enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE,
                 enable ? GL_TRUE : GL_FALSE);
+    // Redirect-to-Z draws (color writes off) also need REAL near/far
+    // clipping: the backend runs with GL_DEPTH_CLAMP enabled globally
+    // (N64-style permissive near behavior for ordinary color draws), but a
+    // depth-mask mesh straddling the camera plane then rasterizes an
+    // inflated unclipped shape and its synthesized-depth writes smear far
+    // beyond the authored mask region — SSB64's intro explosion Overlay
+    // punches its reveal mask over the red outer ring that way. The RSP
+    // clips these tris; matching that requires clipping here too.
+    if (enable) {
+        glEnable(GL_DEPTH_CLAMP);
+    } else {
+        glDisable(GL_DEPTH_CLAMP);
+    }
 }
 
 void GfxRenderingAPIOGL::ClearRegionImpl(float x0, float y0, float x1, float y1, bool color, bool depth,
@@ -1150,10 +1163,6 @@ void GfxRenderingAPIOGL::ClearRegionImpl(float x0, float y0, float x1, float y1,
         glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
     }
     glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
-}
-
-void GfxRenderingAPIOGL::ClearDepthRegion(float x0, float y0, float x1, float y1, float depth) {
-    ClearRegionImpl(x0, y0, x1, y1, false, true, depth);
 }
 
 void GfxRenderingAPIOGL::ClearColorRegion(float x0, float y0, float x1, float y1) {

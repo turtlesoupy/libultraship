@@ -81,17 +81,6 @@ class GfxRenderingAPI {
     virtual void SetColorWriteMask(bool enable) {
         (void)enable;
     }
-    // Clear the depth attachment to `depth` (0..1) inside the given region,
-    // normalized to the game framebuffer (x0,y0 = top-left, 1.0 = full
-    // extent). Default falls back to the legacy full-buffer depth clear.
-    virtual void ClearDepthRegion(float x0, float y0, float x1, float y1, float depth) {
-        (void)x0;
-        (void)y0;
-        (void)x1;
-        (void)y1;
-        (void)depth;
-        ClearFramebuffer(false, true);
-    }
     // Clear only the color attachment inside the given normalized region.
     // Used for widescreen pillarbox strips so the 4:3 content area keeps its
     // prior-frame pixels (N64 framebuffers persist across frames; SSB64's
