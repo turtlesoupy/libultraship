@@ -2366,9 +2366,11 @@ extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     }
 }
 
-#else // !ENABLE_DX11
+#elif !defined(ENABLE_OPENGL) // !ENABLE_DX11 && !ENABLE_OPENGL
 
-// Stub when DX11 backend is disabled, so the port always has a symbol to link.
+// Stub when neither the DX11 nor the OpenGL backend is compiled in, so the
+// port always has a symbol to link. (gfx_opengl.cpp provides a real GL
+// implementation whenever ENABLE_OPENGL is set and DX11 is not.)
 extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     (void)path;
     return 0;

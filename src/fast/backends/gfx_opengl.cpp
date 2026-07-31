@@ -27,6 +27,16 @@
 #include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
 
+#include <vector>
+#include <cstring>
+
+// stb_image_write for backbuffer screenshot capture (portFastCaptureBackbufferPNG).
+// STB_IMAGE_WRITE_STATIC keeps the instantiation TU-local, so this does not
+// collide with gfx_direct3d11.cpp's copy on builds that enable both backends.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
     GLint max_texture_size;
@@ -632,6 +642,9 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
     }
 }
 
+extern "C" int gPortGLDumpDraws;
+static void GLDumpDrawSnapshot();
+
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
         mLastDepthTest = mCurrentDepthTest;
@@ -687,6 +700,9 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     // printf("flushing %d tris\n", buf_vbo_num_tris);
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
+    if (gPortGLDumpDraws) {
+        GLDumpDrawSnapshot();
+    }
 }
 
 void GfxRenderingAPIOGL::Init() {
@@ -732,8 +748,125 @@ void GfxRenderingAPIOGL::StartFrame() {
     mFrameCount++;
 }
 
+// --------------------------------------------------------------------------
+// Backbuffer screenshot capture (portFastCaptureBackbufferPNG, GL path).
+//
+// Unlike DX11 (which can read the swap chain back buffer synchronously at any
+// point), GL's back buffer contents are undefined after SwapWindow. The port
+// calls portFastCaptureBackbufferPNG *after* the frame has been presented, so
+// a synchronous glReadPixels would read garbage on flip-model drivers.
+// Instead the request is staged here and fulfilled at the next EndFrame(),
+// which runs after all game + ImGui draws but before the buffer swap — the
+// default framebuffer is complete and well-defined at that point. Captures
+// therefore lag the requested frame index by exactly one frame on GL.
+// --------------------------------------------------------------------------
+static char sGLCapturePendingPath[1024];
+static bool sGLCapturePending = false;
+
+static void GLCaptureBackbufferNow(const char* path) {
+    auto wnd = Ship::Context::GetInstance() ? Ship::Context::GetInstance()->GetWindow() : nullptr;
+    if (wnd == nullptr) {
+        return;
+    }
+    const int32_t w = (int32_t)wnd->GetWidth();
+    const int32_t h = (int32_t)wnd->GetHeight();
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    GLint prevReadFb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    std::vector<uint8_t> pixels((size_t)w * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
+
+    // GL rows are bottom-up; PNG wants top-down. Flip in place, force opaque.
+    std::vector<uint8_t> row((size_t)w * 4);
+    for (int32_t y = 0; y < h / 2; ++y) {
+        uint8_t* a = pixels.data() + (size_t)y * w * 4;
+        uint8_t* b = pixels.data() + (size_t)(h - 1 - y) * w * 4;
+        memcpy(row.data(), a, row.size());
+        memcpy(a, b, row.size());
+        memcpy(b, row.data(), row.size());
+    }
+    for (size_t i = 3; i < pixels.size(); i += 4) {
+        pixels[i] = 0xFF;
+    }
+
+    if (stbi_write_png(path, w, h, 4, pixels.data(), w * 4) == 0) {
+        SPDLOG_WARN("portFastCaptureBackbufferPNG(GL): stbi_write_png failed for {}", path);
+    }
+}
+
 void GfxRenderingAPIOGL::EndFrame() {
+    if (sGLCapturePending) {
+        sGLCapturePending = false;
+        GLCaptureBackbufferNow(sGLCapturePendingPath);
+    }
     glFlush();
+}
+
+// Per-draw framebuffer dump (debug): when gPortGLDumpDraws is nonzero, every
+// DrawTriangles call writes a numbered snapshot of the current draw target so
+// a corrupt frame can be bisected to the exact draw. Armed externally (see
+// port/gameloop.cpp SSB64_DUMP_DRAWS). Reset the counter when re-arming.
+extern "C" int gPortGLDumpDraws = 0;
+static int sGLDumpDrawIndex = 0;
+
+static void GLDumpDrawSnapshot() {
+    char path[256];
+    GLint prevReadFb = 0, prevDrawFb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFb);
+    // Read only the current viewport rect — the one region guaranteed to be
+    // inside the draw target regardless of which FBO is bound.
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int w = vp[2], h = vp[3];
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevDrawFb);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    std::vector<uint8_t> pixels((size_t)w * h * 4);
+    glReadPixels(vp[0], vp[1], w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFb);
+    std::vector<uint8_t> row((size_t)w * 4);
+    for (int32_t y = 0; y < h / 2; ++y) {
+        uint8_t* a = pixels.data() + (size_t)y * w * 4;
+        uint8_t* b = pixels.data() + (size_t)(h - 1 - y) * w * 4;
+        memcpy(row.data(), a, row.size());
+        memcpy(a, b, row.size());
+        memcpy(b, row.data(), row.size());
+    }
+    for (size_t i = 3; i < pixels.size(); i += 4) {
+        pixels[i] = 0xFF;
+    }
+    snprintf(path, sizeof(path), "draw_dump/draw_f%d_%04d.png", gPortGLDumpDraws, sGLDumpDrawIndex++);
+    stbi_write_png(path, w, h, 4, pixels.data(), w * 4);
+
+    // Append the GL state this draw used, for correlating visual anomalies
+    // with pipeline state.
+    static FILE* sStateLog = nullptr;
+    if (sStateLog == nullptr) {
+        sStateLog = fopen("draw_dump/draw_state.log", "w");
+    }
+    if (sStateLog != nullptr) {
+        GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
+        GLboolean scissorEn = glIsEnabled(GL_SCISSOR_TEST);
+        GLint depthFunc = 0, depthMask = 0, sc[4] = { 0, 0, 0, 0 };
+        glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+        glGetIntegerv(GL_DEPTH_WRITEMASK, &depthMask);
+        glGetIntegerv(GL_SCISSOR_BOX, sc);
+        fprintf(sStateLog,
+                "%s vp=(%d,%d,%d,%d) scissor=%d(%d,%d,%d,%d) depth_test=%d func=0x%X mask=%d fbo=%d\n",
+                path, vp[0], vp[1], vp[2], vp[3], (int)scissorEn, sc[0], sc[1], sc[2], sc[3], (int)depthTest,
+                (unsigned)depthFunc, (int)depthMask, (int)prevDrawFb);
+        fflush(sStateLog);
+    }
 }
 
 void GfxRenderingAPIOGL::FinishRender() {
@@ -920,14 +1053,74 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
         mLastScissorEnabled = 0;
         glDisable(GL_SCISSOR_TEST);
     }
+    if (color && !mColorWriteEnabled) {
+        // glClear honors glColorMask; a color clear must not be silently
+        // dropped while a redirect draw has color writes suppressed.
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
         glEnable(GL_SCISSOR_TEST);
     }
+}
+
+void GfxRenderingAPIOGL::SetColorWriteMask(bool enable) {
+    mColorWriteEnabled = enable;
+    glColorMask(enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE, enable ? GL_TRUE : GL_FALSE,
+                enable ? GL_TRUE : GL_FALSE);
+}
+
+void GfxRenderingAPIOGL::ClearRegionImpl(float x0, float y0, float x1, float y1, bool color, bool depth,
+                                         float depth_value) {
+    const FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
+    const int w = (int)fb.width;
+    const int h = (int)fb.height;
+    int px0 = (int)(x0 * w + 0.5f);
+    int px1 = (int)(x1 * w + 0.5f);
+    // Game-space y is top-down; convert to this FB's row convention the same
+    // way GetPixelDepth does.
+    int py_top = (int)(y0 * h + 0.5f);
+    int py_bot = (int)(y1 * h + 0.5f);
+    int gy0 = fb.invertY ? (h - py_bot) : py_top;
+    if (px1 <= px0 || py_bot <= py_top) {
+        return;
+    }
+
+    GLint prevScissor[4];
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+    glScissor(px0, gy0, px1 - px0, py_bot - py_top);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+    glDepthMask(GL_TRUE);
+    glClearDepth((GLdouble)depth_value);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
+    glClearDepth(1.0);
+    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    if (color && !mColorWriteEnabled) {
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    }
+    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
+}
+
+void GfxRenderingAPIOGL::ClearDepthRegion(float x0, float y0, float x1, float y1, float depth) {
+    ClearRegionImpl(x0, y0, x1, y1, false, true, depth);
+}
+
+void GfxRenderingAPIOGL::ClearColorRegion(float x0, float y0, float x1, float y1) {
+    ClearRegionImpl(x0, y0, x1, y1, true, false, 1.0f);
 }
 
 void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1889,6 +2082,23 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
     return reinterpret_cast<ImTextureID>(id);
 }
 } // namespace Fast
+
+#ifndef ENABLE_DX11
+// C-callable entry point for the port (see gfx_direct3d11.cpp for the DX11
+// version, which owns the symbol whenever DX11 is compiled in). GL cannot
+// read the back buffer after present, so this stages the request; the PNG is
+// written at the next EndFrame() (one frame after the requested index).
+// Returns 1 if the request was staged.
+extern "C" int portFastCaptureBackbufferPNG(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+    snprintf(Fast::sGLCapturePendingPath, sizeof(Fast::sGLCapturePendingPath), "%s", path);
+    Fast::sGLCapturePending = true;
+    return 1;
+}
+#endif
+
 #endif
 
 #pragma clang diagnostic pop

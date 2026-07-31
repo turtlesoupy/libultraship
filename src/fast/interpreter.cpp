@@ -633,9 +633,14 @@ void RegisterAddressClassifier(AddressClassifierFn fn) {
     sAddressClassifier = fn;
 }
 
+extern "C" void gbi_trace_note_flush(int num_tris);
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+        // Emit a marker into the GBI trace so draw-dump indices can be
+        // correlated with positions in the traced command stream.
+        gbi_trace_note_flush((int)mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -2910,16 +2915,33 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // sprite invisible. When the redirect is active, gate depth_test on
     // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
     // white tris reach the framebuffer.
-    bool redirect_active = mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr;
+    bool redirect_active = RdpColorImageIsZBuffer();
     if (redirect_active) {
         depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
-        depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+        // On real hardware a redirect-active draw's combiner output is written
+        // to the Z buffer as pixel data — unconditionally, regardless of
+        // Z_UPD (that flag governs the *depth* path, but here the *color*
+        // path is what lands in the Z buffer). Emulate by forcing depth
+        // writes on; the written value is synthesized below (see the
+        // use_prim_depth override) and framebuffer color writes are
+        // suppressed via SetColorWriteMask.
+        depth_mask = true;
     }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
         mRapi->SetDepthTestAndMask(depth_test, depth_mask);
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
+    }
+
+    // Suppress framebuffer color writes while the color image is redirected to
+    // the Z buffer: on hardware such draws have no color side effect. Backends
+    // without an override keep the previous (visible-draw) behavior.
+    bool color_write = !redirect_active;
+    if (color_write != mRenderingState.color_write_enabled) {
+        Flush();
+        mRapi->SetColorWriteMask(color_write);
+        mRenderingState.color_write_enabled = color_write;
     }
 
     bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
@@ -3185,6 +3207,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // depth-slope is irrelevant once we're producing post-projection Z directly.
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) == G_ZS_PRIM;
     float prim_depth_ndc = (float)mRdp->prim_depth_z / 65535.0f; // 0..1 (Metal-style)
+    if (redirect_active) {
+        // Color-image-redirect-to-Z: the value a redirect-active draw deposits
+        // in the Z buffer is its combiner output packed as RGBA16. SSB64's
+        // uses of the idiom (mvOpeningRoom transition Overlay, magnify mask)
+        // drive the combiner with a constant PRIM color, so synthesize the
+        // 16-bit value from prim_color and write it as constant depth —
+        // exactly the G_ZS_PRIM mechanism. 0xFFFC+ snaps to far (1.0) so a
+        // white fill matches a standard depth clear bit-exactly.
+        uint16_t z16 = (uint16_t)((((uint32_t)mRdp->prim_color.r >> 3) << 11) |
+                                  (((uint32_t)mRdp->prim_color.g >> 3) << 6) |
+                                  (((uint32_t)mRdp->prim_color.b >> 3) << 1) |
+                                  (mRdp->prim_color.a >= 128 ? 1u : 0u));
+        use_prim_depth = true;
+        prim_depth_ndc = (z16 >= 0xFFFC) ? 1.0f : (float)z16 / 65535.0f;
+    }
     if (!clip_parameters.z_is_from_0_to_1) {
         prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
     }
@@ -4284,6 +4321,17 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
     mRsp->geometry_mode = 0;
+    // RDP semantics: rectangles ARE depth-tested/depth-written when Z_CMP /
+    // Z_UPD are enabled — rects carry no per-pixel Z, so the RDP substitutes
+    // the primitive depth register (gDPSetPrimDepth, G_ZS_PRIM). SSB64's
+    // mvOpeningRoom transition relies on this: the dim-room wallpaper strips
+    // draw at PrimDepth z=0.56 with Z_CMP against the Z mask punched by the
+    // redirect-active Outline/Overlay draws. Route such rects through the
+    // depth-tested tri path; the G_ZS_PRIM handling there supplies the
+    // constant Z. Rects without Z_CMP keep the legacy always-on-top path.
+    if ((mRdp->other_mode_l & Z_CMP) == Z_CMP) {
+        mRsp->geometry_mode = G_ZBUFFER;
+    }
 
     GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, true);
     GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, true);
@@ -4311,7 +4359,7 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     // a black square with the circle inside). Matches the same skip in
     // GfxDpFillRectangle ("Don't clear Z buffer here since we already did
     // it with glClear").
-    if (mRdp->color_image_address == mRdp->z_buf_address) {
+    if (RdpColorImageIsZBuffer()) {
         return;
     }
     // printf("render %d at %d\n", tile, lrx);
@@ -4427,21 +4475,37 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
 }
 
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
-    if (mRdp->color_image_address == mRdp->z_buf_address) {
-        // PORT: SSB64's mvOpeningRoom transition Outline issues a full-screen
-        // FillRectangle to ZB right before drawing the visible silhouette tris
-        // with G_RM_AA_OPA_SURF (Z_CMP enabled). On real hardware that fill
-        // rewrites Z to a uniform value so the subsequent tris always pass
-        // depth comparison. Previously we just skipped this entirely under
-        // the assumption that the framebuffer's depth attachment had already
-        // been cleared by a glClear at start-of-frame, but that assumption
-        // doesn't hold mid-frame: the wallpaper drew with G_RM_AA_ZB_OPA_SURF
-        // (Z_UPD set) and filled the depth buffer with its own values, so
-        // Outline tris Z-fail and the transition silhouette never appears.
-        // Treat the redirect-fill as an actual depth clear so the Outline's
-        // subsequent OPA tris have a clean Z buffer to draw against.
+    if (RdpColorImageIsZBuffer()) {
+        // PORT: color-image-redirect fill — the game is writing a constant
+        // 16-bit value into the Z buffer through the color path (per-camera
+        // depth clears in objdisplay, and the mvOpeningRoom transition
+        // Outline's full-screen Z=near fill). Emulate as a depth clear that
+        // honors BOTH the written value and the fill rectangle:
+        //   - G_CYC_FILL: the value is fill_color's packed RGBA16
+        //     (objdisplay uses GPACK_ZDZ(G_MAXFBZ,0) = 0xFFFC → far).
+        //   - 1-cycle (Outline): the combiner output; SSB64 drives it with a
+        //     constant PRIM color ((0,0,0,FF) + XLU blend lands ~0x0001 on
+        //     hardware → near 0).
+        // Values at/above 0xFFFC snap to exactly 1.0 so the per-camera clear
+        // remains a bit-exact full-range clear. The region matters: the band
+        // cameras clear only their own viewport strip — a full-buffer clear
+        // here mid-frame stomps depth under the rest of the scene.
         Flush();
-        mRapi->ClearFramebuffer(false, true);
+        uint32_t fill_mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
+        const auto& c = (fill_mode == G_CYC_FILL) ? mRdp->fill_color : mRdp->prim_color;
+        uint16_t z16 = (uint16_t)((((uint32_t)c.r >> 3) << 11) | (((uint32_t)c.g >> 3) << 6) |
+                                  (((uint32_t)c.b >> 3) << 1) | (c.a >= 128 ? 1u : 0u));
+        if (fill_mode == G_CYC_FILL && mRdp->fill_color.a != 0) {
+            z16 |= 1;
+        }
+        float depth = (z16 >= 0xFFFC) ? 1.0f : (float)z16 / 65535.0f;
+        // Fill coords are 10.2 fixed point in native (320x240) space; FILL
+        // mode is inclusive of the lower-right pixel.
+        float nx0 = (ulx / 4.0f) / (float)mNativeDimensions.width;
+        float ny0 = (uly / 4.0f) / (float)mNativeDimensions.height;
+        float nx1 = (lrx / 4.0f + 1.0f) / (float)mNativeDimensions.width;
+        float ny1 = (lry / 4.0f + 1.0f) / (float)mNativeDimensions.height;
+        mRapi->ClearDepthRegion(nx0, ny0, nx1, ny1, depth);
         mRenderingState.depth_test_and_mask = 0xff; /* invalidate cached state */
         return;
     }
@@ -4476,12 +4540,21 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     mRdp->combine_mode = saved_combine_mode;
 }
 
-void Interpreter::GfxDpSetZImage(void* zBufAddr) {
+void Interpreter::GfxDpSetZImage(void* zBufAddr, uint32_t rawAddr) {
     mRdp->z_buf_address = zBufAddr;
+    mRdp->z_buf_address_raw = rawAddr;
 }
 
-void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address) {
+void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address, uint32_t rawAddr) {
     mRdp->color_image_address = address;
+    mRdp->color_image_address_raw = rawAddr;
+}
+
+bool Interpreter::RdpColorImageIsZBuffer() const {
+    if (mRdp->color_image_address != nullptr && mRdp->color_image_address == mRdp->z_buf_address) {
+        return true;
+    }
+    return mRdp->color_image_address_raw != 0 && mRdp->color_image_address_raw == mRdp->z_buf_address_raw;
 }
 
 void Interpreter::GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t mode) {
@@ -6050,7 +6123,7 @@ bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *(cmd0);
 
-    gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1));
+    gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1), (uint32_t)cmd->words.w1);
     return false;
 }
 
@@ -6058,7 +6131,7 @@ bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *(cmd0);
 
-    gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1));
+    gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1), (uint32_t)cmd->words.w1);
     return false;
 }
 
@@ -6737,10 +6810,21 @@ void Interpreter::RunGuiOnly() {
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     // SSB64 port widescreen: when active, the game's 4:3-authored scissor
     // covers only ~93% of the FB width, leaving uncleared side strips that
-    // show prior-frame garbage. Force a color clear in that mode. Outside
-    // widescreen we keep the depth-only clear so the GPU-readback bridge
-    // (port_capture_*) still has prior color contents available.
-    mRapi->ClearFramebuffer(mWidescreenActive, true);
+    // show prior-frame garbage. Clear ONLY those strips: the 4:3 content
+    // area must keep its prior-frame pixels in every mode — N64
+    // framebuffers persist across frames, and SSB64's opening desk→stage
+    // transition deliberately leaves old pixels visible outside its Z mask
+    // (issue #10); a full color clear turns that region black. Depth is
+    // still cleared every frame as before.
+    if (mWidescreenActive) {
+        float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
+        if (contentFrac < 1.0f) {
+            float side = (1.0f - contentFrac) * 0.5f;
+            mRapi->ClearColorRegion(0.0f, 0.0f, side, 1.0f);
+            mRapi->ClearColorRegion(1.0f - side, 0.0f, 1.0f, 1.0f);
+        }
+    }
+    mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6776,10 +6860,21 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     // SSB64 port widescreen: when active, the game's 4:3-authored scissor
     // covers only ~93% of the FB width, leaving uncleared side strips that
-    // show prior-frame garbage. Force a color clear in that mode. Outside
-    // widescreen we keep the depth-only clear so the GPU-readback bridge
-    // (port_capture_*) still has prior color contents available.
-    mRapi->ClearFramebuffer(mWidescreenActive, true);
+    // show prior-frame garbage. Clear ONLY those strips: the 4:3 content
+    // area must keep its prior-frame pixels in every mode — N64
+    // framebuffers persist across frames, and SSB64's opening desk→stage
+    // transition deliberately leaves old pixels visible outside its Z mask
+    // (issue #10); a full color clear turns that region black. Depth is
+    // still cleared every frame as before.
+    if (mWidescreenActive) {
+        float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
+        if (contentFrac < 1.0f) {
+            float side = (1.0f - contentFrac) * 0.5f;
+            mRapi->ClearColorRegion(0.0f, 0.0f, side, 1.0f);
+            mRapi->ClearColorRegion(1.0f - side, 0.0f, 1.0f, 1.0f);
+        }
+    }
+    mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
