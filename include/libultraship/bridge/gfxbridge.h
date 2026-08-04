@@ -31,6 +31,11 @@ float GfxGetWidescreenClipXScale(void);
 // impact-flash starburst). Default 0 ⇒ no scissor narrowing.
 void GfxSetTight4_3ScissorWindow(int active);
 
+// SSB64 port hook: preserve the complete widescreen game framebuffer between
+// frames while a transition intentionally uses prior color-buffer contents.
+// Default 0 keeps the normal side-strip clear used by authored 4:3 screens.
+void GfxSetWidescreenFramebufferPersistence(int active);
+
 #ifdef __cplusplus
 }
 #endif

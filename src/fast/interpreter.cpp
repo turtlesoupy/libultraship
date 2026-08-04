@@ -6971,7 +6971,7 @@ void Interpreter::RunGuiOnly() {
     // transition deliberately leaves old pixels visible outside its Z mask
     // (issue #10); a full color clear turns that region black. Depth is
     // still cleared every frame as before.
-    if (mWidescreenActive) {
+    if (mWidescreenActive && !mWidescreenFramebufferPersistence) {
         float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
         if (contentFrac < 1.0f) {
             float side = (1.0f - contentFrac) * 0.5f;
@@ -7022,7 +7022,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     // transition deliberately leaves old pixels visible outside its Z mask
     // (issue #10); a full color clear turns that region black. Depth is
     // still cleared every frame as before.
-    if (mWidescreenActive) {
+    if (mWidescreenActive && !mWidescreenFramebufferPersistence) {
         float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
         if (contentFrac < 1.0f) {
             float side = (1.0f - contentFrac) * 0.5f;

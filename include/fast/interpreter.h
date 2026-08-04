@@ -477,6 +477,12 @@ class Interpreter {
     // otherwise expose perspective-foreshortened slants in widescreen.
     void SetTight4_3ScissorWindow(bool active) { mTight4_3ScissorWindow = active; }
 
+    // Port hook: preserve the widened side regions of the game framebuffer
+    // across frames while an effect intentionally consumes prior color-buffer
+    // contents. Ordinary widescreen frames continue clearing untouched 4:3
+    // side strips so menus cannot expose stale scene pixels.
+    void SetWidescreenFramebufferPersistence(bool active) { mWidescreenFramebufferPersistence = active; }
+
     // private: TODO make these private
     void Flush();
     // End-of-frame composition step: resolves MSAA (when applicable),
@@ -618,6 +624,7 @@ class Interpreter {
     // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
     bool mWidescreenActive{};
     bool mTight4_3ScissorWindow{};
+    bool mWidescreenFramebufferPersistence{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

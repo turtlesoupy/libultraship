@@ -78,3 +78,19 @@ extern "C" void GfxSetTight4_3ScissorWindow(int active) {
     interp->SetTight4_3ScissorWindow(active != 0);
 }
 
+extern "C" void GfxSetWidescreenFramebufferPersistence(int active) {
+    auto window = Ship::Context::GetInstance()->GetWindow();
+    if (window == nullptr) {
+        return;
+    }
+    auto fast3d = std::dynamic_pointer_cast<Fast::Fast3dWindow>(window);
+    if (fast3d == nullptr) {
+        return;
+    }
+    auto interp = fast3d->GetInterpreterWeak().lock();
+    if (interp == nullptr) {
+        return;
+    }
+    interp->SetWidescreenFramebufferPersistence(active != 0);
+}
+
