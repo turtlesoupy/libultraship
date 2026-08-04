@@ -5419,8 +5419,13 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     // producing a pointer-shaped "opcode" and a cmd-word-shaped "pointer",
     // which then dispatches as garbage G_VTX with bogus vertex addresses.
     {
+        // A native host pointer can coincidentally contain 0x0E in bits
+        // 24..31 (Windows ASLR placed dFTShadowNoPrevLinkDL at
+        // 0x...0EC0D820). Only 32-bit values can be N64 segmented
+        // addresses; applying this rewrite to a 64-bit pointer redirects the
+        // call into unrelated segment-E heap data and starts a runaway walk.
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (segByte == 0x0E) {
+        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E) {
             uint32_t segNum = 0x0E;
             uintptr_t segBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
             if (segBase != 0) {
@@ -5448,7 +5453,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     // DL's containing reloc file (intra-file sub-DL branch).
     {
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
+        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
             uintptr_t fileBase = 0;
             size_t fileSize = 0;
             if (portRelocFindContainingFile(cmd, &fileBase, &fileSize)) {
