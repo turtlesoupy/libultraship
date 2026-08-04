@@ -7152,6 +7152,20 @@ void Interpreter::UpdatePostProcessFromCVars() {
 
 void Interpreter::ComposeFinalFrame() {
     mRapi->StartDrawToFramebuffer(0, 1);
+
+    // A display list may legitimately end while its color image is redirected
+    // to the depth buffer. That leaves the backend color-write mask disabled,
+    // but the GUI presentation pass that samples mGameFb is outside the N64
+    // display list and must always be able to write to the swap-chain buffer.
+    // OpenGL exposes the leak directly through its global glColorMask state:
+    // the fighter-name intro cards render correctly into mGameFb, then their
+    // ImGui::Image presentation is discarded and the cleared back buffer stays
+    // black. Restore both the backend state and our cache so the next game draw
+    // can disable writes again when it encounters another redirect.
+    if (!mRenderingState.color_write_enabled) {
+        mRapi->SetColorWriteMask(true);
+        mRenderingState.color_write_enabled = true;
+    }
     mRapi->ClearFramebuffer(true, true);
 
     // The texture-backed FBO whose color attachment the post-process pass
@@ -7207,6 +7221,13 @@ void Interpreter::PresentCurrentFramebuffer() {
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
     mRapi->StartDrawToFramebuffer(0, 1);
+
+    // Held VI frames bypass ComposeFinalFrame(), so independently guarantee
+    // that the cached game texture can be presented after a redirect-ending DL.
+    if (!mRenderingState.color_write_enabled) {
+        mRapi->SetColorWriteMask(true);
+        mRenderingState.color_write_enabled = true;
+    }
     mRapi->ClearFramebuffer(true, false);
 }
 
