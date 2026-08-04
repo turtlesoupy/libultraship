@@ -290,6 +290,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // DrawTriangles while mColorWritesDisabled is set.
     Microsoft::WRL::ComPtr<ID3D11BlendState> mNoColorWriteBlendState = nullptr;
     bool mColorWritesDisabled = false;
+    // Ordinary Fast3D draws keep D3D's permissive depth-clamp behavior.
+    // Redirect-to-Z mask draws temporarily enable real near/far clipping,
+    // matching the scoped GL_DEPTH_CLAMP toggle in the OpenGL backend.
+    int8_t mLastDepthClipEnabled = -1;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mLastResourceViews[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
     Microsoft::WRL::ComPtr<ID3D11SamplerState> mLastSamplerStates[SHADER_MAX_TEXTURES] = { nullptr, nullptr };
 

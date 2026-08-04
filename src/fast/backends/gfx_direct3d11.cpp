@@ -241,6 +241,7 @@ void GfxRenderingAPIDX11::Init() {
         mLastDepthTest = -1;
         mLastDepthMask = -1;
         mLastZmodeDecal = -1;
+        mLastDepthClipEnabled = -1;
         mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     });
 
@@ -689,8 +690,10 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
     }
 
-    if (mLastZmodeDecal != mCurrentZmodeDecal) {
+    const bool depthClipEnabled = mColorWritesDisabled;
+    if (mLastZmodeDecal != mCurrentZmodeDecal || mLastDepthClipEnabled != depthClipEnabled) {
         mLastZmodeDecal = mCurrentZmodeDecal;
+        mLastDepthClipEnabled = depthClipEnabled;
 
         mRasterizerState.Reset();
 
@@ -720,7 +723,11 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         }
         rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
         rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
+        // Redirect-to-Z draws synthesize the explosion's depth mask with
+        // color writes disabled.  Leaving depth clipping off lets triangles
+        // crossing the camera plane inflate across the screen corners.
+        // Ordinary draws retain the backend's established permissive mode.
+        rasterizer_desc.DepthClipEnable = depthClipEnabled;
         rasterizer_desc.ScissorEnable = true;
         rasterizer_desc.MultisampleEnable = false;
         rasterizer_desc.AntialiasedLineEnable = false;
