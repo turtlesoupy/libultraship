@@ -45,7 +45,17 @@ bool SDLAudioPlayer::DoInit() {
 
     SPDLOG_INFO("SDL Audio initialized: {} channels, {} Hz", mNumChannels, this->GetSampleRate());
 
+#ifndef __EMSCRIPTEN__
     SDL_PauseAudioDevice(mDevice, 0);
+#else
+    /* WASM: leave the device paused until the first real submission
+     * (DoPlay). Unpausing here lets SDL's queue-drain callback fire
+     * JS->wasm during the boot chain's deep Asyncify fiber unwinds,
+     * which can livelock the unwind state machine — the boot hang was
+     * timing-dependent (any change to startup work moved it). Once the
+     * frame loop is running, unwinds are shallow and the callback is
+     * safe. */
+#endif
     return true;
 }
 
@@ -54,6 +64,15 @@ int SDLAudioPlayer::Buffered() {
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
+#ifdef __EMSCRIPTEN__
+    /* Deferred unpause — see Init(). First DoPlay happens from the frame
+     * loop, after the boot chain's deep fiber unwinds are done. */
+    static bool sUnpaused = false;
+    if (!sUnpaused) {
+        SDL_PauseAudioDevice(mDevice, 0);
+        sUnpaused = true;
+    }
+#endif
     if (Buffered() < 6000) {
         // Don't fill the audio buffer too much in case this happens
         SDL_QueueAudio(mDevice, buf, len);

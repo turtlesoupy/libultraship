@@ -57,7 +57,13 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
 #ifdef __EMSCRIPTEN__
     fprintf(stderr, "SSB64[wasm]: osContInit — mappings loaded, PreInitRaphnet next\n");
 #endif
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit D (PreInitRaphnet)\n");
+#endif
     Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit E (SDL_Init gamecontroller)\n");
+#endif
 #ifdef __EMSCRIPTEN__
     fprintf(stderr, "SSB64[wasm]: osContInit — PreInitRaphnet done\n");
 #endif

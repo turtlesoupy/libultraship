@@ -179,10 +179,17 @@ list(APPEND ADDITIONAL_LIB_INCLUDES ${threadpool_SOURCE_DIR}/include)
 
 #=========== prism ===========
 option(PRISM_STANDALONE "Build prism as a standalone library" OFF)
+# parse_header patch: pre-reserve the line vector — the push_back realloc
+# memcpy reads past the old buffer (caught by ASan as container-overflow on
+# wasm; on normal builds it's silent heap-layout-dependent corruption that
+# manifested as boot hangs when unrelated allocations shifted).
+set(prism_patch_file ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/prism-reserve-lines.patch)
+set(prism_apply_patch_command ${CMAKE_COMMAND} -Dpatch_file=${prism_patch_file} -Dwith_reset=TRUE -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/git-patch.cmake)
 FetchContent_Declare(
     prism
     GIT_REPOSITORY https://github.com/KiritoDv/prism-processor.git
     GIT_TAG 1de054450e7b3c5f777d2e3dfcb228ad120c329d
+    PATCH_COMMAND ${prism_apply_patch_command}
 )
 FetchContent_MakeAvailable(prism)
 
