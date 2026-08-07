@@ -63,15 +63,33 @@ int SDLAudioPlayer::Buffered() {
     return SDL_GetQueuedAudioSize(mDevice) / (sizeof(int16_t) * mNumChannels);
 }
 
+#ifdef __EMSCRIPTEN__
+/* Boot gate for the deferred unpause (see Init). SDL's emscripten audio
+ * registers a wasm-side drain callback (HandleAudioProcess) the moment the
+ * device unpauses; if it fires while the boot chain's deep Asyncify fiber
+ * swaps are mid-flight, the reentrancy corrupts the asyncify state
+ * (observed as timing-dependent boot livelocks / EM_ASM asserts). DoPlay
+ * alone is not a safe gate — the audio FIBER submits during boot. The
+ * port's main loop calls port_audio_boot_complete() once boot is done. */
+static SDL_AudioDeviceID sEmDevice = 0;
+static bool sEmBootDone = false;
+static bool sEmUnpaused = false;
+static void emMaybeUnpause() {
+    if (sEmBootDone && !sEmUnpaused && sEmDevice != 0) {
+        SDL_PauseAudioDevice(sEmDevice, 0);
+        sEmUnpaused = true;
+    }
+}
+extern "C" void port_audio_boot_complete(void) {
+    sEmBootDone = true;
+    emMaybeUnpause();
+}
+#endif
+
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
 #ifdef __EMSCRIPTEN__
-    /* Deferred unpause — see Init(). First DoPlay happens from the frame
-     * loop, after the boot chain's deep fiber unwinds are done. */
-    static bool sUnpaused = false;
-    if (!sUnpaused) {
-        SDL_PauseAudioDevice(mDevice, 0);
-        sUnpaused = true;
-    }
+    sEmDevice = mDevice;
+    emMaybeUnpause();
 #endif
     if (Buffered() < 6000) {
         // Don't fill the audio buffer too much in case this happens
