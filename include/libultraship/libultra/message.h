@@ -6,6 +6,21 @@
 #define OS_MESG_NOBLOCK 0
 #define OS_MESG_BLOCK 1
 
+#ifdef __EMSCRIPTEN__
+/* wasm32: the C ABI passes multi-member unions INDIRECTLY (pointer to a
+ * temporary) while the C TUs that implement osSendMesg/osRecvMesg declare
+ * OSMesg as a plain void* (passed as a scalar). On x86-64/arm64 both happen
+ * to travel in one register, so the mismatch is latent; on wasm the callee
+ * reads the temporary's ADDRESS as the message value (the scheduler then
+ * chased one as a task pointer — table-index trap). Use the same scalar
+ * type on every TU instead. */
+typedef void* OSMesg;
+
+#define OS_MESG_8(x) ((OSMesg)(uintptr_t)(x))
+#define OS_MESG_16(x) ((OSMesg)(uintptr_t)(x))
+#define OS_MESG_32(x) ((OSMesg)(uintptr_t)(x))
+#define OS_MESG_PTR(x) ((OSMesg)(x))
+#else
 typedef union {
     u8 data8;
     u16 data16;
@@ -17,6 +32,7 @@ typedef union {
 #define OS_MESG_16(x) ((OSMesg){ .data16 = (x) })
 #define OS_MESG_32(x) ((OSMesg){ .data32 = (x) })
 #define OS_MESG_PTR(x) ((OSMesg){ .ptr = (x) })
+#endif
 
 #define osSendMesg8(queue, msg, flag) osSendMesg(queue, OS_MESG_8(msg), flag)
 #define osSendMesg16(queue, msg, flag) osSendMesg(queue, OS_MESG_16(msg), flag)

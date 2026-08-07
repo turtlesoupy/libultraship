@@ -50,12 +50,30 @@ size_t ResourceIdentifierHash::operator()(const ResourceIdentifier& rcd) const {
 ResourceManager::ResourceManager() {
 }
 
+#ifdef __EMSCRIPTEN__
+// WASM builds run single-threaded: BS::thread_pool would require -pthread
+// (SharedArrayBuffer + COOP/COEP headers), so "async" loads execute inline
+// and return an already-satisfied future instead.
+template <typename F> static auto RunInline(F&& func) {
+    using R = std::invoke_result_t<F>;
+    auto promise = std::make_shared<std::promise<R>>();
+    if constexpr (std::is_void_v<R>) {
+        func();
+        promise->set_value();
+    } else {
+        promise->set_value(func());
+    }
+    return promise->get_future().share();
+}
+#endif
+
 void ResourceManager::Init(const std::vector<std::string>& archivePaths,
                            const std::unordered_set<uint32_t>& validHashes, int32_t reservedThreadCount) {
     mResourceLoader = std::make_shared<ResourceLoader>();
     mArchiveManager = std::make_shared<ArchiveManager>();
     GetArchiveManager()->Init(archivePaths, validHashes);
 
+#ifndef __EMSCRIPTEN__
     // the extra `- 1` is because we reserve an extra thread for spdlog
     size_t threadCount = std::max(1, (int32_t)(std::thread::hardware_concurrency() - reservedThreadCount - 1));
     mThreadPool = std::make_shared<BS::thread_pool>(threadCount);
@@ -64,6 +82,7 @@ void ResourceManager::Init(const std::vector<std::string>& archivePaths,
         // Nothing ever unpauses the thread pool since nothing will ever try to load the archive again.
         mThreadPool->pause();
     }
+#endif
 }
 
 ResourceManager::~ResourceManager() {
@@ -211,11 +230,17 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
         return promise->get_future().share();
     }
 
+#ifdef __EMSCRIPTEN__
+    return RunInline([this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
+        return LoadResourceProcess(identifier, loadExact, initData);
+    });
+#else
     return mThreadPool->submit_task(
         [this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
             return LoadResourceProcess(identifier, loadExact, initData);
         },
         priority);
+#endif
 }
 
 std::shared_future<std::shared_ptr<IResource>>
@@ -328,11 +353,17 @@ ResourceManager::LoadResourcesProcess(const ResourceFilter& filter) {
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
 ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
+#ifdef __EMSCRIPTEN__
+    return RunInline([this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
+        return LoadResourcesProcess(filter);
+    });
+#else
     return mThreadPool->submit_task(
         [this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
             return LoadResourcesProcess(filter);
         },
         priority);
+#endif
 }
 
 std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
@@ -349,7 +380,7 @@ std::shared_ptr<std::vector<std::shared_ptr<IResource>>> ResourceManager::LoadRe
 }
 
 void ResourceManager::DirtyResources(const ResourceFilter& filter) {
-    mThreadPool->submit_task([this, filter]() -> void {
+    auto task = [this, filter]() -> void {
         auto list = GetArchiveManager()->ListFiles(filter.IncludeMasks, filter.ExcludeMasks);
 
         for (const auto& key : *list.get()) {
@@ -361,7 +392,12 @@ void ResourceManager::DirtyResources(const ResourceFilter& filter) {
                 UnloadResource({ key, filter.Owner, filter.Parent });
             }
         }
-    });
+    };
+#ifdef __EMSCRIPTEN__
+    RunInline(task);
+#else
+    mThreadPool->submit_task(task);
+#endif
 }
 
 void ResourceManager::DirtyResources(const std::string& searchMask) {
@@ -373,7 +409,11 @@ void ResourceManager::UnloadResourcesAsync(const std::string& searchMask, BS::pr
 }
 
 void ResourceManager::UnloadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
+#ifdef __EMSCRIPTEN__
+    RunInline([this, filter]() -> void { UnloadResourcesProcess(filter); });
+#else
     mThreadPool->submit_task([this, filter]() -> void { UnloadResourcesProcess(filter); }, priority);
+#endif
 }
 
 void ResourceManager::UnloadResources(const std::string& searchMask) {

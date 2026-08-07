@@ -104,6 +104,8 @@ if (USE_OPENGLES)
         target_link_libraries(libultraship PRIVATE GLESv3)
     elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
         target_link_libraries(libultraship PRIVATE OpenGL::GLES2)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+        # GLES3 -> WebGL2 comes from -sFULL_ES3 link flags; nothing to link.
     else()
         find_library(OPENGLES_LIBRARY GLESv2)
         target_link_libraries(libultraship PRIVATE GLESv2)

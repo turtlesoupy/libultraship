@@ -197,7 +197,7 @@ FetchContent_MakeAvailable(prism)
 # success but hid_enumerate() returns nullptr, so RaphnetPhysicalDeviceManager
 # decides "no adapter found" and the SDL2 / Java HIDDeviceManager handles
 # everything that's actually present.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     set(_LUS_HIDAPI_STUB_DIR ${CMAKE_CURRENT_BINARY_DIR}/hidapi_stub)
     file(MAKE_DIRECTORY ${_LUS_HIDAPI_STUB_DIR})
     file(WRITE ${_LUS_HIDAPI_STUB_DIR}/hidapi.h [=[

@@ -1,6 +1,9 @@
 #include "libultraship/libultraship.h"
 #include <SDL2/SDL.h>
 #include <ratio>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 // Establish a chrono duration for the N64 46.875MHz clock rate
 typedef std::ratio<3000, 64> n64ClockRatio;
@@ -25,7 +28,13 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     // pool tears down on the way out, leaving a 0xE06D7363 crash that's
     // hard to diagnose from a user log.
     try {
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "SSB64[wasm]: osContInit — entered, locating gamecontrollerdb\n");
+#endif
         std::string controllerDb = Ship::Context::LocateFileAcrossAppDirs("gamecontrollerdb.txt");
+#ifdef __EMSCRIPTEN__
+        fprintf(stderr, "SSB64[wasm]: osContInit — db at '%s', loading mappings\n", controllerDb.c_str());
+#endif
         int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
         if (mappingsAdded >= 0) {
             SPDLOG_INFO("Added SDL game controllers from \"{}\" ({})", controllerDb, mappingsAdded);
@@ -45,7 +54,13 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     // first and refuses sharing — claiming via hidapi first guarantees we
     // win the race. Internally PreInitRaphnet also globally skip-lists the
     // claimed VIDs so the SDL refresh below ignores them.
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit — mappings loaded, PreInitRaphnet next\n");
+#endif
     Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit — PreInitRaphnet done\n");
+#endif
 
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 #if defined(_WIN32)
@@ -88,8 +103,14 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
         SPDLOG_ERROR("Failed to initialize SDL game controllers ({})", SDL_GetError());
         exit(EXIT_FAILURE);
     }
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit — SDL gamecontroller init done, ControlDeck next\n");
+#endif
 
     Ship::Context::GetInstance()->GetControlDeck()->Init(controllerBits);
+#ifdef __EMSCRIPTEN__
+    fprintf(stderr, "SSB64[wasm]: osContInit — ControlDeck init done\n");
+#endif
 
     return 0;
 }
