@@ -412,6 +412,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
 #ifdef __IOS__
     Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
+#elif defined(__EMSCRIPTEN__)
+    /* No ALLOW_HIGHDPI in the browser: with it, SDL scales the canvas
+     * backing store by devicePixelRatio while parts of the pipeline keep
+     * using CSS-pixel window coordinates, rendering a dpr-times zoomed
+     * crop. Without it window == drawable == CSS pixels everywhere. */
+    Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
 #else
     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
