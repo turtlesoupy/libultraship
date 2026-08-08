@@ -15,6 +15,11 @@ if (NOT ZLIB_FOUND)
         OVERRIDE_FIND_PACKAGE
     )
     FetchContent_MakeAvailable(ZLIB)
+    # zlib's CMake gives the shared and static libs the same libz.a output
+    # under some generators — disambiguate so ninja doesn't see two rules.
+    if (TARGET zlibstatic)
+        set_target_properties(zlibstatic PROPERTIES OUTPUT_NAME zstatic)
+    endif()
     if (NOT TARGET ZLIB::ZLIB)
         add_library(ZLIB::ZLIB INTERFACE IMPORTED GLOBAL)
         target_link_libraries(ZLIB::ZLIB INTERFACE zlibstatic)
