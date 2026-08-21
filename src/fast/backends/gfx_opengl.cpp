@@ -2147,10 +2147,24 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 // read the back buffer after present, so this stages the request; the PNG is
 // written at the next EndFrame() (one frame after the requested index).
 // Returns 1 if the request was staged.
+#ifdef __APPLE__
+extern "C" int portMetalStageCapturePNG(const char* path);
+#endif
 extern "C" int portFastCaptureBackbufferPNG(const char* path) {
     if (path == nullptr || path[0] == '\0') {
         return 0;
     }
+#ifdef __APPLE__
+    // The Metal backend owns the frame when it is active; stage the capture
+    // there (see gfx_metal.cpp) instead of on the never-run GL EndFrame.
+    {
+        auto ctx = Ship::Context::GetInstance();
+        if (ctx && ctx->GetWindow() &&
+            ctx->GetWindow()->GetWindowBackend() == Ship::WindowBackend::FAST3D_SDL_METAL) {
+            return portMetalStageCapturePNG(path);
+        }
+    }
+#endif
     snprintf(Fast::sGLCapturePendingPath, sizeof(Fast::sGLCapturePendingPath), "%s", path);
     Fast::sGLCapturePending = true;
     return 1;

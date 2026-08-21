@@ -34,6 +34,13 @@
 
 #include "fast/backends/gfx_metal_shader.h"
 
+// stb_image_write for backbuffer screenshot capture (portFastCaptureBackbufferPNG).
+// STB_IMAGE_WRITE_STATIC keeps the instantiation TU-local (same pattern as
+// gfx_opengl.cpp / gfx_direct3d11.cpp).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 #include "libultraship/libultra/abi.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
@@ -76,6 +83,10 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
 
     mLayer = (CA::MetalLayer*)SDL_RenderGetMetalLayer(renderer);
     mLayer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    // Allow blit reads of the drawable for the port's screenshot capture
+    // (portFastCaptureBackbufferPNG). Default framebufferOnly=YES textures
+    // cannot be the source of a blit.
+    mLayer->setFramebufferOnly(false);
 
     mDevice = mLayer->device();
     mCommandQueue = mDevice->newCommandQueue();
@@ -599,6 +610,24 @@ void GfxRenderingAPIMetal::StartFrame() {
     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
 }
 
+// Backbuffer screenshot capture (portFastCaptureBackbufferPNG, Metal path).
+// Requests are staged (same contract as the GL backend: the PNG is written at
+// the next EndFrame, one frame after the requested index) and fulfilled by
+// blitting the presentable drawable into a CPU-shared buffer right before
+// present. MetalInit sets framebufferOnly=false on the layer so the drawable
+// texture is a legal blit source.
+static char sMetalCapturePendingPath[1024];
+static bool sMetalCapturePending = false;
+
+extern "C" int portMetalStageCapturePNG(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return 0;
+    }
+    snprintf(sMetalCapturePendingPath, sizeof(sMetalCapturePendingPath), "%s", path);
+    sMetalCapturePending = true;
+    return 1;
+}
+
 void GfxRenderingAPIMetal::EndFrame() {
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;
@@ -615,9 +644,45 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     auto screen_framebuffer = mFramebuffers[0];
     screen_framebuffer.mCommandEncoder->endEncoding();
+
+    MTL::Buffer* capture_buffer = nullptr;
+    uint32_t cap_w = 0, cap_h = 0;
+    if (sMetalCapturePending && mCurrentDrawable != nullptr) {
+        MTL::Texture* tex = mCurrentDrawable->texture();
+        if (tex != nullptr && tex->framebufferOnly() == false) {
+            cap_w = (uint32_t)tex->width();
+            cap_h = (uint32_t)tex->height();
+            capture_buffer = mDevice->newBuffer((size_t)cap_w * cap_h * 4, MTL::ResourceStorageModeShared);
+            if (capture_buffer != nullptr) {
+                MTL::BlitCommandEncoder* blit = screen_framebuffer.mCommandBuffer->blitCommandEncoder();
+                blit->copyFromTexture(tex, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(cap_w, cap_h, 1), capture_buffer, 0,
+                                      (NS::UInteger)cap_w * 4, (NS::UInteger)cap_w * 4 * cap_h);
+                blit->endEncoding();
+            }
+        }
+    }
+
     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
+
+    if (capture_buffer != nullptr) {
+        screen_framebuffer.mCommandBuffer->waitUntilCompleted();
+        // BGRA -> RGBA, force opaque alpha.
+        const uint8_t* src = (const uint8_t*)capture_buffer->contents();
+        std::vector<uint8_t> rgba((size_t)cap_w * cap_h * 4);
+        for (size_t i = 0; i < (size_t)cap_w * cap_h; i++) {
+            rgba[i * 4 + 0] = src[i * 4 + 2];
+            rgba[i * 4 + 1] = src[i * 4 + 1];
+            rgba[i * 4 + 2] = src[i * 4 + 0];
+            rgba[i * 4 + 3] = 0xFF;
+        }
+        if (stbi_write_png(sMetalCapturePendingPath, (int)cap_w, (int)cap_h, 4, rgba.data(), (int)cap_w * 4) == 0) {
+            SPDLOG_WARN("portFastCaptureBackbufferPNG(Metal): stbi_write_png failed for {}", sMetalCapturePendingPath);
+        }
+        capture_buffer->release();
+        sMetalCapturePending = false;
+    }
 
     mDrawnFramebuffers.clear();
 
