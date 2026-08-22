@@ -668,17 +668,35 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     if (capture_buffer != nullptr) {
         screen_framebuffer.mCommandBuffer->waitUntilCompleted();
-        // BGRA -> RGBA, force opaque alpha.
         const uint8_t* src = (const uint8_t*)capture_buffer->contents();
-        std::vector<uint8_t> rgba((size_t)cap_w * cap_h * 4);
-        for (size_t i = 0; i < (size_t)cap_w * cap_h; i++) {
-            rgba[i * 4 + 0] = src[i * 4 + 2];
-            rgba[i * 4 + 1] = src[i * 4 + 1];
-            rgba[i * 4 + 2] = src[i * 4 + 0];
-            rgba[i * 4 + 3] = 0xFF;
-        }
-        if (stbi_write_png(sMetalCapturePendingPath, (int)cap_w, (int)cap_h, 4, rgba.data(), (int)cap_w * 4) == 0) {
-            SPDLOG_WARN("portFastCaptureBackbufferPNG(Metal): stbi_write_png failed for {}", sMetalCapturePendingPath);
+        static const bool sRawCapture = (getenv("SSB64_SCREENSHOT_RAW") != nullptr);
+        if (sRawCapture) {
+            // Fast path: dump raw BGRA (+8-byte w/h header) and let the
+            // harness encode with ffmpeg. PNG encoding on the render
+            // thread cost ~0.4 s per frame and dominated capture time.
+            std::string rawPath = sMetalCapturePendingPath;
+            size_t dot = rawPath.rfind(".png");
+            if (dot != std::string::npos) rawPath = rawPath.substr(0, dot);
+            rawPath += ".raw";
+            FILE* f = fopen(rawPath.c_str(), "wb");
+            if (f != nullptr) {
+                uint32_t hdr[2] = { (uint32_t)cap_w, (uint32_t)cap_h };
+                fwrite(hdr, 4, 2, f);
+                fwrite(src, 1, (size_t)cap_w * cap_h * 4, f);
+                fclose(f);
+            }
+        } else {
+            // BGRA -> RGBA, force opaque alpha.
+            std::vector<uint8_t> rgba((size_t)cap_w * cap_h * 4);
+            for (size_t i = 0; i < (size_t)cap_w * cap_h; i++) {
+                rgba[i * 4 + 0] = src[i * 4 + 2];
+                rgba[i * 4 + 1] = src[i * 4 + 1];
+                rgba[i * 4 + 2] = src[i * 4 + 0];
+                rgba[i * 4 + 3] = 0xFF;
+            }
+            if (stbi_write_png(sMetalCapturePendingPath, (int)cap_w, (int)cap_h, 4, rgba.data(), (int)cap_w * 4) == 0) {
+                SPDLOG_WARN("portFastCaptureBackbufferPNG(Metal): stbi_write_png failed for {}", sMetalCapturePendingPath);
+            }
         }
         capture_buffer->release();
         sMetalCapturePending = false;
