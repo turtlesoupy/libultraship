@@ -416,8 +416,13 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     /* No ALLOW_HIGHDPI in the browser: with it, SDL scales the canvas
      * backing store by devicePixelRatio while parts of the pipeline keep
      * using CSS-pixel window coordinates, rendering a dpr-times zoomed
-     * crop. Without it window == drawable == CSS pixels everywhere. */
-    Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+     * crop. Without it window == drawable == CSS pixels everywhere.
+     * No RESIZABLE either: SDL's Emscripten driver resizes a RESIZABLE
+     * window to the browser window on every resize event (including to
+     * 0x0 when the tab is hidden), fighting the 4:3 presentation. The
+     * canvas keeps the configured size as its render buffer and the
+     * shell page's CSS scales the displayed element to fit. */
+    Uint32 flags = SDL_WINDOW_SHOWN;
 #else
     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
@@ -658,6 +663,38 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
 #ifdef __APPLE__
                     SDL_GetWindowSize(mWnd, &mWindowWidth, &mWindowHeight);
+#elif defined(__EMSCRIPTEN__)
+                    /* SDL's Emscripten driver sizes a RESIZABLE window to
+                     * fill the browser window. The N64 presents 4:3, so
+                     * clamp to the largest 4:3 rect that fits — the shell
+                     * page centers the canvas, giving letterbox/pillarbox
+                     * instead of a stretched (or cropped-FOV) picture.
+                     * Re-entrant SIZE_CHANGED from our SetWindowSize call
+                     * arrives already 4:3 and passes through unchanged. */
+                    {
+                        int dw = 0, dh = 0;
+                        SDL_GL_GetDrawableSize(mWnd, &dw, &dh);
+                        /* A hidden browser tab reports a 0-size window;
+                         * keep the last real size so the game continues
+                         * to render (headless capture relies on this). */
+                        if (dw > 0 && dh > 0) {
+                            mWindowWidth = dw;
+                            mWindowHeight = dh;
+                        }
+                    }
+                    {
+                        int fit_w = (mWindowHeight * 4) / 3;
+                        int fit_h = mWindowHeight;
+                        if (fit_w > mWindowWidth) {
+                            fit_w = mWindowWidth;
+                            fit_h = (mWindowWidth * 3) / 4;
+                        }
+                        if (fit_w != mWindowWidth || fit_h != mWindowHeight) {
+                            mWindowWidth = fit_w;
+                            mWindowHeight = fit_h;
+                            SDL_SetWindowSize(mWnd, fit_w, fit_h);
+                        }
+                    }
 #else
                     SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 #endif
