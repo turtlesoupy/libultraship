@@ -5509,6 +5509,37 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
         }
     }
 
+    /* PORT: a 32-bit target whose top byte is an F3D opcode (>= 0xD0)
+     * is command bytes read as a pointer — it can be neither a valid
+     * host pointer (userspace tops out below 0xD0000000 on 32-bit, and
+     * 64-bit heaps are above 4GB) nor a segmented address (segments are
+     * 0x0..0xF). Seen when a mis-strided seg-0x0E sub-DL call lands
+     * mid-command in a game-built widened DL (e.g. an injected mesh DL
+     * whose first word is gDPPipeSync = 0xE7000000). Skip instead of
+     * faulting; keep a breadcrumb for the stride bug hunt. */
+    {
+        uintptr_t subAddr = (uintptr_t)subGFX;
+        int cmdShaped = 0;
+        if (subAddr <= UINT32_MAX && (subAddr >> 24) >= 0xD0) {
+            cmdShaped = 1;  /* 32-bit: opcode in the top byte */
+        } else if (subAddr > UINT32_MAX && (subAddr >> 47) != 0) {
+            cmdShaped = 1;  /* 64-bit: above the userspace canonical range —
+                             * a widened Gfx word (opcode in bits 56..63)
+                             * read as a pointer via 8-byte misalignment */
+        }
+        if (cmdShaped) {
+            static int sCmdShapedCount = 0;
+            if (sCmdShapedCount < 10) {
+                sCmdShapedCount++;
+                SPDLOG_WARN("gfx_dl_handler: skipping command-shaped DL target "
+                            "0x{:x} (caller cmd at {}, w1=0x{:x})",
+                            (unsigned long long)subAddr, (void*)cmd,
+                            (unsigned long long)cmd->words.w1);
+            }
+            return false;
+        }
+    }
+
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
