@@ -3,6 +3,7 @@
 #include "ship/resource/File.h"
 #include "ship/resource/archive/Archive.h"
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include "ship/utils/StringHelper.h"
 #include "ship/utils/Utils.h"
@@ -232,7 +233,19 @@ ResourceManager::LoadResourceAsync(const ResourceIdentifier& identifier, bool lo
 
 #ifdef __EMSCRIPTEN__
     return RunInline([this, identifier, loadExact, initData]() -> std::shared_ptr<IResource> {
-        return LoadResourceProcess(identifier, loadExact, initData);
+        // Single-threaded wasm runs "async" loads inline in the frame; a slow
+        // one is a visible hitch. Log anything >30ms to stderr (browser
+        // console) with its path so stalls can be attributed — rare enough
+        // not to be console spam.
+        auto t0 = std::chrono::steady_clock::now();
+        auto res = LoadResourceProcess(identifier, loadExact, initData);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        if (ms > 30) {
+            fprintf(stderr, "SSB64[wasm]: slow inline load %lldms: %s\n",
+                    (long long)ms, identifier.Path.c_str());
+        }
+        return res;
     });
 #else
     return mThreadPool->submit_task(
@@ -355,7 +368,17 @@ std::shared_future<std::shared_ptr<std::vector<std::shared_ptr<IResource>>>>
 ResourceManager::LoadResourcesAsync(const ResourceFilter& filter, BS::priority_t priority) {
 #ifdef __EMSCRIPTEN__
     return RunInline([this, filter]() -> std::shared_ptr<std::vector<std::shared_ptr<IResource>>> {
-        return LoadResourcesProcess(filter);
+        auto t0 = std::chrono::steady_clock::now();
+        auto res = LoadResourcesProcess(filter);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        if (ms > 30) {
+            fprintf(stderr, "SSB64[wasm]: slow inline bulk load %lldms: %s (%zu files)\n",
+                    (long long)ms,
+                    filter.IncludeMasks.empty() ? "?" : filter.IncludeMasks.front().c_str(),
+                    res ? res->size() : (size_t)0);
+        }
+        return res;
     });
 #else
     return mThreadPool->submit_task(
