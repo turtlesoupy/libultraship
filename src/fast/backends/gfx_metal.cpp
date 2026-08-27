@@ -662,7 +662,9 @@ void GfxRenderingAPIMetal::EndFrame() {
         }
     }
 
-    screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+    if (mCurrentDrawable != nullptr) {
+        screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+    }
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
 
@@ -813,7 +815,18 @@ int GfxRenderingAPIMetal::CreateFramebuffer() {
 
 void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
     mCurrentDrawable = nullptr;
-    mCurrentDrawable = mLayer->nextDrawable();
+    // nextDrawable blocks up to ~1s and returns nil if the layer's drawable
+    // pool is exhausted (WindowServer under load, e.g. several instances
+    // booting at once). Retry a few times instead of dereferencing nil.
+    for (int attempt = 0; attempt < 5 && mCurrentDrawable == nullptr; attempt++) {
+        mCurrentDrawable = mLayer->nextDrawable();
+    }
+    if (mCurrentDrawable == nullptr) {
+        // Keep last frame's render pass / texture (retained below); EndFrame
+        // skips present when there is no drawable.
+        SPDLOG_WARN("Metal: nextDrawable returned nil; skipping present this frame");
+        return;
+    }
 
     bool msaa_enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
 
@@ -825,7 +838,13 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
     if (tex.texture != nullptr)
         tex.texture->release();
 
+    // texture() is a borrowed +0 reference owned by the layer's image queue;
+    // retain it to balance the release above (and DestroyFramebuffer /
+    // shutdown). Releasing without this retain frees the queue's image out
+    // from under it and CAImageQueueCollect crashes inside a later
+    // nextDrawable (objc_msgSend on a freed object in release_images).
     tex.texture = mCurrentDrawable->texture();
+    tex.texture->retain();
 
     MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
     render_pass_descriptor->colorAttachments()->object(0)->setTexture(tex.texture);
@@ -1159,8 +1178,9 @@ void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_so
     MTL::Texture* source_texture = mTextures[source_texture_id].texture;
 
     int target_texture_id = mFramebuffers[fb_id_target].mTextureId;
-    MTL::Texture* target_texture =
-        target_texture_id == 0 ? mCurrentDrawable->texture() : mTextures[target_texture_id].texture;
+    MTL::Texture* target_texture = (target_texture_id == 0 && mCurrentDrawable != nullptr)
+                                       ? mCurrentDrawable->texture()
+                                       : mTextures[target_texture_id].texture;
 
     // Workaround for detecting when transitioning to/from full screen mode.
     if (source_texture->width() != target_texture->width() || source_texture->height() != target_texture->height()) {
