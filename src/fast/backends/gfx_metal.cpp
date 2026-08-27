@@ -647,8 +647,15 @@ void GfxRenderingAPIMetal::EndFrame() {
 
     MTL::Buffer* capture_buffer = nullptr;
     uint32_t cap_w = 0, cap_h = 0;
-    if (sMetalCapturePending && mCurrentDrawable != nullptr) {
-        MTL::Texture* tex = mCurrentDrawable->texture();
+    if (sMetalCapturePending) {
+        // Blit from the screen framebuffer's RETAINED texture — the same
+        // object as mCurrentDrawable->texture() on normal frames. During
+        // drawable-pool starvation (nextDrawable nil under parallel-instance
+        // load) SetupScreenFramebuffer keeps last frame's texture and the
+        // game still renders into it, so captures keep working even while
+        // presents are skipped; gating on mCurrentDrawable silently dropped
+        // every capture for the rest of such a run (truncated eval clips).
+        MTL::Texture* tex = mTextures[mFramebuffers[0].mTextureId].texture;
         if (tex != nullptr && tex->framebufferOnly() == false) {
             cap_w = (uint32_t)tex->width();
             cap_h = (uint32_t)tex->height();
@@ -823,8 +830,14 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
     }
     if (mCurrentDrawable == nullptr) {
         // Keep last frame's render pass / texture (retained below); EndFrame
-        // skips present when there is no drawable.
-        SPDLOG_WARN("Metal: nextDrawable returned nil; skipping present this frame");
+        // skips present when there is no drawable but still renders and
+        // captures into the kept texture. Starvation can persist for the
+        // rest of a run (occluded/offscreen windows under load), so
+        // rate-limit the warn instead of one line per frame.
+        static uint32_t sNilDrawableFrames = 0;
+        if (sNilDrawableFrames++ % 300 == 0) {
+            SPDLOG_WARN("Metal: nextDrawable returned nil; skipping present ({} frames so far)", sNilDrawableFrames);
+        }
         return;
     }
 
