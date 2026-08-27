@@ -713,6 +713,19 @@ void RegisterDLBoundsCheck(DLBoundsCheckFn fn);
 using AddressClassifierFn = int (*)(uintptr_t addr, char* buf, size_t buf_size);
 void RegisterAddressClassifier(AddressClassifierFn fn);
 
+/* DL range add/remove hooks. The widened packed-DL copies the interpreter
+ * builds (portNormalizeDisplayListPointer) live in plain heap allocations;
+ * unless the game's range registry knows about them, a copy that malloc
+ * happens to place inside the bounds-check's walked-past shadow window of
+ * some registered range is condemned as a runaway on every walk — the
+ * whole frame's remaining draws are dropped, heap-layout-dependently.
+ * When registered, the interpreter reports each widened copy's exact
+ * extent through these hooks so the registry can treat it as a
+ * first-class DL range. */
+using DLRangeRegisterFn = void (*)(const void* base, size_t size, const char* label);
+using DLRangeUnregisterFn = void (*)(const void* base);
+void RegisterDLRangeHooks(DLRangeRegisterFn reg, DLRangeUnregisterFn unreg);
+
 /* Dump the recent-DL-pushes and recent-segment-writes ring buffers via
  * SPDLOG_CRITICAL. Called from SIGSEGV handlers (CrashHandler.cpp,
  * port_watchdog.cpp) — `badCmd` is best-effort, typically `siginfo->si_addr`.

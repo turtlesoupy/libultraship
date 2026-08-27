@@ -117,6 +117,11 @@ std::stack<std::string> currentDir;
 
 #define TEXTURE_CACHE_MAX_SIZE 1024
 
+/* DL range add/remove hooks (see interpreter.h). File scope so the packed-DL
+ * widening cache below can announce its heap copies to the game's registry. */
+static Fast::DLRangeRegisterFn sDLRangeRegister = nullptr;
+static Fast::DLRangeUnregisterFn sDLRangeUnregister = nullptr;
+
 namespace {
 
 constexpr size_t PORT_PACKED_GFX_SIZE = sizeof(uint32_t) * 2;
@@ -267,6 +272,9 @@ Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
 
     Fast::F3DGfx* translatedPtr = translated->data();
     sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
+    if (sDLRangeRegister != nullptr) {
+        sDLRangeRegister(translatedPtr, translated->size() * sizeof(Fast::F3DGfx), "widened-dl");
+    }
 
     return translatedPtr;
 }
@@ -384,6 +392,11 @@ bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
 } // namespace
 
 extern "C" void portResetPackedDisplayListCache(void) {
+    if (sDLRangeUnregister != nullptr) {
+        for (const auto& [source, info] : sPortPackedDisplayListCache) {
+            sDLRangeUnregister(info.commands->data());
+        }
+    }
     sPortPackedDisplayListCache.clear();
 }
 
@@ -414,6 +427,9 @@ extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t s
             }
         }
         if (evict) {
+            if (sDLRangeUnregister != nullptr) {
+                sDLRangeUnregister(it->second.commands->data());
+            }
             it = sPortPackedDisplayListCache.erase(it);
         } else {
             ++it;
@@ -653,6 +669,11 @@ void RegisterDLBoundsCheck(DLBoundsCheckFn fn) {
 
 void RegisterAddressClassifier(AddressClassifierFn fn) {
     sAddressClassifier = fn;
+}
+
+void RegisterDLRangeHooks(DLRangeRegisterFn reg, DLRangeUnregisterFn unreg) {
+    sDLRangeRegister = reg;
+    sDLRangeUnregister = unreg;
 }
 
 extern "C" void gbi_trace_note_flush(int num_tris);
@@ -5242,16 +5263,25 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
 // malloc + memcpy a heap copy at every init.
 static inline bool gfx_vtx_addr_is_unresolved(const void* addr) {
     uintptr_t i = (uintptr_t)addr;
-#if UINTPTR_MAX > 0xFFFFFFFFu
+#if defined(__EMSCRIPTEN__)
+    // wasm32 linear memory: with INITIAL_MEMORY=512MB the malloc heap
+    // straddles the 32-bit guard's 0x10000000 line, so legitimate Vtx
+    // arrays land below it and would be dropped (mesh silently absent,
+    // dependent on where malloc placed the buffer). The SIGSEGV this
+    // guard exists to prevent cannot happen here — an in-bounds read of
+    // a stale segment token just returns garbage — so only reject null.
+    return i == 0;
+#elif UINTPTR_MAX > 0xFFFFFFFFu
     if (i == 0 || i >= 0x100000000ull) {
         return false;
     }
+    return !gfxPointerInLoadedModule(addr);
 #else
     if (i > 0x0FFFFFFFu) {
         return false;
     }
-#endif
     return !gfxPointerInLoadedModule(addr);
+#endif
 }
 
 // Almost all versions of the microcode have their own version of this opcode
@@ -5839,9 +5869,18 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     // real `.rodata` texture from a TCC mod whose DLL got loaded at a low
     // preferred base. Accepting those lets mods use static texture data
     // without a heap-copy workaround.
+#if defined(__EMSCRIPTEN__)
+    // wasm32: heap pointers legitimately occupy the sub-0x10000000 range
+    // (see gfx_vtx_addr_is_unresolved), and an unresolved token can't
+    // fault here — only reject null.
+    if (i == 0) {
+        return false;
+    }
+#else
     if (i <= 0x0FFFFFFF && !gfxPointerInLoadedModule(reinterpret_cast<const void*>(i))) {
         return false;
     }
+#endif
 
     gfx->GfxDpSetTextureImage(C0(21, 3), C0(19, 2), C0(0, 12) + 1, imgData, texFlags, rawTexMetdata, (void*)i);
 
