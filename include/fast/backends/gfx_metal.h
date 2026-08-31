@@ -29,6 +29,7 @@ class Device;
 class Function;
 class Buffer;
 class RenderPipelineState;
+class RenderPipelineDescriptor;
 class CommandQueue;
 class Viewport;
 class Library;
@@ -65,8 +66,11 @@ struct ShaderProgramMetal {
     uint8_t numFloats;
     bool usedTextures[SHADER_MAX_TEXTURES];
 
-    // hashed by msaa_level
-    MTL::RenderPipelineState* pipeline_state_variants[9];
+    // Indexed by color writes (0 = disabled, 1 = enabled), then MSAA level.
+    // Metal bakes the attachment write mask into the pipeline state, so
+    // redirect-to-Z draws need a distinct pipeline from visible draws.
+    MTL::RenderPipelineState* pipeline_state_variants[2][9] = {};
+    MTL::RenderPipelineDescriptor* pipeline_descriptor = nullptr;
 };
 
 // Compiled post-process program. The pipeline state expects:
@@ -189,6 +193,7 @@ struct FramebufferMetal {
     int8_t mLastDepthTest = -1;
     int8_t mLastDepthMask = -1;
     int8_t mLastZmodeDecal = -1;
+    int8_t mLastColorWriteEnabled = -1;
 };
 
 struct FrameUniforms {
@@ -239,6 +244,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
+    void SetColorWriteMask(bool enable) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
     void ResolveMSAAColorBuffer(int fbIdTarger, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
@@ -325,6 +331,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     FilteringMode mCurrentFilterMode = FILTER_THREE_POINT;
 
     bool mNonUniformThreadgroupSupported;
+    bool mColorWriteEnabled = true;
 
     // Post-process programs allocated via CreatePostProcessProgram. Slots
     // with pipeline==nullptr are empty (returned to the free list when

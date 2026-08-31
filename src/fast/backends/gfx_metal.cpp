@@ -309,6 +309,7 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     prg->usedTextures[5] = cc_features.used_blend[1];
     prg->numInputs = cc_features.numInputs;
     prg->numFloats = numFloats;
+    prg->pipeline_descriptor = pipeline_descriptor;
 
     // Prepoluate pipeline state cache with program and available msaa levels
     for (int i = 0; i < ARRAY_COUNT(mMsaaNumQualityLevels); i++) {
@@ -326,7 +327,7 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
                              error->localizedDescription()->cString(NS::UTF8StringEncoding));
             }
 
-            prg->pipeline_state_variants[msaa_level] = pipeline_state;
+            prg->pipeline_state_variants[1][msaa_level] = pipeline_state;
         }
     }
 
@@ -335,7 +336,6 @@ struct ShaderProgram* GfxRenderingAPIMetal::CreateAndLoadNewShader(uint64_t shad
     vertexFunc->release();
     fragmentFunc->release();
     library->release();
-    pipeline_descriptor->release();
     autorelease_pool->release();
 
     return (struct ShaderProgram*)prg;
@@ -431,6 +431,18 @@ void GfxRenderingAPIMetal::SetDepthTestAndMask(bool depth_test, bool depth_mask)
 
 void GfxRenderingAPIMetal::SetZmodeDecal(bool zmode_decal) {
     mCurrentZmodeDecal = zmode_decal;
+}
+
+void GfxRenderingAPIMetal::SetColorWriteMask(bool enable) {
+    mColorWriteEnabled = enable;
+
+    // Ordinary N64 draws use permissive depth clamping, but redirect-to-Z
+    // geometry is a depth mask and must be clipped at the near/far planes.
+    // This mirrors the OpenGL backend's GL_DEPTH_CLAMP toggle.
+    FramebufferMetal& fb = mFramebuffers[mCurrentFramebuffer];
+    if (fb.mCommandEncoder != nullptr) {
+        fb.mCommandEncoder->setDepthClipMode(enable ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip);
+    }
 }
 
 void GfxRenderingAPIMetal::SetViewport(int x, int y, int width, int height) {
@@ -574,11 +586,33 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         current_framebuffer.mCommandEncoder->setFragmentBytes(&mDrawUniforms, sizeof(DrawUniforms), 1);
     }
 
-    if (current_framebuffer.mLastShaderProgram != mShaderProgram) {
+    if (current_framebuffer.mLastShaderProgram != mShaderProgram ||
+        current_framebuffer.mLastColorWriteEnabled != (int8_t)mColorWriteEnabled) {
         current_framebuffer.mLastShaderProgram = mShaderProgram;
+        current_framebuffer.mLastColorWriteEnabled = (int8_t)mColorWriteEnabled;
 
-        MTL::RenderPipelineState* pipeline_state =
-            mShaderProgram->pipeline_state_variants[current_framebuffer.mMsaaLevel];
+        const int color_write_index = mColorWriteEnabled ? 1 : 0;
+        MTL::RenderPipelineState*& pipeline_state =
+            mShaderProgram->pipeline_state_variants[color_write_index][current_framebuffer.mMsaaLevel];
+        if (pipeline_state == nullptr) {
+            MTL::RenderPipelineDescriptor* descriptor = mShaderProgram->pipeline_descriptor;
+            descriptor->setSampleCount(current_framebuffer.mMsaaLevel);
+            descriptor->colorAttachments()->object(0)->setWriteMask(
+                mColorWriteEnabled ? MTL::ColorWriteMaskAll : MTL::ColorWriteMaskNone);
+
+            NS::Error* error = nullptr;
+            pipeline_state = mDevice->newRenderPipelineState(descriptor, &error);
+
+            // Keep the retained descriptor in its normal visible-draw state.
+            descriptor->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
+            if (pipeline_state == nullptr || error != nullptr) {
+                SPDLOG_ERROR("Failed to create Metal color-write pipeline variant, error {}",
+                             error != nullptr ? error->localizedDescription()->cString(NS::UTF8StringEncoding)
+                                              : "unknown");
+                autorelease_pool->release();
+                return;
+            }
+        }
         current_framebuffer.mCommandEncoder->setRenderPipelineState(pipeline_state);
     }
 
@@ -741,6 +775,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         fb.mLastDepthTest = -1;
         fb.mLastDepthMask = -1;
         fb.mLastZmodeDecal = -1;
+        fb.mLastColorWriteEnabled = -1;
     }
 
     mFrameAutoreleasePool->release();
@@ -1123,7 +1158,8 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
         fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
         std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder", fb_id);
         fb.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
-        fb.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
+        fb.mCommandEncoder->setDepthClipMode(mColorWriteEnabled ? MTL::DepthClipModeClamp
+                                                                : MTL::DepthClipModeClip);
     }
 
     if (noise_scale != 0.0f) {
@@ -1163,7 +1199,8 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
 
     std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder After Clear", mCurrentFramebuffer);
     framebuffer.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
-    framebuffer.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
+    framebuffer.mCommandEncoder->setDepthClipMode(mColorWriteEnabled ? MTL::DepthClipModeClamp
+                                                                      : MTL::DepthClipModeClip);
     framebuffer.mCommandEncoder->setViewport(*framebuffer.mViewport);
     framebuffer.mCommandEncoder->setScissorRect(*framebuffer.mScissorRect);
 
@@ -1184,6 +1221,7 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
     framebuffer.mLastDepthTest = -1;
     framebuffer.mLastDepthMask = -1;
     framebuffer.mLastZmodeDecal = -1;
+    framebuffer.mLastColorWriteEnabled = -1;
 }
 
 void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
@@ -1411,7 +1449,8 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
 
     std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder After Copy", fb_src_id);
     source_framebuffer.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
-    source_framebuffer.mCommandEncoder->setDepthClipMode(MTL::DepthClipModeClamp);
+    source_framebuffer.mCommandEncoder->setDepthClipMode(mColorWriteEnabled ? MTL::DepthClipModeClamp
+                                                                            : MTL::DepthClipModeClip);
     source_framebuffer.mCommandEncoder->setViewport(*source_framebuffer.mViewport);
     source_framebuffer.mCommandEncoder->setScissorRect(*source_framebuffer.mScissorRect);
 
@@ -1432,6 +1471,7 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     source_framebuffer.mLastDepthTest = -1;
     source_framebuffer.mLastDepthMask = -1;
     source_framebuffer.mLastZmodeDecal = -1;
+    source_framebuffer.mLastColorWriteEnabled = -1;
 }
 
 void GfxRenderingAPIMetal::GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height,
@@ -1617,6 +1657,23 @@ int GfxRenderingAPIMetal::CreatePostProcessProgram(const PostProcessSource& src)
 }
 
 GfxRenderingAPIMetal::~GfxRenderingAPIMetal() {
+    for (auto& entry : mShaderProgramPool) {
+        ShaderProgramMetal& program = entry.second;
+        for (auto& colorVariants : program.pipeline_state_variants) {
+            for (auto*& variant : colorVariants) {
+                if (variant != nullptr) {
+                    variant->release();
+                    variant = nullptr;
+                }
+            }
+        }
+        if (program.pipeline_descriptor != nullptr) {
+            program.pipeline_descriptor->release();
+            program.pipeline_descriptor = nullptr;
+        }
+    }
+    mShaderProgramPool.clear();
+
     // The post-process sampler cache is keyed on (filter, wrap) — bounded
     // to 8 entries by design — but `newSamplerState` returns a retained
     // MTL::SamplerState that the backend owns. Release each on shutdown
