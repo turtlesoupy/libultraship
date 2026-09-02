@@ -46,11 +46,14 @@ void ControllerDefaultMappings::SetDefaultKeyboardKeyToButtonMappings(
     }
 
     Ship::ControllerDefaultMappings::SetDefaultKeyboardKeyToButtonMappings({
-        { BTN_A, { Ship::KbScancode::LUS_KB_X } },
-        { BTN_B, { Ship::KbScancode::LUS_KB_C } },
-        { BTN_L, { Ship::KbScancode::LUS_KB_E } },
-        { BTN_R, { Ship::KbScancode::LUS_KB_R } },
-        { BTN_Z, { Ship::KbScancode::LUS_KB_Z } },
+        /* Right-hand cluster mirrors the N64 pad under the fingers:
+         * J=A, K=B, L=Z, I=L, O=R (WASD stick, Space=Start, arrows=C).
+         * The web launcher's controls tutorial teaches exactly this. */
+        { BTN_A, { Ship::KbScancode::LUS_KB_J } },
+        { BTN_B, { Ship::KbScancode::LUS_KB_K } },
+        { BTN_L, { Ship::KbScancode::LUS_KB_I } },
+        { BTN_R, { Ship::KbScancode::LUS_KB_O } },
+        { BTN_Z, { Ship::KbScancode::LUS_KB_L } },
         { BTN_START, { Ship::KbScancode::LUS_KB_SPACE } },
         { BTN_CUP, { Ship::KbScancode::LUS_KB_ARROWKEY_UP } },
         { BTN_CDOWN, { Ship::KbScancode::LUS_KB_ARROWKEY_DOWN } },
