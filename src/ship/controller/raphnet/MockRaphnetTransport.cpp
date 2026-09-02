@@ -42,13 +42,13 @@ void ApplyKeymap(const uint8_t* state, OSContPad& pad) {
     if (state[SDL_SCANCODE_K]) {
         pad.button |= BTN_B;
     }
-    if (state[SDL_SCANCODE_SPACE]) {
+    if (state[SDL_SCANCODE_L]) {
         pad.button |= BTN_Z;
     }
-    if (state[SDL_SCANCODE_Q]) {
+    if (state[SDL_SCANCODE_I]) {
         pad.button |= BTN_L;
     }
-    if (state[SDL_SCANCODE_E]) {
+    if (state[SDL_SCANCODE_O]) {
         pad.button |= BTN_R;
     }
     if (state[SDL_SCANCODE_RETURN]) {
@@ -100,7 +100,7 @@ bool MockRaphnetTransport::Open(const std::string& hidPath, uint16_t vid, uint16
     mDevice = nullptr;  // we never own a real hid_device
     mIsOpen = true;
     SPDLOG_INFO("[raphnet:MOCK] adapter '{}' (vid=0x{:04x} pid=0x{:04x}) opened (synthetic). "
-                "Default keymap: WASD=stick, J=A, K=B, Space=Z, Q/E=L/R, Enter=Start, Arrows=C-stick",
+                "Default keymap: WASD=stick, J=A, K=B, L=Z, I/O=L/R, Enter=Start, Arrows=C-stick",
                 ToUtf8(serial), vid, pid);
     return true;
 }
