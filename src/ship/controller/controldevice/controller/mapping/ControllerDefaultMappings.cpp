@@ -60,10 +60,16 @@ void ControllerDefaultMappings::SetDefaultKeyboardKeyToAxisDirectionMappings(
         return;
     }
 
+    // WASD plus the arrow keys as an unlabelled fallback; the stick takes
+    // the max across mappings per direction, so both sets coexist.
     mDefaultKeyboardKeyToAxisDirectionMappings[LEFT_STICK] = { { LEFT, KbScancode::LUS_KB_A },
                                                                { RIGHT, KbScancode::LUS_KB_D },
                                                                { UP, KbScancode::LUS_KB_W },
-                                                               { DOWN, KbScancode::LUS_KB_S } };
+                                                               { DOWN, KbScancode::LUS_KB_S },
+                                                               { LEFT, KbScancode::LUS_KB_ARROWKEY_LEFT },
+                                                               { RIGHT, KbScancode::LUS_KB_ARROWKEY_RIGHT },
+                                                               { UP, KbScancode::LUS_KB_ARROWKEY_UP },
+                                                               { DOWN, KbScancode::LUS_KB_ARROWKEY_DOWN } };
 }
 
 std::unordered_map<CONTROLLERBUTTONS_T, std::unordered_set<SDL_GameControllerButton>>

@@ -47,18 +47,20 @@ void ControllerDefaultMappings::SetDefaultKeyboardKeyToButtonMappings(
 
     Ship::ControllerDefaultMappings::SetDefaultKeyboardKeyToButtonMappings({
         /* Right-hand cluster mirrors the N64 pad under the fingers:
-         * J=A, K=B, L=Z, I=L, O=R (WASD stick, Space=Start, arrows=C).
-         * The web launcher's controls tutorial teaches exactly this. */
-        { BTN_A, { Ship::KbScancode::LUS_KB_J } },
-        { BTN_B, { Ship::KbScancode::LUS_KB_K } },
+         * J=A, K=B, L=Z, I=L, O=R (WASD stick, Space=Start).
+         * The web launcher's controls tutorial teaches exactly this.
+         * Unlabelled fallbacks for people mashing an unfamiliar keyboard:
+         * arrows also drive the stick (see the axis defaults), Enter also
+         * pauses, Ctrl attacks (A), Alt is special (B), Shift shields (Z). U is C-up
+         * (jump) so the site's touch overlay has a key that is not the
+         * stick. */
+        { BTN_A, { Ship::KbScancode::LUS_KB_J, Ship::KbScancode::LUS_KB_CONTROL } },
+        { BTN_B, { Ship::KbScancode::LUS_KB_K, Ship::KbScancode::LUS_KB_ALT } },
         { BTN_L, { Ship::KbScancode::LUS_KB_I } },
         { BTN_R, { Ship::KbScancode::LUS_KB_O } },
-        { BTN_Z, { Ship::KbScancode::LUS_KB_L } },
-        { BTN_START, { Ship::KbScancode::LUS_KB_SPACE } },
-        { BTN_CUP, { Ship::KbScancode::LUS_KB_ARROWKEY_UP } },
-        { BTN_CDOWN, { Ship::KbScancode::LUS_KB_ARROWKEY_DOWN } },
-        { BTN_CLEFT, { Ship::KbScancode::LUS_KB_ARROWKEY_LEFT } },
-        { BTN_CRIGHT, { Ship::KbScancode::LUS_KB_ARROWKEY_RIGHT } },
+        { BTN_Z, { Ship::KbScancode::LUS_KB_L, Ship::KbScancode::LUS_KB_SHIFT, Ship::KbScancode::LUS_KB_RSHIFT } },
+        { BTN_START, { Ship::KbScancode::LUS_KB_SPACE, Ship::KbScancode::LUS_KB_ENTER } },
+        { BTN_CUP, { Ship::KbScancode::LUS_KB_U } },
         { BTN_DUP, { Ship::KbScancode::LUS_KB_T } },
         { BTN_DDOWN, { Ship::KbScancode::LUS_KB_G } },
         { BTN_DLEFT, { Ship::KbScancode::LUS_KB_F } },
