@@ -39,3 +39,13 @@ extern "C" void portRelocFixupVertexAtRuntime(const void* /*addr*/,
 extern "C" void portRelocFixupTextureAtRuntime(const void* /*addr*/,
                                                unsigned int /*num_bytes*/) {
 }
+
+// Game-side hook consumed by Fast::Interpreter::Flush(); the real one lives
+// in `debug_tools/gbi_trace/gbi_trace.c`.
+extern "C" void gbi_trace_note_flush(int /*num_tris*/) {
+}
+
+// Event-ID storage for events LUS fires but the downstream port registers
+// (`port/hooks/Events.cpp` REGISTER_EVENT). -1 == unregistered, so CallEvent
+// is a no-op if a test ever reaches a focus-change path.
+extern "C" uint32_t WindowFocusEventID = static_cast<uint32_t>(-1);
