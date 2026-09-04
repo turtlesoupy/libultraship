@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdint>
+extern "C" uint64_t gPortProfStageNs[8] = {0};
 #include "fast/Fast3dWindow.h"
 
 #include "ship/Context.h"
@@ -197,11 +200,23 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
 
     auto gui = wnd->GetGui();
     wnd->GetMouseStateManager()->StartFrame();
-    gui->StartDraw();
-    mInterpreter->StartFrame();
-    mInterpreter->Run(commands, mtxReplacements);
-    gui->EndDraw();
-    mInterpreter->EndFrame();
+    {
+        auto pn = [] { return std::chrono::steady_clock::now(); };
+        auto p0 = pn();
+        gui->StartDraw();
+        auto p1 = pn();
+        mInterpreter->StartFrame();
+        auto p2 = pn();
+        mInterpreter->Run(commands, mtxReplacements);
+        auto p3 = pn();
+        gui->EndDraw();
+        auto p4 = pn();
+        mInterpreter->EndFrame();
+        auto p5 = pn();
+        auto ns = [](auto a, auto b) { return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count(); };
+        gPortProfStageNs[0] += ns(p0, p1); gPortProfStageNs[1] += ns(p1, p2); gPortProfStageNs[2] += ns(p2, p3);
+        gPortProfStageNs[3] += ns(p3, p4); gPortProfStageNs[4] += ns(p4, p5);
+    }
 
     return true;
 }

@@ -808,7 +808,20 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
     }
 
+#ifdef __EMSCRIPTEN__
+    /* PORT: the browser build paces itself on requestAnimationFrame in
+     * port.cpp's main loop. nanosleep on the emscripten main thread is a
+     * busy-wait (emscripten_thread_sleep spins), so this limiter burned the
+     * rest of every 16.7ms window on the main thread — measured ~10ms/frame
+     * of spin with SSB64_FRAME_PROFILE=1 — starving the SDL audio callback
+     * and any other event-loop work. Keep it only for the sub-frame
+     * (SetTargetFps(60*k)) mode, which relies on it. */
+    if (mTargetFps > 60) {
+        SyncFramerateWithTime();
+    }
+#else
     SyncFramerateWithTime();
+#endif
     SDL_GL_SwapWindow(mWnd);
 }
 

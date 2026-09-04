@@ -1,3 +1,4 @@
+#include <chrono>
 #define NOMINMAX
 
 #ifdef _WIN32
@@ -987,9 +988,30 @@ void Interpreter::TextureCacheClear() {
 // FNV-1a over the texture source bytes, 8-byte strides + tail. Reads exactly
 // the range the ImportTexture* miss path would read, so it is precisely as
 // safe as a cache miss.
+// SSB64_FRAME_PROFILE=1 counters (port.cpp reports them every 60 frames).
+extern "C" { int gPortProfEnabled = 0; uint64_t gPortProfTexHashNs = 0; uint64_t gPortProfTexHashBytes = 0; uint32_t gPortProfTexHashCalls = 0; }
 static uint64_t PortTextureContentHash(const uint8_t* p, uint32_t n) {
     uint64_t h = 1469598103934665603ULL;
     uint32_t i = 0;
+    // PORT: injected fighter atlases are 512x512 RGBA16 (512KB) and a full
+    // hash per lookup cost ~2MB/frame of hashing in a 4-fighter match. Above
+    // 64KB sample one 8-byte word per 512 bytes plus the first/last 4KB: a
+    // recycled address holding a different texture still differs in nearly
+    // every sampled word, so the stale-hit detection this exists for holds.
+    if (n > 65536) {
+        uint32_t head = 4096, tail = n - 4096;
+        for (; i + 8 <= head; i += 8) {
+            uint64_t w; memcpy(&w, p + i, 8); h ^= w; h *= 1099511628211ULL;
+        }
+        for (; i + 8 <= tail; i += 512) {
+            uint64_t w; memcpy(&w, p + i, 8); h ^= w; h *= 1099511628211ULL;
+        }
+        for (i = tail; i + 8 <= n; i += 8) {
+            uint64_t w; memcpy(&w, p + i, 8); h ^= w; h *= 1099511628211ULL;
+        }
+        for (; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+        return h;
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t w;
         memcpy(&w, p + i, 8);
@@ -1023,7 +1045,15 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     const bool verify = PortTextureCacheVerifyEnabled() && key.texture_addr != nullptr && key.size_bytes != 0;
     uint64_t content_hash = 0;
     if (verify) {
-        content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+        if (gPortProfEnabled) {
+            auto th0 = std::chrono::steady_clock::now();
+            content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+            gPortProfTexHashNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - th0).count();
+            gPortProfTexHashBytes += key.size_bytes;
+            gPortProfTexHashCalls++;
+        } else {
+            content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+        }
     }
 
     if (it != mTextureCache.map.end()) {
